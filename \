@@ -1,0 +1,114 @@
+#include <stdio.h>
+#include "stdbool.h"
+#include "external/volk/volk.h"
+
+
+
+
+typedef struct
+{
+    VkPhysicalDevice physical;
+    //warm data
+    VkDevice device;
+
+    VkQueue present_queue;
+    VkQueue graphics_queue;
+    VkQueue compute_queue;
+    VkQueue transfer_queue;
+
+    uint32_t present_queue_index;
+    uint32_t graphics_queue_index;
+    uint32_t compute_queue_index;
+    uint32_t transfer_queue_index;
+
+
+    VkAllocationCallbacks* allocatorcallbacks;
+
+} DeviceContext;
+
+//Touched rarely.
+
+typedef struct VkFeatureChain
+{
+    VkPhysicalDeviceFeatures2 core;
+
+    VkPhysicalDeviceVulkan11Features v11;
+    VkPhysicalDeviceVulkan12Features v12;
+    VkPhysicalDeviceVulkan13Features v13;
+
+
+    // ---- add this ----
+    VkPhysicalDeviceMaintenance5FeaturesKHR          maintenance5;
+    VkPhysicalDeviceShaderNonSemanticInfoFeatures shaderNonSemanticInfo;
+} VkFeatureChain;
+
+typedef struct
+{
+
+    uint32_t width;
+    uint32_t height;
+
+    const char* app_name;
+
+    const char** instance_layers;
+    const char** instance_extensions;
+    const char** device_extensions;
+
+    uint32_t instance_layer_count;
+    uint32_t instance_extension_count;
+    uint32_t device_extension_count;
+    bool     enable_validation;
+    bool     enable_gpu_based_validation;
+
+    VkDebugUtilsMessageSeverityFlagsEXT validation_severity;
+    VkDebugUtilsMessageTypeFlagsEXT     validation_types;
+    bool                                use_custom_features;
+    VkFeatureChain                      custom_features;
+    VkPresentModeKHR                    swapchain_preferred_present_mode;
+    VkFormat                            swapchain_preferred_format;
+
+    VkColorSpaceKHR swapchain_preferred_color_space;
+
+    VkImageUsageFlags swapchain_extra_usage_flags; /* Additional usage flags */
+    bool              vsync;
+    bool              enable_debug_printf; /* Enable VK_KHR_shader_non_semantic_info for shader debug printf */
+    uint32_t          bindless_sampled_image_count;
+    uint32_t          bindless_sampler_count;
+    uint32_t          bindless_storage_image_count;
+    bool              enable_pipeline_stats;
+
+
+    VkDeviceSize size_of_cpu_pool;
+
+    VkDeviceSize size_of_gpu_pool;
+
+    VkDeviceSize size_of_staging_pool;
+} RendererDesc;
+typedef struct
+{
+    VkInstance               instance;
+    VkDebugUtilsMessengerEXT debug_messenger;
+    VkAllocationCallbacks*   allocatorcallbacks;
+} InstanceContext;
+
+int main () 
+
+{
+
+
+
+
+
+
+
+
+
+
+
+return 0;
+
+}
+
+
+
+
