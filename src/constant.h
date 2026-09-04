@@ -13,3 +13,6 @@
 #define MAX_PIPELINES                256
 #define MAX_BINDLESS_SAMPLERS        256
 #define MAX_BINDLESS_TEXTURES        65536
+
+#define MAX_COLOR_ATTACHMENTS 8
+
