@@ -10,7 +10,7 @@ CXX := clang++
 # Sources
 # =========================================================
 
-SRC_C := main.c    \
+SRC_C := main.c  ext.c  \
          external/mu/offset_allocator.c  \
          external/mu/mu.c
 

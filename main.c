@@ -1393,6 +1393,9 @@ TextureID create_texture(Renderer *r, const TextureCreateDesc *desc) {
     TextureID    id;
     Texture     *tex;
     TextureInfo *info;
+    uint32_t     depth     = desc->depth ? desc->depth : 1;
+    uint32_t     layers    = desc->layers ? desc->layers : 1;
+    uint32_t     mip_count = desc->mip_count ? desc->mip_count : 1;
 
     VkImageCreateInfo       image_info;
     VmaAllocationCreateInfo alloc_info;
@@ -1434,7 +1437,7 @@ TextureID create_texture(Renderer *r, const TextureCreateDesc *desc) {
 
     info->width     = desc->width;
     info->height    = desc->height;
-    info->mip_count = desc->mip_count;
+    info->mip_count = mip_count;
     info->format    = desc->format;
 
     /*
@@ -1474,7 +1477,7 @@ TextureID create_texture(Renderer *r, const TextureCreateDesc *desc) {
 
         .flags = desc->flags,
 
-        .imageType = (desc->depth > 1) ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D,
+        .imageType = (depth > 1) ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D,
 
         .format = desc->format,
 
@@ -1482,11 +1485,11 @@ TextureID create_texture(Renderer *r, const TextureCreateDesc *desc) {
             {
                 .width  = desc->width,
                 .height = desc->height,
-                .depth  = desc->depth,
+                .depth  = depth,
             },
 
-        .mipLevels   = desc->mip_count,
-        .arrayLayers = desc->layers,
+        .mipLevels   = mip_count,
+        .arrayLayers = layers,
 
         .samples = VK_SAMPLE_COUNT_1_BIT,
         .tiling  = VK_IMAGE_TILING_OPTIMAL,
@@ -1536,15 +1539,15 @@ TextureID create_texture(Renderer *r, const TextureCreateDesc *desc) {
 
     VkImageViewType view_type;
 
-    if (desc->depth > 1) {
+    if (depth > 1) {
         view_type = VK_IMAGE_VIEW_TYPE_3D;
     } else if (desc->flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) {
-        if (desc->layers == 6) {
+        if (layers == 6) {
             view_type = VK_IMAGE_VIEW_TYPE_CUBE;
         } else {
             view_type = VK_IMAGE_VIEW_TYPE_CUBE_ARRAY;
         }
-    } else if (desc->layers > 1) {
+    } else if (layers > 1) {
         view_type = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
     } else {
         view_type = VK_IMAGE_VIEW_TYPE_2D;
@@ -1590,7 +1593,7 @@ TextureID create_texture(Renderer *r, const TextureCreateDesc *desc) {
                 .aspectMask = get_image_aspect(desc->format),
 
                 .baseMipLevel = 0,
-                .levelCount   = desc->mip_count,
+                .levelCount   = mip_count,
 
                 .baseArrayLayer = 0,
 
@@ -1598,7 +1601,7 @@ TextureID create_texture(Renderer *r, const TextureCreateDesc *desc) {
                     3D images use layerCount = 1.
                     Array/cubemap images use the actual layer count.
                 */
-                .layerCount = (desc->depth > 1) ? 1 : desc->layers,
+                .layerCount = (depth > 1) ? 1 : layers,
             },
     };
 
@@ -1944,7 +1947,33 @@ bool create_buffer(Renderer *r, VkDeviceSize size, VkBufferUsageFlags usage, Vma
 
     return true;
 }
+void destroy_buffer(Renderer *r, Buffer *buffer) {
+    if (!r || !buffer)
+        return;
 
+    /*
+        Buffer ownership:
+
+            Buffer
+             |
+             ├── VkBuffer
+             └── VmaAllocation
+
+        VMA owns the memory relationship, so destroy both through
+        vmaDestroyBuffer().
+    */
+
+    if (buffer->buffer != VK_NULL_HANDLE) {
+        vmaDestroyBuffer(r->devc.vmaallocator, buffer->buffer, buffer->allocation);
+    }
+
+    /*
+        The CPU mapping belongs to the VMA allocation.
+        Do not free() it manually.
+    */
+
+    memset(buffer, 0, sizeof(*buffer));
+}
 static uint32_t rt_compute_mip_count(uint32_t w, uint32_t h) {
     uint32_t max_dim = w > h ? w : h;
     uint32_t mips    = 1;
@@ -2320,19 +2349,27 @@ VkPipeline create_graphics_pipeline(Renderer *renderer, const GraphicsPipelineCo
 
     VkShaderModule fs = create_shader_module(renderer->devc.device, fs_code, fs_size);
 
-    VkPipelineShaderStageCreateInfo stages[2] = {{
-                                                     .sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-                                                     .stage  = VK_SHADER_STAGE_VERTEX_BIT,
-                                                     .module = vs,
-                                                     .pName  = "vs_main",
-                                                 },
-                                                 {
-                                                     .sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-                                                     .stage  = VK_SHADER_STAGE_FRAGMENT_BIT,
-                                                     .module = fs,
-                                                     .pName  = "fs_main",
-                                                 }};
+    VkPipelineShaderStageCreateInfo      stages[2] = {{
+                                                          .sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                                                          .stage  = VK_SHADER_STAGE_VERTEX_BIT,
+                                                          .module = vs,
+                                                          .pName  = "main",
+                                                      },
+                                                      {
+                                                          .sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                                                          .stage  = VK_SHADER_STAGE_FRAGMENT_BIT,
+                                                          .module = fs,
+                                                          .pName  = "main",
+                                                      }};
+    VkPipelineVertexInputStateCreateInfo vertex_input = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
 
+        .vertexBindingDescriptionCount = 0,
+        .pVertexBindingDescriptions    = NULL,
+
+        .vertexAttributeDescriptionCount = 0,
+        .pVertexAttributeDescriptions    = NULL,
+    };
     VkPipelineInputAssemblyStateCreateInfo input_asm = {
         .sType                  = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
         .topology               = cfg->topology,
@@ -2430,9 +2467,9 @@ VkPipeline create_graphics_pipeline(Renderer *renderer, const GraphicsPipelineCo
 
         .pNext = &rendering,
 
-        .stageCount = 2,
-        .pStages    = stages,
-
+        .stageCount          = 2,
+        .pStages             = stages,
+        .pVertexInputState   = &vertex_input,
         .pInputAssemblyState = &input_asm,
         .pViewportState      = &viewport,
         .pRasterizationState = &raster,
@@ -2480,7 +2517,7 @@ VkPipeline create_compute_pipeline(Renderer *renderer, const char *compute_path)
         .sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
         .stage  = VK_SHADER_STAGE_COMPUTE_BIT,
         .module = module,
-        .pName  = "cs_main",
+        .pName  = "main",
     };
     VkComputePipelineCreateInfo ci = {
         .sType  = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
@@ -2699,6 +2736,7 @@ static inline VkImageSubresourceRange image_subresource_range(VkImageAspectFlags
 
     return range;
 }
+
 inline void cmd_transition_all_mips(Renderer *r, VkCommandBuffer cmd, VkImage image, ImageState *state,
                                     VkImageAspectFlags aspect, uint32_t mipCount, VkPipelineStageFlags2 newStage,
                                     VkAccessFlags2 newAccess, VkImageLayout newLayout, uint32_t newQueueFamily) {
@@ -2740,9 +2778,9 @@ inline void cmd_transition_all_mips(Renderer *r, VkCommandBuffer cmd, VkImage im
     state->dirty_mips                                             = 0;
 }
 
-inline void cmd_transition_mip(Renderer *r, VkCommandBuffer cmd, VkImage image, ImageState *state,
-                               VkImageAspectFlags aspect, uint32_t mip, VkPipelineStageFlags2 newStage,
-                               VkAccessFlags2 newAccess, VkImageLayout newLayout, uint32_t newQueueFamily) {
+void cmd_transition_mip(Renderer *r, VkCommandBuffer cmd, VkImage image, ImageState *state, VkImageAspectFlags aspect,
+                        uint32_t mip, VkPipelineStageFlags2 newStage, VkAccessFlags2 newAccess, VkImageLayout newLayout,
+                        uint32_t newQueueFamily) {
     uint32_t bit = 1u << mip;
 
     if (state->validity == IMAGE_STATE_VALID) {
@@ -3338,7 +3376,7 @@ void renderer_create(Renderer *r, RendererDesc *desc) {
                                    .mip_count  = 1,
                                    .debug_name = "ldr_color"};
     RenderTargetSpec smaa_final_spec = ldr_spec;
-    smaa_final_spec.debug_name        = "smaa_final";
+    smaa_final_spec.debug_name       = "smaa_final";
 
     RenderTargetSpec smaa_edge_spec = {.width  = r->swapchain.extent.width,
                                        .height = r->swapchain.extent.height,
@@ -3957,8 +3995,8 @@ static void post_pass(Renderer *r, VkCommandBuffer cmd) {
     GPU_SCOPE(frame_prof, cmd, "POST", VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT) {
         rt_transition_all(r, cmd, &r->hdr_color[image], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                           VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
-        rt_transition_all(r, cmd, &r->ldr_color[image], VK_IMAGE_LAYOUT_GENERAL,
-                          VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+        rt_transition_all(r, cmd, &r->ldr_color[image], VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                          VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
 
         flush_barriers(r, cmd);
 
@@ -3975,7 +4013,7 @@ static void post_pass(Renderer *r, VkCommandBuffer cmd) {
             .exposure        = 1.2f,
         };
 
-        vkCmdPushConstants(cmd, r->bindless_system.pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push),
+        vkCmdPushConstants(cmd, r->bindless_system.pipeline_layout, VK_SHADER_STAGE_ALL, 0, sizeof(push),
                            &push);
 
         uint32_t gx = (push.width + 15) / 16;
@@ -4024,7 +4062,7 @@ static void pass_smaa(Renderer *r, VkCommandBuffer cmd) {
 
             LDR
              |
-             v
+
           EDGE
              |
              v
@@ -4040,8 +4078,8 @@ static void pass_smaa(Renderer *r, VkCommandBuffer cmd) {
 
         rt_transition_all(r, cmd, &r->smaa_edges[image], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                           VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
-rt_transition_all(r, cmd, &r->ldr_color[image], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                  VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+        rt_transition_all(r, cmd, &r->ldr_color[image], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                          VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
         flush_barriers(r, cmd);
 
         VkRenderingAttachmentInfo edge_color = {
@@ -4073,7 +4111,7 @@ rt_transition_all(r, cmd, &r->ldr_color[image], VK_IMAGE_LAYOUT_SHADER_READ_ONLY
             .sampler_id = r->default_samplers.samplers[SAMPLER_LINEAR_CLAMP],
         };
 
-        vkCmdPushConstants(cmd, r->bindless_system.pipeline_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(edge_push),
+        vkCmdPushConstants(cmd, r->bindless_system.pipeline_layout, VK_SHADER_STAGE_ALL, 0, sizeof(edge_push),
                            &edge_push);
 
         vkCmdDraw(cmd, 3, 1, 0, 0);
@@ -4124,7 +4162,7 @@ rt_transition_all(r, cmd, &r->ldr_color[image], VK_IMAGE_LAYOUT_SHADER_READ_ONLY
             .sampler_id = r->default_samplers.samplers[SAMPLER_LINEAR_CLAMP],
         };
 
-        vkCmdPushConstants(cmd, r->bindless_system.pipeline_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+        vkCmdPushConstants(cmd, r->bindless_system.pipeline_layout, VK_SHADER_STAGE_ALL, 0,
                            sizeof(weight_push), &weight_push);
 
         vkCmdDraw(cmd, 3, 1, 0, 0);
@@ -4173,7 +4211,7 @@ rt_transition_all(r, cmd, &r->ldr_color[image], VK_IMAGE_LAYOUT_SHADER_READ_ONLY
             .sampler_id = r->default_samplers.samplers[SAMPLER_LINEAR_CLAMP],
         };
 
-        vkCmdPushConstants(cmd, r->bindless_system.pipeline_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(blend_push),
+        vkCmdPushConstants(cmd, r->bindless_system.pipeline_layout, VK_SHADER_STAGE_ALL, 0, sizeof(blend_push),
                            &blend_push);
 
         vkCmdDraw(cmd, 3, 1, 0, 0);
@@ -4258,6 +4296,19 @@ static void pass_imgui(Renderer *r, VkCommandBuffer cmd) {
 
     vkCmdEndRendering(cmd);
 }
+
+FORCE_INLINE void imgui_shutdown(void) {
+    ImGui_ImplVulkan_Shutdown();
+    ImGui_ImplGlfw_Shutdown();
+    igDestroyContext(NULL);
+}
+
+FORCE_INLINE void imgui_begin_frame(void) {
+    ImGui_ImplVulkan_NewFrame();
+    ImGui_ImplGlfw_NewFrame();
+    igNewFrame();
+}
+
 int main() {
 
     graphics_init();
@@ -4266,16 +4317,14 @@ int main() {
 
         TracyCFrameMark;
         glfwPollEvents();
-        ImGui_ImplVulkan_NewFrame();
-        ImGui_ImplGlfw_NewFrame();
-        igNewFrame();
 
         pipeline_rebuild(g_renderer);
         frame_start(g_renderer);
 
-        Renderer       *renderer   = g_renderer;
+        imgui_begin_frame();
+        Renderer *renderer = g_renderer;
 
-        Renderer       *r   = g_renderer;
+        Renderer       *r          = g_renderer;
         VkCommandBuffer cmd        = renderer->frames[renderer->current_frame].cmdbuf;
         GpuProfiler    *frame_prof = &renderer->gpuprofiler[renderer->current_frame];
 
@@ -4303,24 +4352,27 @@ int main() {
         pass_triangle(r, cmd);
         post_pass(r, cmd);
 
-
         pass_smaa(r, cmd);
 
         pass_ldr_to_swapchain(r, cmd);
+
         igRender();
         pass_imgui(r, cmd);
 
-
-
-
-
-
-
-
-
-
+  image_transition_swapchain(
+        r,
+        cmd,
+        &r->swapchain,
+        VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+        VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+        0
+    );
+  
+flush_barriers(r, cmd);
 
         vk_cmd_end(cmd);
+
+
         submit_frame(renderer);
     }
     pipeline_cache_save(g_renderer->devc.device, g_renderer->devc.physical_device, g_renderer->devc.pipeline_cache,
