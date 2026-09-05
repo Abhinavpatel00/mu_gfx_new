@@ -4,6 +4,7 @@
 #include "src/helpers.h"
 #include "src/slangtypes.h"
 #include <stdint.h>
+#include <vulkan/vulkan_core.h>
 
 // ids
 //
@@ -433,6 +434,21 @@ typedef struct {
     VkSampler         samplers[MAX_BINDLESS_SAMPLERS];
 
     BarrierBatch barrierbatch;
+
+    struct {
+        uint32_t fullscreen;
+        uint32_t postprocess;
+        uint32_t gltf_minimal;
+        uint32_t triangle;
+        uint32_t triangle_wireframe;
+        uint32_t sprite;
+        uint32_t slug_text;
+
+        uint32_t beam;
+        uint32_t sky;
+        uint32_t skinning;
+    } EnginePipelines;
+
 } Renderer;
 // renderer would be heap allocated   since we dont want to crash staack
 bool is_instance_extension_supported(const char *extension_name) {
@@ -3894,236 +3910,287 @@ static MU_INLINE void submit_frame(Renderer *r) {
     TracyCZoneEnd(ctx);
 }
 
-PUSH_CONSTANT(PostPush, uint32_t src_texture_id; uint32_t output_image_id; uint32_t sampler_id;  uint32_t width;
-              uint32_t height;
-              uint frame;
-              float exposure;
+PUSH_CONSTANT(PostPush, uint32_t src_texture_id; uint32_t output_image_id; uint32_t sampler_id; uint32_t width;
+              uint32_t height; uint frame; float exposure;
 
 );
 PUSH_CONSTANT(EdgePush, uint32_t texture_id; uint32_t sampler_id;);
-
 
 PUSH_CONSTANT(BlendPush, uint32_t color_tex; uint32_t weight_tex; uint32_t sampler_id; uint32_t pad;);
 
 PUSH_CONSTANT(WeightPush, uint32_t edge_tex; uint32_t area_tex; uint32_t search_tex; uint32_t sampler_id;);
 
+static void post_pass(Renderer *r, VkCommandBuffer cmd) {
+    uint32_t image = r->swapchain.current_image;
 
-void            post_pass()
-{
+    GpuProfiler *frame_prof = &r->gpuprofiler[r->current_frame];
+    GPU_SCOPE(frame_prof, cmd, "POST", VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT) {
+        rt_transition_all(r, cmd, &r->hdr_color[image], VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                          VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
 
-    VkCommandBuffer cmd        = renderer.frames[renderer.current_frame].cmdbuf;
-    GpuProfiler*    frame_prof = &renderer.gpuprofiler[renderer.current_frame];
-    GPU_SCOPE(frame_prof, cmd, "POST", VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT)
-    {
-        rt_transition_all(cmd, &renderer.hdr_color[renderer.swapchain.current_image], VK_IMAGE_LAYOUT_GENERAL,
-                          VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+        flush_barriers(r, cmd);
 
-        flush_barriers(cmd);
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g_render_pipelines.pipelines[pipelines.postprocess]);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                          r->render_pipelines.pipelines[r->EnginePipelines.postprocess]);
 
-        PostPush pp_push        = {0};
-        pp_push.src_texture_id  = renderer.hdr_color[renderer.swapchain.current_image].bindless_index;
-        pp_push.output_image_id = renderer.ldr_color[renderer.swapchain.current_image].bindless_index;
-        pp_push.sampler_id      = renderer.default_samplers.samplers[SAMPLER_LINEAR_CLAMP];
-        pp_push.width           = renderer.swapchain.extent.width;
-        pp_push.height          = renderer.swapchain.extent.height;
-        pp_push.frame           = pp_frame_counter++;
+        PostPush push = {
+            .src_texture_id  = r->hdr_color[image].bindless_index,
+            .output_image_id = r->ldr_color[image].bindless_index,
+            .sampler_id      = r->default_samplers.samplers[SAMPLER_LINEAR_CLAMP],
+            .width           = r->swapchain.extent.width,
+            .height          = r->swapchain.extent.height,
+            .frame           = 0,
+            .exposure        = 1.2f,
+        };
 
-        pp_push.exposure = 1.2;
-        vkCmdPushConstants(cmd, renderer.bindless_system.pipeline_layout, VK_SHADER_STAGE_ALL, 0, sizeof(PostPush), &pp_push);
+        vkCmdPushConstants(cmd, r->bindless_system.pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push),
+                           &push);
 
-        uint32_t gx = (pp_push.width + 15) / 16;
-        uint32_t gy = (pp_push.height + 15) / 16;
-
+        uint32_t gx = (push.width + 15) / 16;
+        uint32_t gy = (push.height + 15) / 16;
 
         vkCmdDispatch(cmd, gx, gy, 1);
     }
 }
+static void pass_smaa(Renderer *r, VkCommandBuffer cmd) {
+    uint32_t image = r->swapchain.current_image;
 
-void pass_smaa()
-{
+    /*
+        SMAA:
 
-    VkCommandBuffer cmd        = renderer.frames[renderer.current_frame].cmdbuf;
-    GpuProfiler*    frame_prof = &renderer.gpuprofiler[renderer.current_frame];
-
-    uint32_t current_image = renderer.swapchain.current_image;
-
-
-    GPU_SCOPE(frame_prof, cmd, "SMAA", VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT)
+            LDR
+             |
+             v
+          EDGE
+             |
+             v
+          WEIGHT
+             |
+             v
+           FINAL
+    */
     {
-        rt_transition_all(cmd, &renderer.smaa_edges[current_image], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        /* ------------------------------------------------------------
+           1. Edge detection
+           ------------------------------------------------------------ */
+
+        rt_transition_all(r, cmd, &r->smaa_edges[image], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                           VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
-        flush_barriers(cmd);
-        VkRenderingAttachmentInfo color = {.sType            = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
-                                           .imageView        = renderer.smaa_edges[current_image].view,
-                                           .imageLayout      = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                                           .loadOp           = VK_ATTACHMENT_LOAD_OP_CLEAR,
-                                           .storeOp          = VK_ATTACHMENT_STORE_OP_STORE,
-                                           .clearValue.color = {{0, 0, 0, 0}}};
+rt_transition_all(r, cmd, &r->ldr_color[image], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                  VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+        flush_barriers(r, cmd);
 
-        VkRenderingInfo rendering = {.sType                = VK_STRUCTURE_TYPE_RENDERING_INFO,
-                                     .renderArea.extent    = renderer.swapchain.extent,
-                                     .layerCount           = 1,
-                                     .colorAttachmentCount = 1,
-                                     .pColorAttachments    = &color};
+        VkRenderingAttachmentInfo edge_color = {
+            .sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+            .imageView   = r->smaa_edges[image].view,
+            .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            .loadOp      = VK_ATTACHMENT_LOAD_OP_CLEAR,
+            .storeOp     = VK_ATTACHMENT_STORE_OP_STORE,
+            .clearValue  = {.color = {{0, 0, 0, 0}}},
+        };
 
-        vkCmdBeginRendering(cmd, &rendering);
+        VkRenderingInfo edge_rendering = {
+            .sType                = VK_STRUCTURE_TYPE_RENDERING_INFO,
+            .renderArea.extent    = r->swapchain.extent,
+            .layerCount           = 1,
+            .colorAttachmentCount = 1,
+            .pColorAttachments    = &edge_color,
+        };
 
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_render_pipelines.pipelines[renderer.smaa_pipelines.smaa_edge]);
+        vkCmdBeginRendering(cmd, &edge_rendering);
 
-        vk_cmd_set_viewport_scissor(cmd, renderer.swapchain.extent);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                          r->render_pipelines.pipelines[r->smaa_pipelines.smaa_edge]);
 
-        EdgePush push   = {0};
-        push.texture_id = renderer.ldr_color[current_image].bindless_index;
-        push.sampler_id = renderer.default_samplers.samplers[SAMPLER_LINEAR_CLAMP];
+        vk_cmd_set_viewport_scissor(cmd, r->swapchain.extent);
 
-        vkCmdPushConstants(cmd, renderer.bindless_system.pipeline_layout, VK_SHADER_STAGE_ALL, 0, sizeof(EdgePush), &push);
+        EdgePush edge_push = {
+            .texture_id = r->ldr_color[image].bindless_index,
+            .sampler_id = r->default_samplers.samplers[SAMPLER_LINEAR_CLAMP],
+        };
+
+        vkCmdPushConstants(cmd, r->bindless_system.pipeline_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(edge_push),
+                           &edge_push);
 
         vkCmdDraw(cmd, 3, 1, 0, 0);
 
         vkCmdEndRendering(cmd);
     }
-
     {
-        rt_transition_all(cmd, &renderer.smaa_weights[current_image], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        /* ------------------------------------------------------------
+           2. Weight calculation
+           ------------------------------------------------------------ */
+
+        rt_transition_all(r, cmd, &r->smaa_weights[image], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                           VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
-        rt_transition_all(cmd, &renderer.smaa_edges[current_image], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+
+        rt_transition_all(r, cmd, &r->smaa_edges[image], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                           VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
-        flush_barriers(cmd);
-        VkRenderingAttachmentInfo color = {.sType            = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
-                                           .imageView        = renderer.smaa_weights[current_image].view,
-                                           .imageLayout      = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                                           .loadOp           = VK_ATTACHMENT_LOAD_OP_CLEAR,
-                                           .storeOp          = VK_ATTACHMENT_STORE_OP_STORE,
-                                           .clearValue.color = {{0, 0, 0, 0}}};
 
-        VkRenderingInfo rendering = {.sType                = VK_STRUCTURE_TYPE_RENDERING_INFO,
-                                     .renderArea.extent    = renderer.swapchain.extent,
-                                     .layerCount           = 1,
-                                     .colorAttachmentCount = 1,
-                                     .pColorAttachments    = &color};
+        flush_barriers(r, cmd);
 
-        vkCmdBeginRendering(cmd, &rendering);
+        VkRenderingAttachmentInfo weight_color = {
+            .sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+            .imageView   = r->smaa_weights[image].view,
+            .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            .loadOp      = VK_ATTACHMENT_LOAD_OP_CLEAR,
+            .storeOp     = VK_ATTACHMENT_STORE_OP_STORE,
+            .clearValue  = {.color = {{0, 0, 0, 0}}},
+        };
 
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_render_pipelines.pipelines[renderer.smaa_pipelines.smaa_weight]);
+        VkRenderingInfo weight_rendering = {
+            .sType                = VK_STRUCTURE_TYPE_RENDERING_INFO,
+            .renderArea.extent    = r->swapchain.extent,
+            .layerCount           = 1,
+            .colorAttachmentCount = 1,
+            .pColorAttachments    = &weight_color,
+        };
 
+        vkCmdBeginRendering(cmd, &weight_rendering);
 
-        vk_cmd_set_viewport_scissor(cmd, renderer.swapchain.extent);
-        WeightPush push = {0};
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                          r->render_pipelines.pipelines[r->smaa_pipelines.smaa_weight]);
 
-        push.edge_tex   = renderer.smaa_edges[current_image].bindless_index;
-        push.area_tex   = renderer.smaa_area_tex;
-        push.search_tex = renderer.smaa_search_tex;
-        push.sampler_id = renderer.default_samplers.samplers[SAMPLER_LINEAR_CLAMP];
+        vk_cmd_set_viewport_scissor(cmd, r->swapchain.extent);
 
-        vkCmdPushConstants(cmd, renderer.bindless_system.pipeline_layout, VK_SHADER_STAGE_ALL, 0, sizeof(WeightPush), &push);
+        WeightPush weight_push = {
+            .edge_tex   = r->smaa_edges[image].bindless_index,
+            .area_tex   = r->smaa_area_tex,
+            .search_tex = r->smaa_search_tex,
+            .sampler_id = r->default_samplers.samplers[SAMPLER_LINEAR_CLAMP],
+        };
+
+        vkCmdPushConstants(cmd, r->bindless_system.pipeline_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                           sizeof(weight_push), &weight_push);
 
         vkCmdDraw(cmd, 3, 1, 0, 0);
 
         vkCmdEndRendering(cmd);
     }
-
-    rt_transition_all(cmd, &renderer.ldr_color[current_image], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                      VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
-    flush_barriers(cmd);
-
     {
-        VkRenderingAttachmentInfo color = {.sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
-                                           .imageView   = renderer.ldr_color[current_image].view,
-                                           .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                                           .loadOp      = VK_ATTACHMENT_LOAD_OP_LOAD,
-                                           .storeOp     = VK_ATTACHMENT_STORE_OP_STORE};
+        /* ------------------------------------------------------------
+           3. Blend LDR + SMAA into FINAL
+           ------------------------------------------------------------ */
 
-        VkRenderingInfo rendering = {.sType                = VK_STRUCTURE_TYPE_RENDERING_INFO,
-                                     .renderArea.extent    = renderer.swapchain.extent,
-                                     .layerCount           = 1,
-                                     .colorAttachmentCount = 1,
-                                     .pColorAttachments    = &color};
+        rt_transition_all(r, cmd, &r->ldr_color[image], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                          VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+rt_transition_all(r, cmd, &r->smaa_weights[image], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                  VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+        flush_barriers(r, cmd);
 
-        vkCmdBeginRendering(cmd, &rendering);
+        VkRenderingAttachmentInfo final_color = {
+            .sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+            .imageView   = r->ldr_color[image].view,
+            .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            .loadOp      = VK_ATTACHMENT_LOAD_OP_CLEAR,
+            .storeOp     = VK_ATTACHMENT_STORE_OP_STORE,
+        };
 
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_render_pipelines.pipelines[renderer.smaa_pipelines.smaa_blend]);
+        VkRenderingInfo final_rendering = {
+            .sType                = VK_STRUCTURE_TYPE_RENDERING_INFO,
+            .renderArea.extent    = r->swapchain.extent,
+            .layerCount           = 1,
+            .colorAttachmentCount = 1,
+            .pColorAttachments    = &final_color,
+        };
 
+        vkCmdBeginRendering(cmd, &final_rendering);
 
-        vk_cmd_set_viewport_scissor(cmd, renderer.swapchain.extent);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                          r->render_pipelines.pipelines[r->smaa_pipelines.smaa_blend]);
 
-        BlendPush push  = {0};
-        push.color_tex  = renderer.ldr_color[current_image].bindless_index;
-        push.weight_tex = renderer.smaa_weights[current_image].bindless_index;
-        push.sampler_id = renderer.default_samplers.samplers[SAMPLER_LINEAR_CLAMP];
+        vk_cmd_set_viewport_scissor(cmd, r->swapchain.extent);
 
-        vkCmdPushConstants(cmd, renderer.bindless_system.pipeline_layout, VK_SHADER_STAGE_ALL, 0, sizeof(BlendPush), &push);
+        BlendPush blend_push = {
+            .color_tex  = r->ldr_color[image].bindless_index,
+            .weight_tex = r->smaa_weights[image].bindless_index,
+            .sampler_id = r->default_samplers.samplers[SAMPLER_LINEAR_CLAMP],
+        };
+
+        vkCmdPushConstants(cmd, r->bindless_system.pipeline_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(blend_push),
+                           &blend_push);
 
         vkCmdDraw(cmd, 3, 1, 0, 0);
-
 
         vkCmdEndRendering(cmd);
     }
 }
+static void pass_ldr_to_swapchain(Renderer *r, VkCommandBuffer cmd) {
+    uint32_t image = r->swapchain.current_image;
 
-
-// image bliting
-void pass_ldr_to_swapchain()
-{
-
-    VkCommandBuffer cmd        = renderer.frames[renderer.current_frame].cmdbuf;
-    GpuProfiler*    frame_prof = &renderer.gpuprofiler[renderer.current_frame];
-
-    uint32_t current_image = renderer.swapchain.current_image;
-
-
-    rt_transition_all(cmd, &renderer.ldr_color[renderer.swapchain.current_image], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+    rt_transition_all(r, cmd, &r->ldr_color[image], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                       VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
-    image_transition_swapchain(renderer.frames[renderer.current_frame].cmdbuf, &renderer.swapchain,
-                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_TRANSFER_BIT, 0);
-    flush_barriers(cmd);
+
+    image_transition_swapchain(r, cmd, &r->swapchain, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                               VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+
+    flush_barriers(r, cmd);
+
     VkImageBlit blit = {
-        .srcSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .mipLevel = 0, .baseArrayLayer = 0, .layerCount = 1},
-        .srcOffsets = {{0, 0, 0}, {renderer.swapchain.extent.width, renderer.swapchain.extent.height, 1}},
+        .srcSubresource =
+            {
+                .aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
+                .mipLevel       = 0,
+                .baseArrayLayer = 0,
+                .layerCount     = 1,
+            },
 
-        .dstSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .mipLevel = 0, .baseArrayLayer = 0, .layerCount = 1},
-        .dstOffsets = {{0, 0, 0}, {renderer.swapchain.extent.width, renderer.swapchain.extent.height, 1}}};
+        .srcOffsets =
+            {
+                {0, 0, 0},
+                {(int32_t)r->swapchain.extent.width, (int32_t)r->swapchain.extent.height, 1},
+            },
 
-    vkCmdBlitImage(cmd, renderer.ldr_color[renderer.swapchain.current_image].image,
-                   VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, renderer.swapchain.images[renderer.swapchain.current_image],
+        .dstSubresource =
+            {
+                .aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
+                .mipLevel       = 0,
+                .baseArrayLayer = 0,
+                .layerCount     = 1,
+            },
+
+        .dstOffsets =
+            {
+                {0, 0, 0},
+                {(int32_t)r->swapchain.extent.width, (int32_t)r->swapchain.extent.height, 1},
+            },
+    };
+
+    vkCmdBlitImage(cmd, r->ldr_color[image].image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, r->swapchain.images[image],
                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_NEAREST);
 }
 
-// imgui pass
+static void pass_imgui(Renderer *r, VkCommandBuffer cmd) {
+    uint32_t image = r->swapchain.current_image;
 
-void pass_imgui()
-{
+    image_transition_swapchain(r, cmd, &r->swapchain, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                               VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
 
-    VkCommandBuffer cmd        = renderer.frames[renderer.current_frame].cmdbuf;
-    GpuProfiler*    frame_prof = &renderer.gpuprofiler[renderer.current_frame];
+    flush_barriers(r, cmd);
 
-    uint32_t current_image = renderer.swapchain.current_image;
+    VkRenderingAttachmentInfo color = {
+        .sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+        .imageView   = r->swapchain.image_views[image],
+        .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        .loadOp      = VK_ATTACHMENT_LOAD_OP_LOAD,
+        .storeOp     = VK_ATTACHMENT_STORE_OP_STORE,
+    };
 
+    VkRenderingInfo rendering = {
+        .sType                = VK_STRUCTURE_TYPE_RENDERING_INFO,
+        .renderArea.extent    = r->swapchain.extent,
+        .layerCount           = 1,
+        .colorAttachmentCount = 1,
+        .pColorAttachments    = &color,
+    };
 
-    {
-        image_transition_swapchain(cmd, &renderer.swapchain, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                                   VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+    vkCmdBeginRendering(cmd, &rendering);
 
-        flush_barriers(cmd);
-        VkRenderingAttachmentInfo color = {.sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
-                                           .imageView   = renderer.swapchain.image_views[current_image],
-                                           .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                                           .loadOp      = VK_ATTACHMENT_LOAD_OP_LOAD,
-                                           .storeOp     = VK_ATTACHMENT_STORE_OP_STORE};
+    ImDrawData *draw_data = igGetDrawData();
 
-        VkRenderingInfo rendering = {.sType                = VK_STRUCTURE_TYPE_RENDERING_INFO,
-                                     .renderArea.extent    = renderer.swapchain.extent,
-                                     .layerCount           = 1,
-                                     .colorAttachmentCount = 1,
-                                     .pColorAttachments    = &color};
+    ImGui_ImplVulkan_RenderDrawData(draw_data, cmd, VK_NULL_HANDLE);
 
-        vkCmdBeginRendering(cmd, &rendering);
-        {
-            ImDrawData* draw_data = igGetDrawData();
-            ImGui_ImplVulkan_RenderDrawData(draw_data, cmd, VK_NULL_HANDLE);
-        }
-        vkCmdEndRendering(cmd);
-    }
+    vkCmdEndRendering(cmd);
 }
 int main() {
 
@@ -4137,6 +4204,8 @@ int main() {
         frame_start(g_renderer);
 
         Renderer       *renderer   = g_renderer;
+
+        Renderer       *r   = g_renderer;
         VkCommandBuffer cmd        = renderer->frames[renderer->current_frame].cmdbuf;
         GpuProfiler    *frame_prof = &renderer->gpuprofiler[renderer->current_frame];
 
@@ -4173,6 +4242,34 @@ int main() {
                                        VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, 0);
             flush_barriers(renderer, cmd);
         }
+
+
+
+
+
+
+
+
+        post_pass(r, cmd);
+
+
+        pass_smaa(r, cmd);
+
+        pass_ldr_to_swapchain(r, cmd);
+
+
+        pass_imgui(r, cmd);
+
+
+
+
+
+
+
+
+
+
+
         vk_cmd_end(cmd);
         submit_frame(renderer);
     }

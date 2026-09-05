@@ -15,4 +15,4 @@
 #define MAX_BINDLESS_TEXTURES        65536
 
 #define MAX_COLOR_ATTACHMENTS 8
-
+#define VALIDATION true

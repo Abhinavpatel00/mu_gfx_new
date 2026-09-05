@@ -1,6 +1,6 @@
 #include "../common.h"
 #include "../external/xxHash/xxhash.h"
-
+#include <errno.h>
 /*
 
 whatevet the fuck u write no one cares here 
