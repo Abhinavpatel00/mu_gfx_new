@@ -69,6 +69,7 @@ BASE_CXXFLAGS := \
     -fno-common \
     $(INCLUDES) \
     -DIMGUI_IMPL_VULKAN_NO_PROTOTYPES \
+    -DIMGUI_DISABLE_OBSOLETE_FUNCTIONS \
     -DIMGUI_IMPL_API='extern "C"'
 
 # =========================================================
