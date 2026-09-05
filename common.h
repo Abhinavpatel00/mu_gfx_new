@@ -40,6 +40,33 @@
 
 #define forEach(i, count) for (uint32_t i = 0; i < (count); i++)
 
+
+#define RUN_ONCE for(static int _once = 1; _once; _once = 0)
+
+#define PUSH_CONSTANT(name, BODY)                                                                                      \
+    typedef struct ALIGNAS(16) name##_init                                                                             \
+    {                                                                                                                  \
+        BODY                                                                                                           \
+    } name##_init;                                                                                                     \
+    enum                                                                                                               \
+    {                                                                                                                  \
+        name##_pad_size = 256 - sizeof(name##_init)                                                                    \
+    };                                                                                                                 \
+                                                                                                                       \
+    typedef struct ALIGNAS(16) name                                                                                    \
+    {                                                                                                                  \
+        BODY uint8_t _pad[name##_pad_size];                                                                            \
+    } name;                                                                                                            \
+                                                                                                                       \
+    _Static_assert(sizeof(name) == 256, "Push constant != 256");
+
+
+
+
+
+
+
+
 #define MIN(a, b) (((a) < (b)) ? (a) : (b))
 #define MAX(a, b) (((a) > (b)) ? (a) : (b))
 #define CLAMP(v, mn, mx) MIN(MAX(v, mn), mx)

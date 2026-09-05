@@ -11,6 +11,7 @@
 typedef uint32_t TextureID;
 typedef uint32_t SamplerID;
 typedef uint32_t PipelineID;
+
 typedef struct Texture {
     VkImage       image;
     VkImageView   view;
@@ -352,6 +353,12 @@ typedef struct RendererPipelines {
     mu_id_pool    pipeline_id_pool;
 } RendererPipelines;
 
+typedef struct BarrierBatch {
+    VkImageMemoryBarrier2 image_barriers[32];
+
+    uint32_t image_count;
+} BarrierBatch;
+
 typedef struct {
     // ---- CPU profiling ----
     double cpu_frame_ns;      // total frame time (e.g., from glfwGetTime)
@@ -425,6 +432,7 @@ typedef struct {
     VkDeviceAddress   gpu_base_addr;
     VkSampler         samplers[MAX_BINDLESS_SAMPLERS];
 
+    BarrierBatch barrierbatch;
 } Renderer;
 // renderer would be heap allocated   since we dont want to crash staack
 bool is_instance_extension_supported(const char *extension_name) {
@@ -2489,6 +2497,45 @@ void vk_cmd_set_viewport_scissor(VkCommandBuffer cmd, VkExtent2D extent) {
     vkCmdSetScissor(cmd, 0, 1, &sc);
 }
 
+static void spv_to_slang(const char *spv, char *out) {
+    const char *name = strrchr(spv, '/');
+    name             = name ? name + 1 : spv;
+
+    char tmp[256];
+    strcpy(tmp, name);
+
+    char *stage = strstr(tmp, ".vert");
+    if (!stage)
+        stage = strstr(tmp, ".frag");
+    if (!stage)
+        stage = strstr(tmp, ".comp");
+
+    if (stage)
+        *stage = '\0';
+
+    sprintf(out, "shaders/%s.slang", tmp);
+}
+
+static const char *path_basename(const char *path) {
+    const char *slash = strrchr(path, '/');
+    return slash ? slash + 1 : path;
+}
+
+static bool shader_change_matches_spv(const char *changed, const char *spv) {
+    if (!changed || !spv)
+        return false;
+
+    char slang[256];
+    spv_to_slang(spv, slang);
+
+    if (strstr(changed, slang))
+        return true;
+
+    const char *changed_name = path_basename(changed);
+    const char *slang_name   = path_basename(slang);
+
+    return strcmp(changed_name, slang_name) == 0;
+}
 PipelineID pipeline_create_compute(Renderer *r, const char *path) {
 
     uint32_t id;
@@ -2527,6 +2574,233 @@ PipelineID pipeline_create_graphics(Renderer *r, GraphicsPipelineConfig *cfg) {
     r->render_pipelines.count++;
 
     return id;
+}
+void pipeline_rebuild(Renderer *r) {
+    bool any_dirty = false;
+
+    for (int i = 0; i < r->render_pipelines.count; i++)
+        if (r->render_pipelines.entries[i].dirty)
+            any_dirty = true;
+
+    if (!any_dirty)
+        return;
+
+    vkDeviceWaitIdle(r->devc.device);
+
+    for (int i = 0; i < r->render_pipelines.count; i++) {
+        PipelineEntry *e = &r->render_pipelines.entries[i];
+
+        if (!e->dirty)
+            continue;
+
+        e->dirty = false;
+
+        vkDestroyPipeline(r->devc.device, r->render_pipelines.pipelines[i], NULL);
+
+        if (e->type == PIPELINE_TYPE_GRAPHICS)
+            r->render_pipelines.pipelines[i] = create_graphics_pipeline(r, &e->graphics);
+        else
+            r->render_pipelines.pipelines[i] = create_compute_pipeline(r, e->compute.path);
+
+        printf("Pipeline %d hot reloaded\n", i);
+    }
+}
+
+void pipeline_mark_dirty(Renderer *r, const char *changed) {
+    for (uint32_t i = 0; i < r->render_pipelines.count; i++) {
+        PipelineEntry *e = &r->render_pipelines.entries[i];
+
+        if (e->type != PIPELINE_TYPE_GRAPHICS && e->type != PIPELINE_TYPE_COMPUTE)
+            continue;
+
+        bool matches = false;
+
+        if (e->type == PIPELINE_TYPE_GRAPHICS) {
+            matches = shader_change_matches_spv(changed, e->graphics.vert_path) ||
+                      shader_change_matches_spv(changed, e->graphics.frag_path);
+        } else {
+            matches = shader_change_matches_spv(changed, e->compute.path);
+        }
+
+        if (matches)
+            e->dirty = true;
+    }
+}
+
+void image_transition_swapchain(Renderer *r, VkCommandBuffer cmd, FlowSwapchain *sc, VkImageLayout new_layout,
+                                VkPipelineStageFlags2 dst_stage, VkAccessFlags2 dst_access) {
+    uint32_t index = sc->current_image;
+
+    ImageState *state = &sc->states[index];
+
+    VkPipelineStageFlags2 src_stage;
+    VkAccessFlags2        src_access;
+    if (state->validity == IMAGE_STATE_UNDEFINED) {
+        src_stage  = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+        src_access = 0;
+    } else {
+        src_stage  = state->stage;
+        src_access = state->access;
+    }
+    VkImageMemoryBarrier2 barrier = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+
+                                     .srcStageMask  = src_stage,
+                                     .srcAccessMask = src_access,
+
+                                     .dstStageMask  = dst_stage,
+                                     .dstAccessMask = dst_access,
+
+                                     .oldLayout = state->layout,
+                                     .newLayout = new_layout,
+
+                                     .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                                     .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+
+                                     .image = sc->images[index],
+
+                                     .subresourceRange = {.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
+                                                          .baseMipLevel   = 0,
+                                                          .levelCount     = 1,
+                                                          .baseArrayLayer = 0,
+                                                          .layerCount     = 1}};
+
+    r->barrierbatch.image_barriers[r->barrierbatch.image_count++] = barrier;
+    state->layout                                                 = new_layout;
+    state->stage                                                  = dst_stage;
+    state->access                                                 = dst_access;
+    state->validity                                               = IMAGE_STATE_VALID;
+}
+
+static inline VkImageSubresourceRange image_subresource_range(VkImageAspectFlags aspect, uint32_t baseMip,
+                                                              uint32_t mipCount) {
+    VkImageSubresourceRange range = {.aspectMask     = aspect,
+                                     .baseMipLevel   = baseMip,
+                                     .levelCount     = mipCount,
+                                     .baseArrayLayer = 0,
+                                     .layerCount     = VK_REMAINING_ARRAY_LAYERS};
+
+    return range;
+}
+inline void cmd_transition_all_mips(Renderer *r, VkCommandBuffer cmd, VkImage image, ImageState *state,
+                                    VkImageAspectFlags aspect, uint32_t mipCount, VkPipelineStageFlags2 newStage,
+                                    VkAccessFlags2 newAccess, VkImageLayout newLayout, uint32_t newQueueFamily) {
+    if (state->validity == IMAGE_STATE_VALID) {
+        if (state->stage == newStage && state->access == newAccess && state->layout == newLayout &&
+            state->queue_family == newQueueFamily) {
+            return;
+        }
+    }
+
+    VkImageMemoryBarrier2 barrier = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+
+        .srcStageMask = state->validity == IMAGE_STATE_VALID ? state->stage : VK_PIPELINE_STAGE_2_NONE,
+
+        .srcAccessMask = state->validity == IMAGE_STATE_VALID ? state->access : VK_ACCESS_2_NONE,
+
+        .dstStageMask  = newStage,
+        .dstAccessMask = newAccess,
+
+        .oldLayout = state->validity == IMAGE_STATE_VALID ? state->layout : VK_IMAGE_LAYOUT_UNDEFINED,
+
+        .newLayout = newLayout,
+
+        .srcQueueFamilyIndex = state->validity == IMAGE_STATE_EXTERNAL ? state->queue_family : VK_QUEUE_FAMILY_IGNORED,
+
+        .dstQueueFamilyIndex = newQueueFamily,
+
+        .image = image,
+
+        .subresourceRange = image_subresource_range(aspect, 0, mipCount)};
+
+    r->barrierbatch.image_barriers[r->barrierbatch.image_count++] = barrier;
+    state->stage                                                  = newStage;
+    state->access                                                 = newAccess;
+    state->layout                                                 = newLayout;
+    state->queue_family                                           = newQueueFamily;
+    state->validity                                               = IMAGE_STATE_VALID;
+    state->dirty_mips                                             = 0;
+}
+
+inline void cmd_transition_mip(Renderer *r, VkCommandBuffer cmd, VkImage image, ImageState *state,
+                               VkImageAspectFlags aspect, uint32_t mip, VkPipelineStageFlags2 newStage,
+                               VkAccessFlags2 newAccess, VkImageLayout newLayout, uint32_t newQueueFamily) {
+    uint32_t bit = 1u << mip;
+
+    if (state->validity == IMAGE_STATE_VALID) {
+        if ((state->dirty_mips & bit) == 0 && state->stage == newStage && state->access == newAccess &&
+            state->layout == newLayout && state->queue_family == newQueueFamily) {
+            return;
+        }
+    }
+
+    VkImageMemoryBarrier2 barrier = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+
+        .srcStageMask = state->validity == IMAGE_STATE_VALID ? state->stage : VK_PIPELINE_STAGE_2_NONE,
+
+        .srcAccessMask = state->validity == IMAGE_STATE_VALID ? state->access : VK_ACCESS_2_NONE,
+
+        .dstStageMask  = newStage,
+        .dstAccessMask = newAccess,
+
+        .oldLayout = state->validity == IMAGE_STATE_VALID ? state->layout : VK_IMAGE_LAYOUT_UNDEFINED,
+
+        .newLayout = newLayout,
+
+        .srcQueueFamilyIndex = state->validity == IMAGE_STATE_EXTERNAL ? state->queue_family : VK_QUEUE_FAMILY_IGNORED,
+
+        .dstQueueFamilyIndex = newQueueFamily,
+
+        .image = image,
+
+        .subresourceRange = image_subresource_range(aspect, mip, 1)};
+
+    r->barrierbatch.image_barriers[r->barrierbatch.image_count++] = barrier;
+
+    state->stage        = newStage;
+    state->access       = newAccess;
+    state->layout       = newLayout;
+    state->queue_family = newQueueFamily;
+    state->validity     = IMAGE_STATE_VALID;
+
+    state->dirty_mips &= ~bit;
+}
+void flush_barriers(Renderer *r, VkCommandBuffer cmd) {
+
+    if (r->barrierbatch.image_count == 0)
+        return;
+
+    VkDependencyInfo dep = {.sType                   = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+                            .imageMemoryBarrierCount = r->barrierbatch.image_count,
+                            .pImageMemoryBarriers    = r->barrierbatch.image_barriers};
+
+    vkCmdPipelineBarrier2(cmd, &dep);
+
+    r->barrierbatch.image_count = 0;
+}
+
+MU_INLINE void rt_transition_mip(Renderer *r, VkCommandBuffer cmd, RenderTarget *rt, uint32_t mip,
+                                 VkImageLayout new_layout, VkPipelineStageFlags2 new_stage, VkAccessFlags2 new_access
+
+) {
+    assert(mip < rt->mip_count);
+    cmd_transition_mip(r, cmd, rt->image, &rt->mip_states[mip], rt->aspect, mip, new_stage, new_access, new_layout,
+                       VK_QUEUE_FAMILY_IGNORED);
+}
+
+MU_INLINE void rt_transition_all(Renderer *r, VkCommandBuffer cmd, RenderTarget *rt, VkImageLayout new_layout,
+                                 VkPipelineStageFlags2 new_stage, VkAccessFlags2 new_access) {
+    for (uint32_t mip = 0; mip < rt->mip_count; mip++) {
+        ImageState *s = &rt->mip_states[mip];
+        // Skip if already in target state
+        if (s->validity == IMAGE_STATE_VALID && s->stage == new_stage && s->access == new_access &&
+            s->layout == new_layout) {
+            continue;
+        }
+        cmd_transition_mip(r, cmd, rt->image, s, rt->aspect, mip, new_stage, new_access, new_layout,
+                           VK_QUEUE_FAMILY_IGNORED);
+    }
 }
 
 void renderer_create(Renderer *r, RendererDesc *desc) {
@@ -2831,7 +3105,7 @@ void renderer_create(Renderer *r, RendererDesc *desc) {
 
     mu_id_pool_init(&r->sampler_pool, MAX_BINDLESS_SAMPLERS);
 
-    mu_id_pool_init(&r->pipeline_id_pool, MAX_PIPELINES);
+    mu_id_pool_init(&r->render_pipelines.pipeline_id_pool, MAX_PIPELINES);
     vk_cmd_create_pool(r->devc.device, r->devc.graphics_queue_index, true, false, &r->one_time_gfx_pool);
 
     int fb_w, fb_h;
@@ -3439,6 +3713,9 @@ void renderer_create(Renderer *r, RendererDesc *desc) {
         }
     }
 }
+
+static Renderer *g_renderer = NULL;
+
 void graphics_init(void) {
     VK_CHECK(volkInitialize());
     if (!is_instance_extension_supported("VK_KHR_wayland_surface"))
@@ -3491,14 +3768,184 @@ void graphics_init(void) {
 
     };
 
-    Renderer *renderer = malloc(sizeof(*renderer));
-    MU_SCOPE_TIMER("Renderer Creation") { renderer_create(renderer, &desc); }
+    Renderer *g_renderer = malloc(sizeof(*g_renderer));
+    MU_SCOPE_TIMER("Renderer Creation") { renderer_create(g_renderer, &desc); }
 
     // gfx_pipelines();
 }
+FORCE_INLINE bool vk_swapchain_acquire(VkDevice device, FlowSwapchain *sc, VkSemaphore image_available, VkFence fence,
+                                       uint64_t timeout) {
+    ///  PFN_vkAcquireNextImage2KHR
+    VkResult r = vkAcquireNextImageKHR(device, sc->swapchain, timeout, image_available, fence, &sc->current_image);
+
+    if (r == VK_SUCCESS)
+        return true;
+
+    if (r == VK_SUBOPTIMAL_KHR || r == VK_ERROR_OUT_OF_DATE_KHR) {
+        sc->needs_recreate = true;
+        return false;
+    }
+
+    VK_CHECK(r);
+    return false;
+}
+
+FORCE_INLINE bool vk_swapchain_present(VkQueue present_queue, FlowSwapchain *sc, const VkSemaphore *waits,
+                                       uint32_t wait_count) {
+    VkPresentInfoKHR info = {.sType              = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
+                             .waitSemaphoreCount = wait_count,
+                             .pWaitSemaphores    = waits,
+                             .swapchainCount     = 1,
+                             .pSwapchains        = &sc->swapchain,
+                             .pImageIndices      = &sc->current_image};
+
+    VkResult r = vkQueuePresentKHR(present_queue, &info);
+
+    if (r == VK_SUBOPTIMAL_KHR || r == VK_ERROR_OUT_OF_DATE_KHR) {
+        sc->needs_recreate = true;
+        return false;
+    }
+
+    VK_CHECK(r);
+    return true;
+}
+
+static MU_INLINE void frame_start(Renderer *r) {
+    TracyCZoneNC(ctx, "frame_start", 0x00FF00, 1);
+    r->current_frame = (r->current_frame + 1) % MAX_FRAMES_IN_FLIGHT;
+
+    int fb_w, fb_h;
+    glfwGetFramebufferSize(r->window, &fb_w, &fb_h);
+
+    if (fb_w == 0 || fb_h == 0) {
+        uint64_t wait_start = mu_time_now();
+        glfwWaitEvents();
+        r->cpu_wait_accum_ns += (double)(mu_time_now() - wait_start);
+        return;
+    }
+    r->swapchain.needs_recreate |= fb_w != (int)r->swapchain.extent.width || fb_h != (int)r->swapchain.extent.height;
+
+    if (r->swapchain.needs_recreate) {
+        vkDeviceWaitIdle(r->devc.device);
+
+        vk_swapchain_recreate(r->devc.device, r->devc.physical_device, &r->swapchain, fb_w, fb_h,
+                              r->devc.graphics_queue, r->one_time_gfx_pool, r);
+
+        forEach(i, r->swapchain.image_count) {
+            rt_resize(r, &r->depth[i], fb_w, fb_h);
+            rt_resize(r, &r->hdr_color[i], fb_w, fb_h);
+            rt_resize(r, &r->ldr_color[i], fb_w, fb_h);
+        }
+
+        r->swapchain.needs_recreate = false;
+    }
+
+    FrameContext *f = &r->frames[r->current_frame];
+
+    VK_CHECK(vkWaitForFences(r->devc.device, 1, &f->in_flight_fence, VK_TRUE, UINT64_MAX));
+
+    VK_CHECK(vkResetFences(r->devc.device, 1, &f->in_flight_fence));
+
+    buffer_pool_linear_reset(&r->cpu_pool);
+    buffer_pool_ring_free_to(&r->staging_pool, f->staging_tail);
+
+    GpuProfiler *frame_prof = &r->gpuprofiler[r->current_frame];
+
+    gpu_profiler_collect(frame_prof, r->devc.device);
+
+    vkResetCommandPool(r->devc.device, f->cmdbufpool, 0);
+
+    vk_swapchain_acquire(r->devc.device, &r->swapchain, r->frames[r->current_frame].image_available_semaphore,
+                         VK_NULL_HANDLE, UINT64_MAX);
+    TracyCZoneEnd(ctx);
+}
+
+static MU_INLINE void submit_frame(Renderer *r) {
+    TracyCZoneNC(ctx, "submit_frame", 0xFF0000, 1);
+    FrameContext *f   = &r->frames[r->current_frame];
+    uint32_t      img = r->swapchain.current_image;
+
+    if (r->staging_pool.type == BUFFER_POOL_RING)
+        f->staging_tail = r->staging_pool.ring.head;
+
+    VkCommandBufferSubmitInfo cmd = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = f->cmdbuf};
+
+    VkSemaphoreSubmitInfo wait = {.sType     = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+                                  .semaphore = f->image_available_semaphore,
+                                  .stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT};
+
+    VkSemaphoreSubmitInfo signal = {.sType     = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+                                    .semaphore = r->swapchain.render_finished[img],
+                                    .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};
+
+    VkSubmitInfo2 submit = {.sType                    = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
+                            .waitSemaphoreInfoCount   = 1,
+                            .pWaitSemaphoreInfos      = &wait,
+                            .commandBufferInfoCount   = 1,
+                            .pCommandBufferInfos      = &cmd,
+                            .signalSemaphoreInfoCount = 1,
+                            .pSignalSemaphoreInfos    = &signal};
+
+    VK_CHECK(vkQueueSubmit2(r->devc.graphics_queue, 1, &submit, f->in_flight_fence));
+
+    vk_swapchain_present(r->devc.present_queue, &r->swapchain,
+                         &r->swapchain.render_finished[r->swapchain.current_image], 1);
+
+    TracyCZoneEnd(ctx);
+}
+
 int main() {
 
     graphics_init();
 
+    while (!glfwWindowShouldClose(g_renderer->window)) {
+
+        TracyCFrameMark;
+
+        pipeline_rebuild(g_renderer);
+        frame_start(g_renderer);
+
+        Renderer       *renderer   = g_renderer;
+        VkCommandBuffer cmd        = renderer->frames[renderer->current_frame].cmdbuf;
+        GpuProfiler    *frame_prof = &renderer->gpuprofiler[renderer->current_frame];
+
+        vk_cmd_begin(cmd, false);
+        gpu_profiler_begin_frame(frame_prof, cmd);
+
+        {
+            {
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, renderer->bindless_system.pipeline_layout,
+                                        0, 1, &renderer->bindless_system.set, 0, NULL);
+
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, renderer->bindless_system.pipeline_layout,
+                                        0, 1, &renderer->bindless_system.set, 0, NULL);
+
+                rt_transition_all(
+                    renderer, cmd, &renderer->depth[renderer->swapchain.current_image],
+                    VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+                    VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+                    VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT);
+
+                rt_transition_all(renderer, cmd, &renderer->hdr_color[renderer->swapchain.current_image],
+                                  VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                                  VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                  VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+
+                image_transition_swapchain(renderer, cmd, &renderer->swapchain, VK_IMAGE_LAYOUT_GENERAL,
+                                           VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                                           VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+
+                flush_barriers(renderer, cmd);
+            }
+
+            image_transition_swapchain(renderer, cmd, &renderer->swapchain, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                                       VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, 0);
+            flush_barriers(renderer, cmd);
+        }
+        vk_cmd_end(cmd);
+        submit_frame(renderer);
+    }
+    pipeline_cache_save(g_renderer->devc.device, g_renderer->devc.physical_device, g_renderer->devc.pipeline_cache,
+                        "pipeline_cache.bin");
     return 0;
 }
