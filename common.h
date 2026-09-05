@@ -16,6 +16,9 @@
 
 
 #include <GLFW/glfw3native.h>
+#ifdef Status
+#undef Status
+#endif
 #define VMA_STATIC_VULKAN_FUNCTIONS  0
 #define VMA_DYNAMIC_VULKAN_FUNCTIONS 0
 #include "external/VulkanMemoryAllocator/include/vk_mem_alloc.h"
@@ -91,10 +94,8 @@
 #if defined(_MSC_VER)
     #define FORCE_INLINE __forceinline
 #elif defined(__GNUC__) || defined(__clang__)
-    #define FORCE_INLINE inline __attribute__((always_inline))
+    #define FORCE_INLINE static inline __attribute__((always_inline))
 #else
-    #define FORCE_INLINE inline
+    #define FORCE_INLINE static inline
 #endif
-
-
 

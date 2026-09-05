@@ -402,6 +402,7 @@ typedef struct {
     RenderTarget depth[MAX_SWAPCHAIN_IMAGES];
     RenderTarget hdr_color[MAX_SWAPCHAIN_IMAGES];
     RenderTarget ldr_color[MAX_SWAPCHAIN_IMAGES];
+    RenderTarget smaa_final[MAX_SWAPCHAIN_IMAGES];
     RenderTarget smaa_edges[MAX_SWAPCHAIN_IMAGES];
     RenderTarget smaa_weights[MAX_SWAPCHAIN_IMAGES];
 
@@ -2323,13 +2324,13 @@ VkPipeline create_graphics_pipeline(Renderer *renderer, const GraphicsPipelineCo
                                                      .sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
                                                      .stage  = VK_SHADER_STAGE_VERTEX_BIT,
                                                      .module = vs,
-                                                     .pName  = "main",
+                                                     .pName  = "vs_main",
                                                  },
                                                  {
                                                      .sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
                                                      .stage  = VK_SHADER_STAGE_FRAGMENT_BIT,
                                                      .module = fs,
-                                                     .pName  = "main",
+                                                     .pName  = "fs_main",
                                                  }};
 
     VkPipelineInputAssemblyStateCreateInfo input_asm = {
@@ -2479,7 +2480,7 @@ VkPipeline create_compute_pipeline(Renderer *renderer, const char *compute_path)
         .sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
         .stage  = VK_SHADER_STAGE_COMPUTE_BIT,
         .module = module,
-        .pName  = "main",
+        .pName  = "cs_main",
     };
     VkComputePipelineCreateInfo ci = {
         .sType  = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
@@ -2492,6 +2493,7 @@ VkPipeline create_compute_pipeline(Renderer *renderer, const char *compute_path)
     VK_CHECK(vkCreateComputePipelines(renderer->devc.device, renderer->devc.pipeline_cache, 1, &ci, NULL, &pipeline));
 
     vkDestroyShaderModule(renderer->devc.device, module, NULL);
+    free(code);
 
     return pipeline;
 }
@@ -3335,6 +3337,8 @@ void renderer_create(Renderer *r, RendererDesc *desc) {
 
                                    .mip_count  = 1,
                                    .debug_name = "ldr_color"};
+    RenderTargetSpec smaa_final_spec = ldr_spec;
+    smaa_final_spec.debug_name        = "smaa_final";
 
     RenderTargetSpec smaa_edge_spec = {.width  = r->swapchain.extent.width,
                                        .height = r->swapchain.extent.height,
@@ -3536,6 +3540,7 @@ void renderer_create(Renderer *r, RendererDesc *desc) {
         rt_create(r, &r->depth[i], &depth_spec);
         rt_create(r, &r->hdr_color[i], &hdr_spec);
         rt_create(r, &r->ldr_color[i], &ldr_spec);
+        rt_create(r, &r->smaa_final[i], &smaa_final_spec);
 
         rt_create(r, &r->smaa_edges[i], &smaa_edge_spec);
         rt_create(r, &r->smaa_weights[i], &smaa_weight_spec);
@@ -3700,10 +3705,28 @@ void renderer_create(Renderer *r, RendererDesc *desc) {
 
         {
             GraphicsPipelineConfig cfg = pipeline_config_default();
+            cfg.vert_path              = "compiledshaders/triangle.vert.spv";
+            cfg.frag_path              = "compiledshaders/triangle.frag.spv";
+            cfg.depth_test_enable      = false;
+            cfg.depth_write_enable     = false;
+            cfg.color_attachment_count = 1;
+            cfg.color_formats          = &r->hdr_color[0].format;
+
+            r->EnginePipelines.triangle = pipeline_create_graphics(r, &cfg);
+        }
+
+        {
+            r->EnginePipelines.postprocess = pipeline_create_compute(r, "compiledshaders/postprocess.comp.spv");
+        }
+
+        {
+            GraphicsPipelineConfig cfg = pipeline_config_default();
             cfg.vert_path              = "compiledshaders/smaa_edge.vert.spv";
             cfg.frag_path              = "compiledshaders/smaa_edge.frag.spv";
+            cfg.depth_test_enable      = false;
+            cfg.depth_write_enable     = false;
             cfg.color_attachment_count = 1;
-            cfg.color_formats          = &r->smaa_edges[1].format;
+            cfg.color_formats          = &r->smaa_edges[0].format;
 
             r->smaa_pipelines.smaa_edge = pipeline_create_graphics(r, &cfg);
         }
@@ -3712,8 +3735,10 @@ void renderer_create(Renderer *r, RendererDesc *desc) {
             GraphicsPipelineConfig cfg = pipeline_config_default();
             cfg.vert_path              = "compiledshaders/smaa_weight.vert.spv";
             cfg.frag_path              = "compiledshaders/smaa_weight.frag.spv";
+            cfg.depth_test_enable      = false;
+            cfg.depth_write_enable     = false;
             cfg.color_attachment_count = 1;
-            cfg.color_formats          = &r->smaa_weights[1].format;
+            cfg.color_formats          = &r->smaa_weights[0].format;
 
             r->smaa_pipelines.smaa_weight = pipeline_create_graphics(r, &cfg);
         }
@@ -3722,8 +3747,10 @@ void renderer_create(Renderer *r, RendererDesc *desc) {
             GraphicsPipelineConfig cfg = pipeline_config_default();
             cfg.vert_path              = "compiledshaders/smaa_blend.vert.spv";
             cfg.frag_path              = "compiledshaders/smaa_blend.frag.spv";
+            cfg.depth_test_enable      = false;
+            cfg.depth_write_enable     = false;
             cfg.color_attachment_count = 1;
-            cfg.color_formats          = &r->ldr_color[0].format;
+            cfg.color_formats          = &r->smaa_final[0].format;
 
             r->smaa_pipelines.smaa_blend = pipeline_create_graphics(r, &cfg);
         }
@@ -3784,7 +3811,7 @@ void graphics_init(void) {
 
     };
 
-    Renderer *g_renderer = malloc(sizeof(*g_renderer));
+    g_renderer = malloc(sizeof(*g_renderer));
     MU_SCOPE_TIMER("Renderer Creation") { renderer_create(g_renderer, &desc); }
 
     // gfx_pipelines();
@@ -3851,6 +3878,9 @@ static MU_INLINE void frame_start(Renderer *r) {
             rt_resize(r, &r->depth[i], fb_w, fb_h);
             rt_resize(r, &r->hdr_color[i], fb_w, fb_h);
             rt_resize(r, &r->ldr_color[i], fb_w, fb_h);
+            rt_resize(r, &r->smaa_final[i], fb_w, fb_h);
+            rt_resize(r, &r->smaa_edges[i], fb_w, fb_h);
+            rt_resize(r, &r->smaa_weights[i], fb_w, fb_h);
         }
 
         r->swapchain.needs_recreate = false;
@@ -3925,8 +3955,10 @@ static void post_pass(Renderer *r, VkCommandBuffer cmd) {
 
     GpuProfiler *frame_prof = &r->gpuprofiler[r->current_frame];
     GPU_SCOPE(frame_prof, cmd, "POST", VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT) {
-        rt_transition_all(r, cmd, &r->hdr_color[image], VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                          VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+        rt_transition_all(r, cmd, &r->hdr_color[image], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                          VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+        rt_transition_all(r, cmd, &r->ldr_color[image], VK_IMAGE_LAYOUT_GENERAL,
+                          VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
 
         flush_barriers(r, cmd);
 
@@ -3952,6 +3984,38 @@ static void post_pass(Renderer *r, VkCommandBuffer cmd) {
         vkCmdDispatch(cmd, gx, gy, 1);
     }
 }
+
+static void pass_triangle(Renderer *r, VkCommandBuffer cmd) {
+    uint32_t image = r->swapchain.current_image;
+
+    rt_transition_all(r, cmd, &r->hdr_color[image], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                      VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+    flush_barriers(r, cmd);
+
+    VkRenderingAttachmentInfo color = {
+        .sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+        .imageView   = r->hdr_color[image].view,
+        .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        .loadOp      = VK_ATTACHMENT_LOAD_OP_CLEAR,
+        .storeOp     = VK_ATTACHMENT_STORE_OP_STORE,
+        .clearValue  = {.color = {{0.02f, 0.025f, 0.03f, 1.0f}}},
+    };
+
+    VkRenderingInfo rendering = {
+        .sType                = VK_STRUCTURE_TYPE_RENDERING_INFO,
+        .renderArea.extent    = r->swapchain.extent,
+        .layerCount           = 1,
+        .colorAttachmentCount = 1,
+        .pColorAttachments    = &color,
+    };
+
+    vkCmdBeginRendering(cmd, &rendering);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, r->render_pipelines.pipelines[r->EnginePipelines.triangle]);
+    vk_cmd_set_viewport_scissor(cmd, r->swapchain.extent);
+    vkCmdDraw(cmd, 3, 1, 0, 0);
+    vkCmdEndRendering(cmd);
+}
+
 static void pass_smaa(Renderer *r, VkCommandBuffer cmd) {
     uint32_t image = r->swapchain.current_image;
 
@@ -4072,15 +4136,17 @@ rt_transition_all(r, cmd, &r->ldr_color[image], VK_IMAGE_LAYOUT_SHADER_READ_ONLY
            3. Blend LDR + SMAA into FINAL
            ------------------------------------------------------------ */
 
-        rt_transition_all(r, cmd, &r->ldr_color[image], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        rt_transition_all(r, cmd, &r->smaa_final[image], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                           VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
-rt_transition_all(r, cmd, &r->smaa_weights[image], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                  VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+        rt_transition_all(r, cmd, &r->ldr_color[image], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                          VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+        rt_transition_all(r, cmd, &r->smaa_weights[image], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                          VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
         flush_barriers(r, cmd);
 
         VkRenderingAttachmentInfo final_color = {
             .sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
-            .imageView   = r->ldr_color[image].view,
+            .imageView   = r->smaa_final[image].view,
             .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
             .loadOp      = VK_ATTACHMENT_LOAD_OP_CLEAR,
             .storeOp     = VK_ATTACHMENT_STORE_OP_STORE,
@@ -4118,7 +4184,7 @@ rt_transition_all(r, cmd, &r->smaa_weights[image], VK_IMAGE_LAYOUT_SHADER_READ_O
 static void pass_ldr_to_swapchain(Renderer *r, VkCommandBuffer cmd) {
     uint32_t image = r->swapchain.current_image;
 
-    rt_transition_all(r, cmd, &r->ldr_color[image], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+    rt_transition_all(r, cmd, &r->smaa_final[image], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                       VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
 
     image_transition_swapchain(r, cmd, &r->swapchain, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
@@ -4156,7 +4222,7 @@ static void pass_ldr_to_swapchain(Renderer *r, VkCommandBuffer cmd) {
             },
     };
 
-    vkCmdBlitImage(cmd, r->ldr_color[image].image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, r->swapchain.images[image],
+    vkCmdBlitImage(cmd, r->smaa_final[image].image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, r->swapchain.images[image],
                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_NEAREST);
 }
 
@@ -4199,6 +4265,10 @@ int main() {
     while (!glfwWindowShouldClose(g_renderer->window)) {
 
         TracyCFrameMark;
+        glfwPollEvents();
+        ImGui_ImplVulkan_NewFrame();
+        ImGui_ImplGlfw_NewFrame();
+        igNewFrame();
 
         pipeline_rebuild(g_renderer);
         frame_start(g_renderer);
@@ -4226,38 +4296,18 @@ int main() {
                     VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
                     VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT);
 
-                rt_transition_all(renderer, cmd, &renderer->hdr_color[renderer->swapchain.current_image],
-                                  VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                                  VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
-                                  VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
-
-                image_transition_swapchain(renderer, cmd, &renderer->swapchain, VK_IMAGE_LAYOUT_GENERAL,
-                                           VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                                           VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
-
                 flush_barriers(renderer, cmd);
             }
-
-            image_transition_swapchain(renderer, cmd, &renderer->swapchain, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
-                                       VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, 0);
-            flush_barriers(renderer, cmd);
         }
 
-
-
-
-
-
-
-
+        pass_triangle(r, cmd);
         post_pass(r, cmd);
 
 
         pass_smaa(r, cmd);
 
         pass_ldr_to_swapchain(r, cmd);
-
-
+        igRender();
         pass_imgui(r, cmd);
 
 
