@@ -4013,8 +4013,7 @@ static void post_pass(Renderer *r, VkCommandBuffer cmd) {
             .exposure        = 1.2f,
         };
 
-        vkCmdPushConstants(cmd, r->bindless_system.pipeline_layout, VK_SHADER_STAGE_ALL, 0, sizeof(push),
-                           &push);
+        vkCmdPushConstants(cmd, r->bindless_system.pipeline_layout, VK_SHADER_STAGE_ALL, 0, sizeof(push), &push);
 
         uint32_t gx = (push.width + 15) / 16;
         uint32_t gy = (push.height + 15) / 16;
@@ -4162,8 +4161,8 @@ static void pass_smaa(Renderer *r, VkCommandBuffer cmd) {
             .sampler_id = r->default_samplers.samplers[SAMPLER_LINEAR_CLAMP],
         };
 
-        vkCmdPushConstants(cmd, r->bindless_system.pipeline_layout, VK_SHADER_STAGE_ALL, 0,
-                           sizeof(weight_push), &weight_push);
+        vkCmdPushConstants(cmd, r->bindless_system.pipeline_layout, VK_SHADER_STAGE_ALL, 0, sizeof(weight_push),
+                           &weight_push);
 
         vkCmdDraw(cmd, 3, 1, 0, 0);
 
@@ -4359,19 +4358,12 @@ int main() {
         igRender();
         pass_imgui(r, cmd);
 
-  image_transition_swapchain(
-        r,
-        cmd,
-        &r->swapchain,
-        VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
-        VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
-        0
-    );
-  
-flush_barriers(r, cmd);
+        image_transition_swapchain(r, cmd, &r->swapchain, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                                   VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, 0);
+
+        flush_barriers(r, cmd);
 
         vk_cmd_end(cmd);
-
 
         submit_frame(renderer);
     }
