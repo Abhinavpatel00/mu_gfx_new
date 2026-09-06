@@ -6,6 +6,9 @@
 #include <stdint.h>
 #include <vulkan/vulkan_core.h>
 
+
+          #define DMON_IMPL
+#include "external/dmon/dmon.h"
 // ids
 
 
@@ -367,7 +370,7 @@ typedef struct {
     double cpu_active_ns;     // time spent in engine work
     double cpu_wait_ns;       // time waiting for GPU
     double cpu_wait_accum_ns; // accumulated wait over several frames
-    double cpu_prev_frame;    // timestamp from previous frame
+    uint64_t cpu_prev_frame;  // timestamp from previous frame
 
     // ---- HOT: touched every frame ----
     // FrameContext   frames[MAX_FRAMES_IN_FLIGHT];
@@ -3149,7 +3152,7 @@ void renderer_create(Renderer *r, RendererDesc *desc) {
     log_info("[renderer] frame contexts created");
 
     r->current_frame     = 0;
-    r->cpu_prev_frame    = (double)mu_time_now();
+    r->cpu_prev_frame    = mu_time_now();
     r->cpu_frame_ns      = 0.0;
     r->cpu_active_ns     = 0.0;
     r->cpu_wait_ns       = 0.0;
@@ -3818,7 +3821,7 @@ void graphics_init(void) {
         .instance_extension_count    = glfw_ext_count,
         .device_extension_count      = 2,
         .enable_gpu_based_validation = VALIDATION,
-        .enable_validation           = true,
+        .enable_validation           =  false,
 
         .validation_severity =
             VK_DEBUG_UTILS_MESSAGE_SEVERITY_VERBOSE_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT |
@@ -3839,7 +3842,7 @@ void graphics_init(void) {
         .bindless_sampled_image_count     = 65536,
         .bindless_sampler_count           = 256,
         .bindless_storage_image_count     = 16384,
-        .enable_pipeline_stats            = false,
+        .enable_pipeline_stats            = true,
         .swapchain_preferred_present_mode = VK_PRESENT_MODE_IMMEDIATE_KHR,
 
         .size_of_cpu_pool     = MB(32),
@@ -3919,6 +3922,10 @@ typedef struct GpuProfilerUIState {
     uint32_t frame_counter;
 } GpuProfilerUIState;
 
+static double ns_to_ms(double ns) {
+    return ns / 1000000.0;
+}
+
 static GpuProfilerUIState g_gpu_profiler_ui = {
     .open = true,
     .paused = false,
@@ -3928,7 +3935,7 @@ static GpuProfilerUIState g_gpu_profiler_ui = {
 static void gpu_profiler_ui_update(GpuProfiler *p) {
     if (g_gpu_profiler_ui.paused || !p || p->pass_count == 0) return;
 
-    g_gpu_profiler_ui.pass_count = p->pass_count;
+    g_gpu_profiler_ui.pass_count = MIN(p->pass_count, MAX_RECORDED_PASSES);
     double total_ms = 0.0;
 
     for (uint32_t i = 0; i < p->pass_count && i < MAX_RECORDED_PASSES; i++) {
@@ -3977,8 +3984,23 @@ static void gpu_profiler_ui_update(GpuProfiler *p) {
     g_gpu_profiler_ui.frame_counter++;
 }
 
+static void profiler_format_count(char *buffer, size_t buffer_size, uint64_t value) {
+    if (value >= 1000000000ull) {
+        snprintf(buffer, buffer_size, "%.2f B", (double)value / 1000000000.0);
+    } else if (value >= 1000000ull) {
+        snprintf(buffer, buffer_size, "%.2f M", (double)value / 1000000.0);
+    } else if (value >= 1000ull) {
+        snprintf(buffer, buffer_size, "%.1f k", (double)value / 1000.0);
+    } else {
+        snprintf(buffer, buffer_size, "%llu", (unsigned long long)value);
+    }
+}
+
 static MU_INLINE void frame_start(Renderer *r) {
     TracyCZoneNC(ctx, "frame_start", 0x00FF00, 1);
+    uint64_t frame_now = mu_time_now();
+    r->cpu_frame_ns = (double)(frame_now - r->cpu_prev_frame);
+    r->cpu_prev_frame = frame_now;
     r->current_frame = (r->current_frame + 1) % MAX_FRAMES_IN_FLIGHT;
 
     int fb_w, fb_h;
@@ -4012,7 +4034,11 @@ static MU_INLINE void frame_start(Renderer *r) {
 
     FrameContext *f = &r->frames[r->current_frame];
 
+    uint64_t wait_start = mu_time_now();
     VK_CHECK(vkWaitForFences(r->devc.device, 1, &f->in_flight_fence, VK_TRUE, UINT64_MAX));
+    r->cpu_wait_ns = (double)(mu_time_now() - wait_start);
+    r->cpu_wait_accum_ns = r->cpu_wait_accum_ns * 0.95 + r->cpu_wait_ns * 0.05;
+    r->cpu_active_ns = MAX(r->cpu_frame_ns - r->cpu_wait_ns, 0.0);
 
     VK_CHECK(vkResetFences(r->devc.device, 1, &f->in_flight_fence));
 
@@ -4100,6 +4126,51 @@ static void render_gpu_profiler_ui(Renderer *r) {
     }
 
     igSeparator();
+
+    double frame_ms = ns_to_ms(r->cpu_frame_ns);
+    double active_ms = ns_to_ms(r->cpu_active_ns);
+    double wait_ms = ns_to_ms(r->cpu_wait_ns);
+    double wait_avg_ms = ns_to_ms(r->cpu_wait_accum_ns);
+    double gpu_ms = g_gpu_profiler_ui.total_gpu_time_ms;
+    double frame_budget_pct = frame_ms > 0.0 ? gpu_ms / frame_ms * 100.0 : 0.0;
+    if (frame_budget_pct > 100.0) frame_budget_pct = 100.0;
+
+    igTextColored((ImVec4_c){0.3f, 0.8f, 1.0f, 1.0f}, "Frame Metrics");
+    if (igBeginTable("FrameMetrics", 3, ImGuiTableFlags_SizingStretchProp, (ImVec2_c){0.0f, 0.0f}, 0.0f)) {
+        igTableSetupColumn("Metric", ImGuiTableColumnFlags_WidthStretch, 1.0f, 0);
+        igTableSetupColumn("Current", ImGuiTableColumnFlags_WidthFixed, 105.0f, 0);
+        igTableSetupColumn("Details", ImGuiTableColumnFlags_WidthStretch, 1.0f, 0);
+        igTableHeadersRow();
+
+        igTableNextRow(0, 0.0f);
+        igTableSetColumnIndex(0); igText("Frame time");
+        igTableSetColumnIndex(1); igText("%.3f ms", frame_ms);
+        igTableSetColumnIndex(2); igText("%.1f FPS", io ? io->Framerate : 0.0f);
+
+        igTableNextRow(0, 0.0f);
+        igTableSetColumnIndex(0); igText("CPU active time");
+        igTableSetColumnIndex(1); igText("%.3f ms", active_ms);
+        igTableSetColumnIndex(2); igText("%.1f%% of frame", frame_ms > 0.0 ? active_ms / frame_ms * 100.0 : 0.0);
+
+        igTableNextRow(0, 0.0f);
+        igTableSetColumnIndex(0); igText("CPU waiting time");
+        igTableSetColumnIndex(1); igText("%.3f ms", wait_ms);
+        igTableSetColumnIndex(2); igText("EMA %.3f ms", wait_avg_ms);
+
+        igTableNextRow(0, 0.0f);
+        igTableSetColumnIndex(0); igText("GPU frame time");
+        igTableSetColumnIndex(1); igText("%.3f ms", gpu_ms);
+        igTableSetColumnIndex(2); igText("%.1f%% of CPU frame", frame_budget_pct);
+
+        igTableNextRow(0, 0.0f);
+        igTableSetColumnIndex(0); igText("ImGui workload");
+        igTableSetColumnIndex(1); igText("%d windows", io ? io->MetricsActiveWindows : 0);
+        igTableSetColumnIndex(2); igText("%d vertices | %d indices", io ? io->MetricsRenderVertices : 0,
+                                         io ? io->MetricsRenderIndices : 0);
+        igEndTable();
+    }
+
+    igSpacing();
 
     igText("Total GPU Time: ");
     igSameLine(0.0f, 0.0f);
@@ -4513,7 +4584,7 @@ FORCE_INLINE void imgui_begin_frame(void) {
 int main() {
 
     graphics_init();
-
+dmon_init();
     while (!glfwWindowShouldClose(g_renderer->window)) {
 
         TracyCFrameMark;
