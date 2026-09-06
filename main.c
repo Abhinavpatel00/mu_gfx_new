@@ -2591,7 +2591,7 @@ static bool shader_change_matches_spv(const char *changed, const char *spv) {
     if (strstr(changed, slang))
         return true;
 
-    const char *slang_name   = path_basename(slang);
+    const char *slang_name = path_basename(slang);
 
     return strcmp(changed_name, slang_name) == 0;
 }
@@ -2685,7 +2685,7 @@ void pipeline_mark_dirty(Renderer *r, const char *changed) {
             e->dirty = true;
     }
 }
-static dmon_watch_id g_source_watch_id ;
+static dmon_watch_id g_source_watch_id;
 
 static void watch_callback(dmon_watch_id watch_id, dmon_action action, const char *rootdir, const char *filepath,
                            const char *oldfilepath, void *user) {
@@ -3962,7 +3962,7 @@ typedef struct GpuProfilerUIState {
 static double ns_to_ms(double ns) { return ns / 1000000.0; }
 
 static GpuProfilerUIState g_gpu_profiler_ui = {
-    .open                =  false,
+    .open                = false,
     .paused              = false,
     .show_pipeline_stats = true,
 };
@@ -4140,14 +4140,25 @@ PUSH_CONSTANT(BlendPush, uint32_t color_tex; uint32_t weight_tex; uint32_t sampl
 
 PUSH_CONSTANT(WeightPush, uint32_t edge_tex; uint32_t area_tex; uint32_t search_tex; uint32_t sampler_id;);
 
-
-
 static void render_gpu_profiler_ui(Renderer *r) {
-    if (!g_gpu_profiler_ui.open)
-        return;
 
     ImGuiIO *io = igGetIO_Nil();
+    if (!g_gpu_profiler_ui.open) {
+        ImGuiIO *io = igGetIO_Nil();
+        if (igBegin("GPU Profiler (Hidden)", NULL,
+                    ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoMove)) {
+            igTextColored((ImVec4_c){0.3f, 0.8f, 1.0f, 1.0f}, "Profiler");
+            igSameLine(0.0f, 10.0f);
+            if (igButton("Show", (ImVec2_c){40, 20})) {
+                g_gpu_profiler_ui.open = true;
+            }
+        }
+        igEnd();
+        return;
+    }
 
+    if (!g_gpu_profiler_ui.open)
+        return;
     igSetNextWindowSize((ImVec2_c){720.0f, 520.0f}, ImGuiCond_FirstUseEver);
     if (!igBegin("GPU Profiler", &g_gpu_profiler_ui.open, ImGuiWindowFlags_None)) {
         igEnd();
@@ -4157,6 +4168,10 @@ static void render_gpu_profiler_ui(Renderer *r) {
     igTextColored((ImVec4_c){0.3f, 0.9f, 0.5f, 1.0f}, "GPU Timing Profiler");
     igSameLine(0.0f, 20.0f);
     igCheckbox("Pause", &g_gpu_profiler_ui.paused);
+    if (igButton("CLOSE", (ImVec2_c){40, 20})) {
+        g_gpu_profiler_ui.open = false;
+    }
+
     igSameLine(0.0f, 15.0f);
     igCheckbox("Pipeline Stats", &g_gpu_profiler_ui.show_pipeline_stats);
     igSameLine(0.0f, 15.0f);
@@ -4672,9 +4687,9 @@ int main() {
     graphics_init();
     dmon_init();
 
-        g_source_watch_id = dmon_watch("shaders", watch_callback, DMON_WATCHFLAGS_RECURSIVE, g_renderer);
+    g_source_watch_id = dmon_watch("shaders", watch_callback, DMON_WATCHFLAGS_RECURSIVE, g_renderer);
 
-        dmon_watch("compiledshaders", watch_callback, DMON_WATCHFLAGS_RECURSIVE, g_renderer);
+    dmon_watch("compiledshaders", watch_callback, DMON_WATCHFLAGS_RECURSIVE, g_renderer);
     // Specify your shader directory here
     while (!glfwWindowShouldClose(g_renderer->window)) {
 
