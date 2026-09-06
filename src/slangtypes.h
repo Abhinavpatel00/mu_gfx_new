@@ -7,8 +7,8 @@
 
 #if defined(__STDC__)
 
-#include <stdint.h>
 #include <cglm/cglm.h>
+#include <stdint.h>
 
 /* ----- scalar types ----- */
 
@@ -24,9 +24,9 @@ typedef ivec2 int2;
 typedef ivec3 int3;
 typedef ivec4 int4;
 
-//typedef uvec2 uint2;
-//typedef uvec3 uint3;
-//typedef uvec4 uint4;
+// typedef uvec2 uint2;
+// typedef uvec3 uint3;
+// typedef uvec4 uint4;
 
 /* ----- matrix types ----- */
 
@@ -42,49 +42,44 @@ typedef float float3x2[3][2];
 
 /* ----- helper functions ----- */
 
-static inline float lerp(float a, float b, float t)
-{
-    return a + (b - a) * t;
-}
+static inline float lerp(float a, float b, float t) { return a + (b - a) * t; }
 
 /* =========================================================
    Shared GPU/CPU structs
    ========================================================= */
 
-typedef struct GlobalData
-{
-    float4x4 view;            // 64 bytes
-    float4x4 projection;      // 64 bytes
-    float4x4 viewproj;        // 64 bytes
-    float4x4 inv_view;        // 64 bytes
-    float4x4 inv_projection;  // 64 bytes
-    float4x4 inv_viewproj;    // 64 bytes
-    float4   camera_pos;      // 16 bytes (xyz + fov)
-    float4   camera_dir;      // 16 bytes (xyz + aspect)
-    float    time;            // 4 bytes
-    float    delta_time;      // 4 bytes
-    uint     frame_count;     // 4 bytes
-    uint     pad;             // 4 bytes
-} GlobalData;                 // 432 bytes
+typedef struct GlobalData {
+    float4x4 view;           // 64 bytes
+    float4x4 projection;     // 64 bytes
+    float4x4 viewproj;       // 64 bytes
+    float4x4 inv_view;       // 64 bytes
+    float4x4 inv_projection; // 64 bytes
+    float4x4 inv_viewproj;   // 64 bytes
+    float4   camera_pos;     // 16 bytes (xyz + fov)
+    float4   camera_dir;     // 16 bytes (xyz + aspect)
+    float    time;           // 4 bytes
+    float    delta_time;     // 4 bytes
+    uint     frame_count;    // 4 bytes
+    uint     pad;            // 4 bytes
+    float4   screen_params;  // x = width, y = height, z = 1/width, w = 1/height
+    float2   mouse_pos;
 
-static inline void mul_mat4(mat4 a, mat4 b, mat4 out)
-{
-    glm_mat4_mul(a, b, out);
-}
+    float2 mouse_buttons;
 
-static inline void mul_mat4_vec4(mat4 m, vec4 v, vec4 out)
-{
-    glm_mat4_mulv(m, v, out);
-}
+} GlobalData; // 432 bytes
+
+static inline void mul_mat4(mat4 a, mat4 b, mat4 out) { glm_mat4_mul(a, b, out); }
+
+static inline void mul_mat4_vec4(mat4 m, vec4 v, vec4 out) { glm_mat4_mulv(m, v, out); }
 
 #define SLANG_DEFAULT(x)
 
 #ifndef NVSHADERS_OUT_TYPE
-#define NVSHADERS_OUT_TYPE(T) T*
+#define NVSHADERS_OUT_TYPE(T) T *
 #endif
 
 #ifndef NVSHADERS_INOUT_TYPE
-#define NVSHADERS_INOUT_TYPE(T) T*
+#define NVSHADERS_INOUT_TYPE(T) T *
 #endif
 
 /* =========================================================
@@ -119,16 +114,15 @@ static inline void mul_mat4_vec4(mat4 m, vec4 v, vec4 out)
 #define NVSHADERS_INOUT_TYPE(T) inout T
 #endif
 
-struct GlobalData
-{
+struct GlobalData {
     float4x4 view;
     float4x4 projection;
     float4x4 viewproj;
     float4x4 inv_view;
     float4x4 inv_projection;
     float4x4 inv_viewproj;
-    float4   camera_pos;   // xyz + fov
-    float4   camera_dir;   // xyz + aspect
+    float4   camera_pos; // xyz + fov
+    float4   camera_dir; // xyz + aspect
     float    time;
     float    delta_time;
     uint     frame_count;
