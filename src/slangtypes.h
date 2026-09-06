@@ -127,6 +127,9 @@ struct GlobalData {
     float    delta_time;
     uint     frame_count;
     uint     pad;
+   float4   screen_params;
+   float2   mouse_pos;
+   float2   mouse_buttons;
 };
 
 #else

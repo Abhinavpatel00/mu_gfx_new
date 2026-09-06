@@ -4,16 +4,7 @@
 // Optimized procedural fire - Slang / Vulkan
 // ============================================================
 
-struct FirePush
-{
-    uint  width;
-    uint  height;
-    float time;
-    float pad;
-};
-
-[[vk::push_constant]]
-FirePush push;
+#include "common.slang"
 
 
 struct VSOutput
@@ -41,12 +32,11 @@ VSOutput vs_main(uint id : SV_VertexID)
 [shader("fragment")]
 float4 fs_main(VSOutput input) : SV_Target0
 {
-    float2 R = float2(push.width, push.height);
-    float  T = push.time;
+    float2 R = global_data.screen_params.xy;
+    float  T = global_data.time;
 
 
     float2 C = input.position.xy;
-    C.y = R.y - C.y;
 
     float3 rd = normalize(float3(
         2.0 * C.x - R.x,
