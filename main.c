@@ -6,12 +6,9 @@
 #include <stdint.h>
 #include <vulkan/vulkan_core.h>
 
-
-          #define DMON_IMPL
+#define DMON_IMPL
 #include "external/dmon/dmon.h"
 // ids
-
-
 
 typedef uint32_t TextureID;
 typedef uint32_t SamplerID;
@@ -366,11 +363,11 @@ typedef struct BarrierBatch {
 
 typedef struct {
     // ---- CPU profiling ----
-    double cpu_frame_ns;      // total frame time (e.g., from glfwGetTime)
-    double cpu_active_ns;     // time spent in engine work
-    double cpu_wait_ns;       // time waiting for GPU
-    double cpu_wait_accum_ns; // accumulated wait over several frames
-    uint64_t cpu_prev_frame;  // timestamp from previous frame
+    double   cpu_frame_ns;      // total frame time (e.g., from glfwGetTime)
+    double   cpu_active_ns;     // time spent in engine work
+    double   cpu_wait_ns;       // time waiting for GPU
+    double   cpu_wait_accum_ns; // accumulated wait over several frames
+    uint64_t cpu_prev_frame;    // timestamp from previous frame
 
     // ---- HOT: touched every frame ----
     // FrameContext   frames[MAX_FRAMES_IN_FLIGHT];
@@ -2684,6 +2681,38 @@ void pipeline_mark_dirty(Renderer *r, const char *changed) {
             e->dirty = true;
     }
 }
+static dmon_watch_id g_source_watch_id ;
+
+static void watch_callback(dmon_watch_id watch_id, dmon_action action, const char *rootdir, const char *filepath,
+                           const char *oldfilepath, void *user) {
+    Renderer *r = (Renderer *)user;
+
+    if (action != DMON_ACTION_CREATE && action != DMON_ACTION_MODIFY && action != DMON_ACTION_MOVE) {
+        return;
+    }
+
+    // --- Handle Source Shader Changes (e.g., in "shaders/") ---
+    if (watch_id.id == g_source_watch_id.id) {
+        // Check if it's a source file (e.g., .slang, .vert, .frag)
+        const char *ext = strrchr(filepath, '.');
+        if (ext && (strcmp(ext, ".slang") == 0 || strcmp(ext, ".vert") == 0 || strcmp(ext, ".frag") == 0)) {
+            // Trigger the bash script
+            trigger_shader_compilation();
+        }
+    }
+    // --- Handle Compiled Shader Changes (e.g., in "compiledshaders/") ---
+    else {
+        // Check if it's a .spv file
+        const char *ext = strrchr(filepath, '.');
+        if (!ext || strcmp(ext, ".spv") != 0)
+            return;
+
+        // Construct path and mark dirty
+        char full_path[512];
+        snprintf(full_path, sizeof(full_path), "%s/%s", rootdir, filepath);
+        pipeline_mark_dirty(r, full_path);
+    }
+}
 
 void image_transition_swapchain(Renderer *r, VkCommandBuffer cmd, FlowSwapchain *sc, VkImageLayout new_layout,
                                 VkPipelineStageFlags2 dst_stage, VkAccessFlags2 dst_access) {
@@ -3301,13 +3330,13 @@ void renderer_create(Renderer *r, RendererDesc *desc) {
     allocatorInfo.pVulkanFunctions = &vulkanFunctions;
 
     vmaCreateAllocator(&allocatorInfo, &r->devc.vmaallocator);
-VkDescriptorPoolSize pool_sizes[] = {
-    { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, IMGUI_COMBINED_IMAGE_COUNT },
-    { VK_DESCRIPTOR_TYPE_SAMPLER,                IMGUI_SAMPLER_COUNT },
-    { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,         IMGUI_UBO_COUNT },
-    { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,         IMGUI_SSBO_COUNT },
-    { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,          IMGUI_SAMPLED_IMAGE_COUNT },
-};
+    VkDescriptorPoolSize pool_sizes[] = {
+        {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, IMGUI_COMBINED_IMAGE_COUNT},
+        {VK_DESCRIPTOR_TYPE_SAMPLER, IMGUI_SAMPLER_COUNT},
+        {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, IMGUI_UBO_COUNT},
+        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, IMGUI_SSBO_COUNT},
+        {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, IMGUI_SAMPLED_IMAGE_COUNT},
+    };
     VkDescriptorPoolCreateInfo pool_info = {
         .sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
         .flags         = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,
@@ -3821,7 +3850,7 @@ void graphics_init(void) {
         .instance_extension_count    = glfw_ext_count,
         .device_extension_count      = 2,
         .enable_gpu_based_validation = VALIDATION,
-        .enable_validation           =  false,
+        .enable_validation           = false,
 
         .validation_severity =
             VK_DEBUG_UTILS_MESSAGE_SEVERITY_VERBOSE_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT |
@@ -3894,53 +3923,52 @@ FORCE_INLINE bool vk_swapchain_present(VkQueue present_queue, FlowSwapchain *sc,
 }
 
 #define GPU_PROF_HISTORY_SIZE 128
-#define MAX_RECORDED_PASSES 32
+#define MAX_RECORDED_PASSES   32
 
 typedef struct GpuPassStats {
-    char name[64];
-    double time_ms;
-    double avg_ms;
-    double min_ms;
-    double max_ms;
+    char     name[64];
+    double   time_ms;
+    double   avg_ms;
+    double   min_ms;
+    double   max_ms;
     uint64_t vs_invocations;
     uint64_t fs_invocations;
     uint64_t primitives;
-    float history[GPU_PROF_HISTORY_SIZE];
+    float    history[GPU_PROF_HISTORY_SIZE];
     uint32_t history_idx;
 } GpuPassStats;
 
 typedef struct GpuProfilerUIState {
-    bool open;
-    bool paused;
-    bool show_pipeline_stats;
-    uint32_t pass_count;
-    double total_gpu_time_ms;
-    double avg_total_gpu_time_ms;
-    float total_history[GPU_PROF_HISTORY_SIZE];
-    uint32_t total_history_idx;
+    bool         open;
+    bool         paused;
+    bool         show_pipeline_stats;
+    uint32_t     pass_count;
+    double       total_gpu_time_ms;
+    double       avg_total_gpu_time_ms;
+    float        total_history[GPU_PROF_HISTORY_SIZE];
+    uint32_t     total_history_idx;
     GpuPassStats pass_stats[MAX_RECORDED_PASSES];
-    uint32_t frame_counter;
+    uint32_t     frame_counter;
 } GpuProfilerUIState;
 
-static double ns_to_ms(double ns) {
-    return ns / 1000000.0;
-}
+static double ns_to_ms(double ns) { return ns / 1000000.0; }
 
 static GpuProfilerUIState g_gpu_profiler_ui = {
-    .open = true,
-    .paused = false,
+    .open                = true,
+    .paused              = false,
     .show_pipeline_stats = true,
 };
 
 static void gpu_profiler_ui_update(GpuProfiler *p) {
-    if (g_gpu_profiler_ui.paused || !p || p->pass_count == 0) return;
+    if (g_gpu_profiler_ui.paused || !p || p->pass_count == 0)
+        return;
 
     g_gpu_profiler_ui.pass_count = MIN(p->pass_count, MAX_RECORDED_PASSES);
-    double total_ms = 0.0;
+    double total_ms              = 0.0;
 
     for (uint32_t i = 0; i < p->pass_count && i < MAX_RECORDED_PASSES; i++) {
-        GpuPass *pass = &p->passes[i];
-        GpuPassStats *ps = &g_gpu_profiler_ui.pass_stats[i];
+        GpuPass      *pass = &p->passes[i];
+        GpuPassStats *ps   = &g_gpu_profiler_ui.pass_stats[i];
 
         if (pass->name) {
             strncpy(ps->name, pass->name, sizeof(ps->name) - 1);
@@ -3950,7 +3978,8 @@ static void gpu_profiler_ui_update(GpuProfiler *p) {
         }
 
         double ms = pass->time_ms;
-        if (ms < 0.0) ms = 0.0;
+        if (ms < 0.0)
+            ms = 0.0;
         ps->time_ms = ms;
         total_ms += ms;
 
@@ -3960,8 +3989,10 @@ static void gpu_profiler_ui_update(GpuProfiler *p) {
             ps->max_ms = ms;
         } else {
             ps->avg_ms = ps->avg_ms * 0.95 + ms * 0.05;
-            if (ms < ps->min_ms) ps->min_ms = ms;
-            if (ms > ps->max_ms) ps->max_ms = ms;
+            if (ms < ps->min_ms)
+                ps->min_ms = ms;
+            if (ms > ps->max_ms)
+                ps->max_ms = ms;
         }
 
         ps->vs_invocations = pass->vs_invocations;
@@ -3969,7 +4000,7 @@ static void gpu_profiler_ui_update(GpuProfiler *p) {
         ps->primitives     = pass->primitives;
 
         ps->history[ps->history_idx] = (float)ms;
-        ps->history_idx = (ps->history_idx + 1) % GPU_PROF_HISTORY_SIZE;
+        ps->history_idx              = (ps->history_idx + 1) % GPU_PROF_HISTORY_SIZE;
     }
 
     g_gpu_profiler_ui.total_gpu_time_ms = total_ms;
@@ -3999,9 +4030,9 @@ static void profiler_format_count(char *buffer, size_t buffer_size, uint64_t val
 static MU_INLINE void frame_start(Renderer *r) {
     TracyCZoneNC(ctx, "frame_start", 0x00FF00, 1);
     uint64_t frame_now = mu_time_now();
-    r->cpu_frame_ns = (double)(frame_now - r->cpu_prev_frame);
-    r->cpu_prev_frame = frame_now;
-    r->current_frame = (r->current_frame + 1) % MAX_FRAMES_IN_FLIGHT;
+    r->cpu_frame_ns    = (double)(frame_now - r->cpu_prev_frame);
+    r->cpu_prev_frame  = frame_now;
+    r->current_frame   = (r->current_frame + 1) % MAX_FRAMES_IN_FLIGHT;
 
     int fb_w, fb_h;
     glfwGetFramebufferSize(r->window, &fb_w, &fb_h);
@@ -4036,9 +4067,9 @@ static MU_INLINE void frame_start(Renderer *r) {
 
     uint64_t wait_start = mu_time_now();
     VK_CHECK(vkWaitForFences(r->devc.device, 1, &f->in_flight_fence, VK_TRUE, UINT64_MAX));
-    r->cpu_wait_ns = (double)(mu_time_now() - wait_start);
+    r->cpu_wait_ns       = (double)(mu_time_now() - wait_start);
     r->cpu_wait_accum_ns = r->cpu_wait_accum_ns * 0.95 + r->cpu_wait_ns * 0.05;
-    r->cpu_active_ns = MAX(r->cpu_frame_ns - r->cpu_wait_ns, 0.0);
+    r->cpu_active_ns     = MAX(r->cpu_frame_ns - r->cpu_wait_ns, 0.0);
 
     VK_CHECK(vkResetFences(r->devc.device, 1, &f->in_flight_fence));
 
@@ -4102,7 +4133,8 @@ PUSH_CONSTANT(BlendPush, uint32_t color_tex; uint32_t weight_tex; uint32_t sampl
 PUSH_CONSTANT(WeightPush, uint32_t edge_tex; uint32_t area_tex; uint32_t search_tex; uint32_t sampler_id;);
 
 static void render_gpu_profiler_ui(Renderer *r) {
-    if (!g_gpu_profiler_ui.open) return;
+    if (!g_gpu_profiler_ui.open)
+        return;
 
     ImGuiIO *io = igGetIO_Nil();
 
@@ -4127,13 +4159,14 @@ static void render_gpu_profiler_ui(Renderer *r) {
 
     igSeparator();
 
-    double frame_ms = ns_to_ms(r->cpu_frame_ns);
-    double active_ms = ns_to_ms(r->cpu_active_ns);
-    double wait_ms = ns_to_ms(r->cpu_wait_ns);
-    double wait_avg_ms = ns_to_ms(r->cpu_wait_accum_ns);
-    double gpu_ms = g_gpu_profiler_ui.total_gpu_time_ms;
+    double frame_ms         = ns_to_ms(r->cpu_frame_ns);
+    double active_ms        = ns_to_ms(r->cpu_active_ns);
+    double wait_ms          = ns_to_ms(r->cpu_wait_ns);
+    double wait_avg_ms      = ns_to_ms(r->cpu_wait_accum_ns);
+    double gpu_ms           = g_gpu_profiler_ui.total_gpu_time_ms;
     double frame_budget_pct = frame_ms > 0.0 ? gpu_ms / frame_ms * 100.0 : 0.0;
-    if (frame_budget_pct > 100.0) frame_budget_pct = 100.0;
+    if (frame_budget_pct > 100.0)
+        frame_budget_pct = 100.0;
 
     igTextColored((ImVec4_c){0.3f, 0.8f, 1.0f, 1.0f}, "Frame Metrics");
     if (igBeginTable("FrameMetrics", 3, ImGuiTableFlags_SizingStretchProp, (ImVec2_c){0.0f, 0.0f}, 0.0f)) {
@@ -4143,34 +4176,70 @@ static void render_gpu_profiler_ui(Renderer *r) {
         igTableHeadersRow();
 
         igTableNextRow(0, 0.0f);
-        igTableSetColumnIndex(0); igText("Frame time");
-        igTableSetColumnIndex(1); igText("%.3f ms", frame_ms);
-        igTableSetColumnIndex(2); igText("%.1f FPS", io ? io->Framerate : 0.0f);
+        igTableSetColumnIndex(0);
+        igText("Frame time");
+        igTableSetColumnIndex(1);
+        igText("%.3f ms", frame_ms);
+        igTableSetColumnIndex(2);
+        igText("%.1f FPS", io ? io->Framerate : 0.0f);
 
         igTableNextRow(0, 0.0f);
-        igTableSetColumnIndex(0); igText("CPU active time");
-        igTableSetColumnIndex(1); igText("%.3f ms", active_ms);
-        igTableSetColumnIndex(2); igText("%.1f%% of frame", frame_ms > 0.0 ? active_ms / frame_ms * 100.0 : 0.0);
+        igTableSetColumnIndex(0);
+        igText("CPU active time");
+        igTableSetColumnIndex(1);
+        igText("%.3f ms", active_ms);
+        igTableSetColumnIndex(2);
+        igText("%.1f%% of frame", frame_ms > 0.0 ? active_ms / frame_ms * 100.0 : 0.0);
 
         igTableNextRow(0, 0.0f);
-        igTableSetColumnIndex(0); igText("CPU waiting time");
-        igTableSetColumnIndex(1); igText("%.3f ms", wait_ms);
-        igTableSetColumnIndex(2); igText("EMA %.3f ms", wait_avg_ms);
+        igTableSetColumnIndex(0);
+        igText("CPU waiting time");
+        igTableSetColumnIndex(1);
+        igText("%.3f ms", wait_ms);
+        igTableSetColumnIndex(2);
+        igText("EMA %.3f ms", wait_avg_ms);
 
         igTableNextRow(0, 0.0f);
-        igTableSetColumnIndex(0); igText("GPU frame time");
-        igTableSetColumnIndex(1); igText("%.3f ms", gpu_ms);
-        igTableSetColumnIndex(2); igText("%.1f%% of CPU frame", frame_budget_pct);
+        igTableSetColumnIndex(0);
+        igText("GPU frame time");
+        igTableSetColumnIndex(1);
+        igText("%.3f ms", gpu_ms);
+        igTableSetColumnIndex(2);
+        igText("%.1f%% of CPU frame", frame_budget_pct);
 
         igTableNextRow(0, 0.0f);
-        igTableSetColumnIndex(0); igText("ImGui workload");
-        igTableSetColumnIndex(1); igText("%d windows", io ? io->MetricsActiveWindows : 0);
-        igTableSetColumnIndex(2); igText("%d vertices | %d indices", io ? io->MetricsRenderVertices : 0,
-                                         io ? io->MetricsRenderIndices : 0);
+        igTableSetColumnIndex(0);
+        igText("ImGui workload");
+        igTableSetColumnIndex(1);
+        igText("%d windows", io ? io->MetricsActiveWindows : 0);
+        igTableSetColumnIndex(2);
+        igText("%d vertices | %d indices", io ? io->MetricsRenderVertices : 0, io ? io->MetricsRenderIndices : 0);
         igEndTable();
     }
 
     igSpacing();
+
+    if (g_gpu_profiler_ui.show_pipeline_stats) {
+        uint64_t total_vs         = 0;
+        uint64_t total_fs         = 0;
+        uint64_t total_primitives = 0;
+        for (uint32_t i = 0; i < g_gpu_profiler_ui.pass_count; i++) {
+            total_vs += g_gpu_profiler_ui.pass_stats[i].vs_invocations;
+            total_fs += g_gpu_profiler_ui.pass_stats[i].fs_invocations;
+            total_primitives += g_gpu_profiler_ui.pass_stats[i].primitives;
+        }
+
+        char vs_buf[32];
+        char fs_buf[32];
+        char primitives_buf[32];
+        profiler_format_count(vs_buf, sizeof(vs_buf), total_vs);
+        profiler_format_count(fs_buf, sizeof(fs_buf), total_fs);
+        profiler_format_count(primitives_buf, sizeof(primitives_buf), total_primitives);
+        igText("Pipeline statistics");
+        igSameLine(0.0f, 15.0f);
+        igText("Vertices: %s | Fragments: %s | Clipping primitives: %s", vs_buf, fs_buf, primitives_buf);
+        igSpacing();
+    }
 
     igText("Total GPU Time: ");
     igSameLine(0.0f, 0.0f);
@@ -4185,7 +4254,8 @@ static void render_gpu_profiler_ui(Renderer *r) {
     char overlay_buf[64];
     snprintf(overlay_buf, sizeof(overlay_buf), "Total: %.3f ms", g_gpu_profiler_ui.total_gpu_time_ms);
     float max_graph_val = (float)g_gpu_profiler_ui.avg_total_gpu_time_ms * 1.5f;
-    if (max_graph_val < 1.0f) max_graph_val = 1.0f;
+    if (max_graph_val < 1.0f)
+        max_graph_val = 1.0f;
 
     igPlotLines_FloatPtr("##GpuTotalTimeGraph", g_gpu_profiler_ui.total_history, GPU_PROF_HISTORY_SIZE,
                          (int)g_gpu_profiler_ui.total_history_idx, overlay_buf, 0.0f, max_graph_val,
@@ -4193,9 +4263,9 @@ static void render_gpu_profiler_ui(Renderer *r) {
 
     igSpacing();
 
-    int table_cols = g_gpu_profiler_ui.show_pipeline_stats ? 7 : 5;
-    ImGuiTableFlags table_flags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
-                                  ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchProp;
+    int             table_cols = g_gpu_profiler_ui.show_pipeline_stats ? 8 : 5;
+    ImGuiTableFlags table_flags =
+        ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchProp;
 
     if (igBeginTable("GpuPassTable", table_cols, table_flags, (ImVec2_c){0.0f, 0.0f}, 0.0f)) {
         igTableSetupColumn("Pass Name", ImGuiTableColumnFlags_WidthStretch, 2.0f, 0);
@@ -4206,6 +4276,7 @@ static void render_gpu_profiler_ui(Renderer *r) {
         if (g_gpu_profiler_ui.show_pipeline_stats) {
             igTableSetupColumn("Vert Shaders", ImGuiTableColumnFlags_WidthFixed, 95.0f, 0);
             igTableSetupColumn("Frag Shaders", ImGuiTableColumnFlags_WidthFixed, 95.0f, 0);
+            igTableSetupColumn("Clip Primitives", ImGuiTableColumnFlags_WidthFixed, 105.0f, 0);
         }
         igTableHeadersRow();
 
@@ -4230,8 +4301,11 @@ static void render_gpu_profiler_ui(Renderer *r) {
             igText("%.3f / %.3f", ps->min_ms, ps->max_ms);
 
             igTableSetColumnIndex(4);
-            float pct = (g_gpu_profiler_ui.total_gpu_time_ms > 0.0) ? (float)(ps->time_ms / g_gpu_profiler_ui.total_gpu_time_ms) : 0.0f;
-            if (pct > 1.0f) pct = 1.0f;
+            float pct = (g_gpu_profiler_ui.total_gpu_time_ms > 0.0)
+                            ? (float)(ps->time_ms / g_gpu_profiler_ui.total_gpu_time_ms)
+                            : 0.0f;
+            if (pct > 1.0f)
+                pct = 1.0f;
             char pct_buf[32];
             snprintf(pct_buf, sizeof(pct_buf), "%.1f%%", pct * 100.0f);
             igProgressBar(pct, (ImVec2_c){-1.0f, 0.0f}, pct_buf);
@@ -4247,13 +4321,14 @@ static void render_gpu_profiler_ui(Renderer *r) {
                 }
 
                 igTableSetColumnIndex(6);
-                if (ps->fs_invocations >= 1000000) {
-                    igText("%.2f M", (double)ps->fs_invocations / 1000000.0);
-                } else if (ps->fs_invocations >= 1000) {
-                    igText("%.1f k", (double)ps->fs_invocations / 1000.0);
-                } else {
-                    igText("%llu", (unsigned long long)ps->fs_invocations);
-                }
+                char fs_buf[32];
+                profiler_format_count(fs_buf, sizeof(fs_buf), ps->fs_invocations);
+                igText("%s", fs_buf);
+
+                igTableSetColumnIndex(7);
+                char primitives_buf[32];
+                profiler_format_count(primitives_buf, sizeof(primitives_buf), ps->primitives);
+                igText("%s", primitives_buf);
             }
         }
         igEndTable();
@@ -4303,8 +4378,8 @@ static void post_pass(Renderer *r, VkCommandBuffer cmd) {
 typedef struct FirePush {
     uint32_t width;
     uint32_t height;
-    float time;
-    float pad;
+    float    time;
+    float    pad;
 } FirePush;
 
 static void pass_fire(Renderer *r, VkCommandBuffer cmd) {
@@ -4350,7 +4425,7 @@ static void pass_fire(Renderer *r, VkCommandBuffer cmd) {
 }
 
 static void pass_smaa(Renderer *r, VkCommandBuffer cmd) {
-    uint32_t image = r->swapchain.current_image;
+    uint32_t     image      = r->swapchain.current_image;
     GpuProfiler *frame_prof = &r->gpuprofiler[r->current_frame];
 
     {
@@ -4528,8 +4603,8 @@ static void pass_ldr_to_swapchain(Renderer *r, VkCommandBuffer cmd) {
                 },
         };
 
-        vkCmdBlitImage(cmd, r->smaa_final[image].image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, r->swapchain.images[image],
-                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_NEAREST);
+        vkCmdBlitImage(cmd, r->smaa_final[image].image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                       r->swapchain.images[image], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_NEAREST);
     }
 }
 
@@ -4539,7 +4614,8 @@ static void pass_imgui(Renderer *r, VkCommandBuffer cmd) {
         uint32_t image = r->swapchain.current_image;
 
         image_transition_swapchain(r, cmd, &r->swapchain, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                                   VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+                                   VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                   VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
 
         flush_barriers(r, cmd);
 
@@ -4584,7 +4660,12 @@ FORCE_INLINE void imgui_begin_frame(void) {
 int main() {
 
     graphics_init();
-dmon_init();
+    dmon_init();
+
+        g_source_watch_id = dmon_watch("shaders", watch_callback, DMON_WATCHFLAGS_RECURSIVE, g_renderer);
+
+        dmon_watch("compiledshaders", watch_callback, DMON_WATCHFLAGS_RECURSIVE, g_renderer);
+    // Specify your shader directory here
     while (!glfwWindowShouldClose(g_renderer->window)) {
 
         TracyCFrameMark;
@@ -4637,6 +4718,8 @@ dmon_init();
 
         submit_frame(renderer);
     }
+
+    dmon_deinit();
     pipeline_cache_save(g_renderer->devc.device, g_renderer->devc.physical_device, g_renderer->devc.pipeline_cache,
                         "pipeline_cache.bin");
     return 0;
