@@ -149,9 +149,9 @@ void cs_main(uint3 id: SV_DispatchThreadID)
 float3 color = src.Load(int3(pix, 0)).rgb;
 
 // exposure control
-color *= exp2(push.exposure);
+//color *= exp2(push.exposure);
 
-color = tonemapACES(color);
+//color = tonemapACES(color);
 
 
 //
