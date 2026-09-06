@@ -4,7 +4,6 @@
 #include "src/helpers.h"
 #include "src/slangtypes.h"
 #include <stdint.h>
-#include <vulkan/vulkan_core.h>
 
 #define DMON_IMPL
 #include "external/dmon/dmon.h"
@@ -2954,10 +2953,17 @@ void renderer_create(Renderer *r, RendererDesc *desc) {
 
         extensions[ext_count++] = VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME;
 
-        if (desc->enable_validation) {
-            if (!is_instance_extension_supported(VK_EXT_DEBUG_UTILS_EXTENSION_NAME)) {
-                log_warn("[instance] %s not supported by loader", VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
-            }
+        bool enable_validation = desc->enable_validation;
+        if (enable_validation && !is_instance_layer_supported("VK_LAYER_KHRONOS_validation")) {
+            log_warn("[instance] VK_LAYER_KHRONOS_validation not present, disabling validation");
+            enable_validation = false;
+        }
+
+        bool enable_debug_utils = enable_validation && is_instance_extension_supported(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+        if (enable_validation && !enable_debug_utils) {
+            log_warn("[instance] %s not supported by loader", VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+        }
+        if (enable_debug_utils) {
             extensions[ext_count++] = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
         }
 
@@ -2967,10 +2973,7 @@ void renderer_create(Renderer *r, RendererDesc *desc) {
         if (layer_count) {
             memcpy(layers, desc->instance_layers, sizeof(char *) * layer_count);
         }
-        if (desc->enable_validation) {
-            if (!is_instance_layer_supported("VK_LAYER_KHRONOS_validation")) {
-                log_warn("[instance] VK_LAYER_KHRONOS_validation not present");
-            }
+        if (enable_validation) {
             layers[layer_count++] = "VK_LAYER_KHRONOS_validation";
         }
 
@@ -2985,8 +2988,8 @@ void renderer_create(Renderer *r, RendererDesc *desc) {
             VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT};
 
         log_info("[instance] app=%s api=1.3 validation=%u gpu_validation=%u",
-                 desc->app_name ? desc->app_name : "(null)", desc->enable_validation,
-                 desc->enable_gpu_based_validation);
+                 desc->app_name ? desc->app_name : "(null)", enable_validation,
+                 enable_validation && desc->enable_gpu_based_validation);
         forEach(i, ext_count) log_info("[instance]  ext[%u]=%s", i, extensions[i]);
 
         if (layer_count > 0) {
@@ -2999,7 +3002,7 @@ void renderer_create(Renderer *r, RendererDesc *desc) {
                                    .ppEnabledExtensionNames = extensions,
                                    .enabledLayerCount       = layer_count,
                                    .ppEnabledLayerNames     = layers};
-        if (desc->enable_validation && desc->enable_gpu_based_validation) {
+        if (enable_validation && desc->enable_gpu_based_validation) {
             validation_features.enabledValidationFeatureCount =
                 (uint32_t)(sizeof(enabled_features) / sizeof(enabled_features[0]));
             validation_features.pEnabledValidationFeatures = enabled_features;
@@ -3017,7 +3020,7 @@ void renderer_create(Renderer *r, RendererDesc *desc) {
         //
         // 2. Debug Messenger
         //
-        if (desc->enable_validation) {
+        if (enable_validation && enable_debug_utils) {
             VkDebugUtilsMessengerCreateInfoEXT ci = {.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT,
 
                                                      .messageSeverity = desc->validation_severity,
@@ -4715,7 +4718,7 @@ static void pass_imgui(Renderer *r, VkCommandBuffer cmd) {
 
         image_transition_swapchain(r, cmd, &r->swapchain, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                                    VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
-                                   VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+                                   VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
 
         flush_barriers(r, cmd);
 
