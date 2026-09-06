@@ -2583,10 +2583,14 @@ static bool shader_change_matches_spv(const char *changed, const char *spv) {
     char slang[256];
     spv_to_slang(spv, slang);
 
+    const char *changed_name = path_basename(changed);
+    const char *spv_name     = path_basename(spv);
+    if (strcmp(changed_name, spv_name) == 0)
+        return true;
+
     if (strstr(changed, slang))
         return true;
 
-    const char *changed_name = path_basename(changed);
     const char *slang_name   = path_basename(slang);
 
     return strcmp(changed_name, slang_name) == 0;
@@ -2697,7 +2701,11 @@ static void watch_callback(dmon_watch_id watch_id, dmon_action action, const cha
         const char *ext = strrchr(filepath, '.');
         if (ext && (strcmp(ext, ".slang") == 0 || strcmp(ext, ".vert") == 0 || strcmp(ext, ".frag") == 0)) {
             // Trigger the bash script
-            trigger_shader_compilation();
+            if (trigger_shader_compilation()) {
+                char full_path[512];
+                snprintf(full_path, sizeof(full_path), "%s/%s", rootdir, filepath);
+                pipeline_mark_dirty(r, full_path);
+            }
         }
     }
     // --- Handle Compiled Shader Changes (e.g., in "compiledshaders/") ---
@@ -3954,7 +3962,7 @@ typedef struct GpuProfilerUIState {
 static double ns_to_ms(double ns) { return ns / 1000000.0; }
 
 static GpuProfilerUIState g_gpu_profiler_ui = {
-    .open                = true,
+    .open                =  false,
     .paused              = false,
     .show_pipeline_stats = true,
 };
