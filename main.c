@@ -3891,8 +3891,8 @@ void graphics_init(void) {
         .instance_layer_count        = 0,
         .instance_extension_count    = glfw_ext_count,
         .device_extension_count      = 2,
-        .enable_gpu_based_validation = true,
-        .enable_validation           =  true,
+        .enable_gpu_based_validation = false,
+        .enable_validation           =  false,
 
         .validation_severity =
             VK_DEBUG_UTILS_MESSAGE_SEVERITY_VERBOSE_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT |
