@@ -66,7 +66,7 @@ typedef struct GlobalData {
 
     float2 mouse_buttons;
 
-} GlobalData; // 432 bytes
+} GlobalData;
 
 static inline void mul_mat4(mat4 a, mat4 b, mat4 out) { glm_mat4_mul(a, b, out); }
 
