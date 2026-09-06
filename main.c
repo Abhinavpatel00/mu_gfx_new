@@ -7,7 +7,8 @@
 #include <vulkan/vulkan_core.h>
 
 // ids
-//
+
+
 
 typedef uint32_t TextureID;
 typedef uint32_t SamplerID;
@@ -440,8 +441,7 @@ typedef struct {
         uint32_t fullscreen;
         uint32_t postprocess;
         uint32_t gltf_minimal;
-        uint32_t triangle;
-        uint32_t triangle_wireframe;
+        uint32_t fire;
         uint32_t sprite;
         uint32_t slug_text;
 
@@ -3298,19 +3298,18 @@ void renderer_create(Renderer *r, RendererDesc *desc) {
     allocatorInfo.pVulkanFunctions = &vulkanFunctions;
 
     vmaCreateAllocator(&allocatorInfo, &r->devc.vmaallocator);
-
-    VkDescriptorPoolSize pool_sizes[] = {
-        {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1000},
-        {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1000},
-        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1000},
-        {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1000},
-    };
-
+VkDescriptorPoolSize pool_sizes[] = {
+    { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, IMGUI_COMBINED_IMAGE_COUNT },
+    { VK_DESCRIPTOR_TYPE_SAMPLER,                IMGUI_SAMPLER_COUNT },
+    { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,         IMGUI_UBO_COUNT },
+    { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,         IMGUI_SSBO_COUNT },
+    { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,          IMGUI_SAMPLED_IMAGE_COUNT },
+};
     VkDescriptorPoolCreateInfo pool_info = {
         .sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
         .flags         = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,
         .maxSets       = 1000,
-        .poolSizeCount = 4,
+        .poolSizeCount = ARRAY_COUNT(pool_sizes),
         .pPoolSizes    = pool_sizes,
     };
 
@@ -3743,14 +3742,14 @@ void renderer_create(Renderer *r, RendererDesc *desc) {
 
         {
             GraphicsPipelineConfig cfg = pipeline_config_default();
-            cfg.vert_path              = "compiledshaders/triangle.vert.spv";
-            cfg.frag_path              = "compiledshaders/triangle.frag.spv";
+            cfg.vert_path              = "compiledshaders/fire.vert.spv";
+            cfg.frag_path              = "compiledshaders/fire.frag.spv";
             cfg.depth_test_enable      = false;
             cfg.depth_write_enable     = false;
             cfg.color_attachment_count = 1;
             cfg.color_formats          = &r->hdr_color[0].format;
 
-            r->EnginePipelines.triangle = pipeline_create_graphics(r, &cfg);
+            r->EnginePipelines.fire = pipeline_create_graphics(r, &cfg);
         }
 
         {
@@ -3891,6 +3890,93 @@ FORCE_INLINE bool vk_swapchain_present(VkQueue present_queue, FlowSwapchain *sc,
     return true;
 }
 
+#define GPU_PROF_HISTORY_SIZE 128
+#define MAX_RECORDED_PASSES 32
+
+typedef struct GpuPassStats {
+    char name[64];
+    double time_ms;
+    double avg_ms;
+    double min_ms;
+    double max_ms;
+    uint64_t vs_invocations;
+    uint64_t fs_invocations;
+    uint64_t primitives;
+    float history[GPU_PROF_HISTORY_SIZE];
+    uint32_t history_idx;
+} GpuPassStats;
+
+typedef struct GpuProfilerUIState {
+    bool open;
+    bool paused;
+    bool show_pipeline_stats;
+    uint32_t pass_count;
+    double total_gpu_time_ms;
+    double avg_total_gpu_time_ms;
+    float total_history[GPU_PROF_HISTORY_SIZE];
+    uint32_t total_history_idx;
+    GpuPassStats pass_stats[MAX_RECORDED_PASSES];
+    uint32_t frame_counter;
+} GpuProfilerUIState;
+
+static GpuProfilerUIState g_gpu_profiler_ui = {
+    .open = true,
+    .paused = false,
+    .show_pipeline_stats = true,
+};
+
+static void gpu_profiler_ui_update(GpuProfiler *p) {
+    if (g_gpu_profiler_ui.paused || !p || p->pass_count == 0) return;
+
+    g_gpu_profiler_ui.pass_count = p->pass_count;
+    double total_ms = 0.0;
+
+    for (uint32_t i = 0; i < p->pass_count && i < MAX_RECORDED_PASSES; i++) {
+        GpuPass *pass = &p->passes[i];
+        GpuPassStats *ps = &g_gpu_profiler_ui.pass_stats[i];
+
+        if (pass->name) {
+            strncpy(ps->name, pass->name, sizeof(ps->name) - 1);
+            ps->name[sizeof(ps->name) - 1] = '\0';
+        } else {
+            snprintf(ps->name, sizeof(ps->name), "Pass %u", i);
+        }
+
+        double ms = pass->time_ms;
+        if (ms < 0.0) ms = 0.0;
+        ps->time_ms = ms;
+        total_ms += ms;
+
+        if (ps->avg_ms == 0.0) {
+            ps->avg_ms = ms;
+            ps->min_ms = ms;
+            ps->max_ms = ms;
+        } else {
+            ps->avg_ms = ps->avg_ms * 0.95 + ms * 0.05;
+            if (ms < ps->min_ms) ps->min_ms = ms;
+            if (ms > ps->max_ms) ps->max_ms = ms;
+        }
+
+        ps->vs_invocations = pass->vs_invocations;
+        ps->fs_invocations = pass->fs_invocations;
+        ps->primitives     = pass->primitives;
+
+        ps->history[ps->history_idx] = (float)ms;
+        ps->history_idx = (ps->history_idx + 1) % GPU_PROF_HISTORY_SIZE;
+    }
+
+    g_gpu_profiler_ui.total_gpu_time_ms = total_ms;
+    if (g_gpu_profiler_ui.avg_total_gpu_time_ms == 0.0) {
+        g_gpu_profiler_ui.avg_total_gpu_time_ms = total_ms;
+    } else {
+        g_gpu_profiler_ui.avg_total_gpu_time_ms = g_gpu_profiler_ui.avg_total_gpu_time_ms * 0.95 + total_ms * 0.05;
+    }
+
+    g_gpu_profiler_ui.total_history[g_gpu_profiler_ui.total_history_idx] = (float)total_ms;
+    g_gpu_profiler_ui.total_history_idx = (g_gpu_profiler_ui.total_history_idx + 1) % GPU_PROF_HISTORY_SIZE;
+    g_gpu_profiler_ui.frame_counter++;
+}
+
 static MU_INLINE void frame_start(Renderer *r) {
     TracyCZoneNC(ctx, "frame_start", 0x00FF00, 1);
     r->current_frame = (r->current_frame + 1) % MAX_FRAMES_IN_FLIGHT;
@@ -3936,6 +4022,7 @@ static MU_INLINE void frame_start(Renderer *r) {
     GpuProfiler *frame_prof = &r->gpuprofiler[r->current_frame];
 
     gpu_profiler_collect(frame_prof, r->devc.device);
+    gpu_profiler_ui_update(frame_prof);
 
     vkResetCommandPool(r->devc.device, f->cmdbufpool, 0);
 
@@ -3988,11 +4075,131 @@ PUSH_CONSTANT(BlendPush, uint32_t color_tex; uint32_t weight_tex; uint32_t sampl
 
 PUSH_CONSTANT(WeightPush, uint32_t edge_tex; uint32_t area_tex; uint32_t search_tex; uint32_t sampler_id;);
 
+static void render_gpu_profiler_ui(Renderer *r) {
+    if (!g_gpu_profiler_ui.open) return;
+
+    ImGuiIO *io = igGetIO_Nil();
+
+    igSetNextWindowSize((ImVec2_c){720.0f, 520.0f}, ImGuiCond_FirstUseEver);
+    if (!igBegin("GPU Profiler", &g_gpu_profiler_ui.open, ImGuiWindowFlags_None)) {
+        igEnd();
+        return;
+    }
+
+    igTextColored((ImVec4_c){0.3f, 0.9f, 0.5f, 1.0f}, "GPU Timing Profiler");
+    igSameLine(0.0f, 20.0f);
+    igCheckbox("Pause", &g_gpu_profiler_ui.paused);
+    igSameLine(0.0f, 15.0f);
+    igCheckbox("Pipeline Stats", &g_gpu_profiler_ui.show_pipeline_stats);
+    igSameLine(0.0f, 15.0f);
+    if (igButton("Reset Min/Max", (ImVec2_c){0, 0})) {
+        for (uint32_t i = 0; i < MAX_RECORDED_PASSES; i++) {
+            g_gpu_profiler_ui.pass_stats[i].min_ms = g_gpu_profiler_ui.pass_stats[i].time_ms;
+            g_gpu_profiler_ui.pass_stats[i].max_ms = g_gpu_profiler_ui.pass_stats[i].time_ms;
+        }
+    }
+
+    igSeparator();
+
+    igText("Total GPU Time: ");
+    igSameLine(0.0f, 0.0f);
+    igTextColored((ImVec4_c){1.0f, 0.85f, 0.3f, 1.0f}, "%.3f ms", g_gpu_profiler_ui.total_gpu_time_ms);
+    igSameLine(0.0f, 15.0f);
+    igText("(Avg: %.3f ms)", g_gpu_profiler_ui.avg_total_gpu_time_ms);
+    igSameLine(0.0f, 25.0f);
+    igText("FPS: ");
+    igSameLine(0.0f, 0.0f);
+    igTextColored((ImVec4_c){0.4f, 0.8f, 1.0f, 1.0f}, "%.1f", io ? io->Framerate : 0.0f);
+
+    char overlay_buf[64];
+    snprintf(overlay_buf, sizeof(overlay_buf), "Total: %.3f ms", g_gpu_profiler_ui.total_gpu_time_ms);
+    float max_graph_val = (float)g_gpu_profiler_ui.avg_total_gpu_time_ms * 1.5f;
+    if (max_graph_val < 1.0f) max_graph_val = 1.0f;
+
+    igPlotLines_FloatPtr("##GpuTotalTimeGraph", g_gpu_profiler_ui.total_history, GPU_PROF_HISTORY_SIZE,
+                         (int)g_gpu_profiler_ui.total_history_idx, overlay_buf, 0.0f, max_graph_val,
+                         (ImVec2_c){-1.0f, 55.0f}, sizeof(float));
+
+    igSpacing();
+
+    int table_cols = g_gpu_profiler_ui.show_pipeline_stats ? 7 : 5;
+    ImGuiTableFlags table_flags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
+                                  ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchProp;
+
+    if (igBeginTable("GpuPassTable", table_cols, table_flags, (ImVec2_c){0.0f, 0.0f}, 0.0f)) {
+        igTableSetupColumn("Pass Name", ImGuiTableColumnFlags_WidthStretch, 2.0f, 0);
+        igTableSetupColumn("Time (ms)", ImGuiTableColumnFlags_WidthFixed, 80.0f, 0);
+        igTableSetupColumn("Avg (ms)", ImGuiTableColumnFlags_WidthFixed, 80.0f, 0);
+        igTableSetupColumn("Min / Max (ms)", ImGuiTableColumnFlags_WidthFixed, 115.0f, 0);
+        igTableSetupColumn("% Total", ImGuiTableColumnFlags_WidthStretch, 2.5f, 0);
+        if (g_gpu_profiler_ui.show_pipeline_stats) {
+            igTableSetupColumn("Vert Shaders", ImGuiTableColumnFlags_WidthFixed, 95.0f, 0);
+            igTableSetupColumn("Frag Shaders", ImGuiTableColumnFlags_WidthFixed, 95.0f, 0);
+        }
+        igTableHeadersRow();
+
+        for (uint32_t i = 0; i < g_gpu_profiler_ui.pass_count; i++) {
+            GpuPassStats *ps = &g_gpu_profiler_ui.pass_stats[i];
+            igTableNextRow(0, 0.0f);
+
+            igTableSetColumnIndex(0);
+            igText("%s", ps->name);
+
+            igTableSetColumnIndex(1);
+            if (ps->time_ms < 0.1) {
+                igText("%.1f us", ps->time_ms * 1000.0);
+            } else {
+                igText("%.3f ms", ps->time_ms);
+            }
+
+            igTableSetColumnIndex(2);
+            igText("%.3f", ps->avg_ms);
+
+            igTableSetColumnIndex(3);
+            igText("%.3f / %.3f", ps->min_ms, ps->max_ms);
+
+            igTableSetColumnIndex(4);
+            float pct = (g_gpu_profiler_ui.total_gpu_time_ms > 0.0) ? (float)(ps->time_ms / g_gpu_profiler_ui.total_gpu_time_ms) : 0.0f;
+            if (pct > 1.0f) pct = 1.0f;
+            char pct_buf[32];
+            snprintf(pct_buf, sizeof(pct_buf), "%.1f%%", pct * 100.0f);
+            igProgressBar(pct, (ImVec2_c){-1.0f, 0.0f}, pct_buf);
+
+            if (g_gpu_profiler_ui.show_pipeline_stats) {
+                igTableSetColumnIndex(5);
+                if (ps->vs_invocations >= 1000000) {
+                    igText("%.2f M", (double)ps->vs_invocations / 1000000.0);
+                } else if (ps->vs_invocations >= 1000) {
+                    igText("%.1f k", (double)ps->vs_invocations / 1000.0);
+                } else {
+                    igText("%llu", (unsigned long long)ps->vs_invocations);
+                }
+
+                igTableSetColumnIndex(6);
+                if (ps->fs_invocations >= 1000000) {
+                    igText("%.2f M", (double)ps->fs_invocations / 1000000.0);
+                } else if (ps->fs_invocations >= 1000) {
+                    igText("%.1f k", (double)ps->fs_invocations / 1000.0);
+                } else {
+                    igText("%llu", (unsigned long long)ps->fs_invocations);
+                }
+            }
+        }
+        igEndTable();
+    }
+
+    igSeparator();
+    igTextDisabled("Timestamp Period: %.2f ns | Query Pool Size: %d passes",
+                   (double)r->info.properties.limits.timestampPeriod, MAX_GPU_PASSES);
+
+    igEnd();
+}
+
 static void post_pass(Renderer *r, VkCommandBuffer cmd) {
     uint32_t image = r->swapchain.current_image;
 
     GpuProfiler *frame_prof = &r->gpuprofiler[r->current_frame];
-    GPU_SCOPE(frame_prof, cmd, "POST", VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT) {
+    GPU_SCOPE(frame_prof, cmd, "Post Processing", VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT) {
         rt_transition_all(r, cmd, &r->hdr_color[image], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                           VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
         rt_transition_all(r, cmd, &r->ldr_color[image], VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
@@ -4022,278 +4229,273 @@ static void post_pass(Renderer *r, VkCommandBuffer cmd) {
     }
 }
 
-static void pass_triangle(Renderer *r, VkCommandBuffer cmd) {
-    uint32_t image = r->swapchain.current_image;
+typedef struct FirePush {
+    uint32_t width;
+    uint32_t height;
+    float time;
+    float pad;
+} FirePush;
 
-    rt_transition_all(r, cmd, &r->hdr_color[image], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                      VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
-    flush_barriers(r, cmd);
+static void pass_fire(Renderer *r, VkCommandBuffer cmd) {
+    GpuProfiler *frame_prof = &r->gpuprofiler[r->current_frame];
+    GPU_SCOPE(frame_prof, cmd, "Fire Pass", VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT) {
+        uint32_t image = r->swapchain.current_image;
 
-    VkRenderingAttachmentInfo color = {
-        .sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
-        .imageView   = r->hdr_color[image].view,
-        .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-        .loadOp      = VK_ATTACHMENT_LOAD_OP_CLEAR,
-        .storeOp     = VK_ATTACHMENT_STORE_OP_STORE,
-        .clearValue  = {.color = {{0.02f, 0.025f, 0.03f, 1.0f}}},
-    };
+        rt_transition_all(r, cmd, &r->hdr_color[image], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                          VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+        flush_barriers(r, cmd);
 
-    VkRenderingInfo rendering = {
-        .sType                = VK_STRUCTURE_TYPE_RENDERING_INFO,
-        .renderArea.extent    = r->swapchain.extent,
-        .layerCount           = 1,
-        .colorAttachmentCount = 1,
-        .pColorAttachments    = &color,
-    };
+        VkRenderingAttachmentInfo color = {
+            .sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+            .imageView   = r->hdr_color[image].view,
+            .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            .loadOp      = VK_ATTACHMENT_LOAD_OP_CLEAR,
+            .storeOp     = VK_ATTACHMENT_STORE_OP_STORE,
+            .clearValue  = {.color = {{0.02f, 0.025f, 0.03f, 1.0f}}},
+        };
 
-    vkCmdBeginRendering(cmd, &rendering);
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, r->render_pipelines.pipelines[r->EnginePipelines.triangle]);
-    vk_cmd_set_viewport_scissor(cmd, r->swapchain.extent);
-    vkCmdDraw(cmd, 3, 1, 0, 0);
-    vkCmdEndRendering(cmd);
+        VkRenderingInfo rendering = {
+            .sType                = VK_STRUCTURE_TYPE_RENDERING_INFO,
+            .renderArea.extent    = r->swapchain.extent,
+            .layerCount           = 1,
+            .colorAttachmentCount = 1,
+            .pColorAttachments    = &color,
+        };
+
+        FirePush push = {
+            .width  = r->swapchain.extent.width,
+            .height = r->swapchain.extent.height,
+            .time   = (float)glfwGetTime(),
+            .pad    = 0.0f,
+        };
+
+        vkCmdBeginRendering(cmd, &rendering);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, r->render_pipelines.pipelines[r->EnginePipelines.fire]);
+        vk_cmd_set_viewport_scissor(cmd, r->swapchain.extent);
+        vkCmdPushConstants(cmd, r->bindless_system.pipeline_layout, VK_SHADER_STAGE_ALL, 0, sizeof(push), &push);
+        vkCmdDraw(cmd, 3, 1, 0, 0);
+        vkCmdEndRendering(cmd);
+    }
 }
 
 static void pass_smaa(Renderer *r, VkCommandBuffer cmd) {
     uint32_t image = r->swapchain.current_image;
+    GpuProfiler *frame_prof = &r->gpuprofiler[r->current_frame];
 
-    /*
-        SMAA:
-
-            LDR
-             |
-
-          EDGE
-             |
-             v
-          WEIGHT
-             |
-             v
-           FINAL
-    */
     {
-        /* ------------------------------------------------------------
-           1. Edge detection
-           ------------------------------------------------------------ */
+        /* 1. Edge detection */
+        GPU_SCOPE(frame_prof, cmd, "SMAA Edge", VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT) {
+            rt_transition_all(r, cmd, &r->smaa_edges[image], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                              VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+            rt_transition_all(r, cmd, &r->ldr_color[image], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                              VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+            flush_barriers(r, cmd);
 
-        rt_transition_all(r, cmd, &r->smaa_edges[image], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                          VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
-        rt_transition_all(r, cmd, &r->ldr_color[image], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                          VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
-        flush_barriers(r, cmd);
+            VkRenderingAttachmentInfo edge_color = {
+                .sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+                .imageView   = r->smaa_edges[image].view,
+                .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                .loadOp      = VK_ATTACHMENT_LOAD_OP_CLEAR,
+                .storeOp     = VK_ATTACHMENT_STORE_OP_STORE,
+                .clearValue  = {.color = {{0, 0, 0, 0}}},
+            };
 
-        VkRenderingAttachmentInfo edge_color = {
-            .sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
-            .imageView   = r->smaa_edges[image].view,
-            .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-            .loadOp      = VK_ATTACHMENT_LOAD_OP_CLEAR,
-            .storeOp     = VK_ATTACHMENT_STORE_OP_STORE,
-            .clearValue  = {.color = {{0, 0, 0, 0}}},
-        };
+            VkRenderingInfo edge_rendering = {
+                .sType                = VK_STRUCTURE_TYPE_RENDERING_INFO,
+                .renderArea.extent    = r->swapchain.extent,
+                .layerCount           = 1,
+                .colorAttachmentCount = 1,
+                .pColorAttachments    = &edge_color,
+            };
 
-        VkRenderingInfo edge_rendering = {
-            .sType                = VK_STRUCTURE_TYPE_RENDERING_INFO,
-            .renderArea.extent    = r->swapchain.extent,
-            .layerCount           = 1,
-            .colorAttachmentCount = 1,
-            .pColorAttachments    = &edge_color,
-        };
+            vkCmdBeginRendering(cmd, &edge_rendering);
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                              r->render_pipelines.pipelines[r->smaa_pipelines.smaa_edge]);
+            vk_cmd_set_viewport_scissor(cmd, r->swapchain.extent);
 
-        vkCmdBeginRendering(cmd, &edge_rendering);
+            EdgePush edge_push = {
+                .texture_id = r->ldr_color[image].bindless_index,
+                .sampler_id = r->default_samplers.samplers[SAMPLER_LINEAR_CLAMP],
+            };
 
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                          r->render_pipelines.pipelines[r->smaa_pipelines.smaa_edge]);
-
-        vk_cmd_set_viewport_scissor(cmd, r->swapchain.extent);
-
-        EdgePush edge_push = {
-            .texture_id = r->ldr_color[image].bindless_index,
-            .sampler_id = r->default_samplers.samplers[SAMPLER_LINEAR_CLAMP],
-        };
-
-        vkCmdPushConstants(cmd, r->bindless_system.pipeline_layout, VK_SHADER_STAGE_ALL, 0, sizeof(edge_push),
-                           &edge_push);
-
-        vkCmdDraw(cmd, 3, 1, 0, 0);
-
-        vkCmdEndRendering(cmd);
+            vkCmdPushConstants(cmd, r->bindless_system.pipeline_layout, VK_SHADER_STAGE_ALL, 0, sizeof(edge_push),
+                               &edge_push);
+            vkCmdDraw(cmd, 3, 1, 0, 0);
+            vkCmdEndRendering(cmd);
+        }
     }
     {
-        /* ------------------------------------------------------------
-           2. Weight calculation
-           ------------------------------------------------------------ */
+        /* 2. Weight calculation */
+        GPU_SCOPE(frame_prof, cmd, "SMAA Weight", VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT) {
+            rt_transition_all(r, cmd, &r->smaa_weights[image], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                              VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+            rt_transition_all(r, cmd, &r->smaa_edges[image], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                              VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+            flush_barriers(r, cmd);
 
-        rt_transition_all(r, cmd, &r->smaa_weights[image], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                          VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+            VkRenderingAttachmentInfo weight_color = {
+                .sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+                .imageView   = r->smaa_weights[image].view,
+                .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                .loadOp      = VK_ATTACHMENT_LOAD_OP_CLEAR,
+                .storeOp     = VK_ATTACHMENT_STORE_OP_STORE,
+                .clearValue  = {.color = {{0, 0, 0, 0}}},
+            };
 
-        rt_transition_all(r, cmd, &r->smaa_edges[image], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                          VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+            VkRenderingInfo weight_rendering = {
+                .sType                = VK_STRUCTURE_TYPE_RENDERING_INFO,
+                .renderArea.extent    = r->swapchain.extent,
+                .layerCount           = 1,
+                .colorAttachmentCount = 1,
+                .pColorAttachments    = &weight_color,
+            };
 
-        flush_barriers(r, cmd);
+            vkCmdBeginRendering(cmd, &weight_rendering);
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                              r->render_pipelines.pipelines[r->smaa_pipelines.smaa_weight]);
+            vk_cmd_set_viewport_scissor(cmd, r->swapchain.extent);
 
-        VkRenderingAttachmentInfo weight_color = {
-            .sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
-            .imageView   = r->smaa_weights[image].view,
-            .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-            .loadOp      = VK_ATTACHMENT_LOAD_OP_CLEAR,
-            .storeOp     = VK_ATTACHMENT_STORE_OP_STORE,
-            .clearValue  = {.color = {{0, 0, 0, 0}}},
-        };
+            WeightPush weight_push = {
+                .edge_tex   = r->smaa_edges[image].bindless_index,
+                .area_tex   = r->smaa_area_tex,
+                .search_tex = r->smaa_search_tex,
+                .sampler_id = r->default_samplers.samplers[SAMPLER_LINEAR_CLAMP],
+            };
 
-        VkRenderingInfo weight_rendering = {
-            .sType                = VK_STRUCTURE_TYPE_RENDERING_INFO,
-            .renderArea.extent    = r->swapchain.extent,
-            .layerCount           = 1,
-            .colorAttachmentCount = 1,
-            .pColorAttachments    = &weight_color,
-        };
-
-        vkCmdBeginRendering(cmd, &weight_rendering);
-
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                          r->render_pipelines.pipelines[r->smaa_pipelines.smaa_weight]);
-
-        vk_cmd_set_viewport_scissor(cmd, r->swapchain.extent);
-
-        WeightPush weight_push = {
-            .edge_tex   = r->smaa_edges[image].bindless_index,
-            .area_tex   = r->smaa_area_tex,
-            .search_tex = r->smaa_search_tex,
-            .sampler_id = r->default_samplers.samplers[SAMPLER_LINEAR_CLAMP],
-        };
-
-        vkCmdPushConstants(cmd, r->bindless_system.pipeline_layout, VK_SHADER_STAGE_ALL, 0, sizeof(weight_push),
-                           &weight_push);
-
-        vkCmdDraw(cmd, 3, 1, 0, 0);
-
-        vkCmdEndRendering(cmd);
+            vkCmdPushConstants(cmd, r->bindless_system.pipeline_layout, VK_SHADER_STAGE_ALL, 0, sizeof(weight_push),
+                               &weight_push);
+            vkCmdDraw(cmd, 3, 1, 0, 0);
+            vkCmdEndRendering(cmd);
+        }
     }
     {
-        /* ------------------------------------------------------------
-           3. Blend LDR + SMAA into FINAL
-           ------------------------------------------------------------ */
+        /* 3. Blend LDR + SMAA into FINAL */
+        GPU_SCOPE(frame_prof, cmd, "SMAA Blend", VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT) {
+            rt_transition_all(r, cmd, &r->smaa_final[image], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                              VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+            rt_transition_all(r, cmd, &r->ldr_color[image], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                              VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+            rt_transition_all(r, cmd, &r->smaa_weights[image], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                              VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+            flush_barriers(r, cmd);
 
-        rt_transition_all(r, cmd, &r->smaa_final[image], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                          VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
-        rt_transition_all(r, cmd, &r->ldr_color[image], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                          VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
-        rt_transition_all(r, cmd, &r->smaa_weights[image], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                          VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
-        flush_barriers(r, cmd);
+            VkRenderingAttachmentInfo final_color = {
+                .sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+                .imageView   = r->smaa_final[image].view,
+                .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                .loadOp      = VK_ATTACHMENT_LOAD_OP_CLEAR,
+                .storeOp     = VK_ATTACHMENT_STORE_OP_STORE,
+            };
 
-        VkRenderingAttachmentInfo final_color = {
-            .sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
-            .imageView   = r->smaa_final[image].view,
-            .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-            .loadOp      = VK_ATTACHMENT_LOAD_OP_CLEAR,
-            .storeOp     = VK_ATTACHMENT_STORE_OP_STORE,
-        };
+            VkRenderingInfo final_rendering = {
+                .sType                = VK_STRUCTURE_TYPE_RENDERING_INFO,
+                .renderArea.extent    = r->swapchain.extent,
+                .layerCount           = 1,
+                .colorAttachmentCount = 1,
+                .pColorAttachments    = &final_color,
+            };
 
-        VkRenderingInfo final_rendering = {
-            .sType                = VK_STRUCTURE_TYPE_RENDERING_INFO,
-            .renderArea.extent    = r->swapchain.extent,
-            .layerCount           = 1,
-            .colorAttachmentCount = 1,
-            .pColorAttachments    = &final_color,
-        };
+            vkCmdBeginRendering(cmd, &final_rendering);
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                              r->render_pipelines.pipelines[r->smaa_pipelines.smaa_blend]);
+            vk_cmd_set_viewport_scissor(cmd, r->swapchain.extent);
 
-        vkCmdBeginRendering(cmd, &final_rendering);
+            BlendPush blend_push = {
+                .color_tex  = r->ldr_color[image].bindless_index,
+                .weight_tex = r->smaa_weights[image].bindless_index,
+                .sampler_id = r->default_samplers.samplers[SAMPLER_LINEAR_CLAMP],
+            };
 
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                          r->render_pipelines.pipelines[r->smaa_pipelines.smaa_blend]);
-
-        vk_cmd_set_viewport_scissor(cmd, r->swapchain.extent);
-
-        BlendPush blend_push = {
-            .color_tex  = r->ldr_color[image].bindless_index,
-            .weight_tex = r->smaa_weights[image].bindless_index,
-            .sampler_id = r->default_samplers.samplers[SAMPLER_LINEAR_CLAMP],
-        };
-
-        vkCmdPushConstants(cmd, r->bindless_system.pipeline_layout, VK_SHADER_STAGE_ALL, 0, sizeof(blend_push),
-                           &blend_push);
-
-        vkCmdDraw(cmd, 3, 1, 0, 0);
-
-        vkCmdEndRendering(cmd);
+            vkCmdPushConstants(cmd, r->bindless_system.pipeline_layout, VK_SHADER_STAGE_ALL, 0, sizeof(blend_push),
+                               &blend_push);
+            vkCmdDraw(cmd, 3, 1, 0, 0);
+            vkCmdEndRendering(cmd);
+        }
     }
 }
+
 static void pass_ldr_to_swapchain(Renderer *r, VkCommandBuffer cmd) {
-    uint32_t image = r->swapchain.current_image;
+    GpuProfiler *frame_prof = &r->gpuprofiler[r->current_frame];
+    GPU_SCOPE(frame_prof, cmd, "Blit Swapchain", VK_PIPELINE_STAGE_2_TRANSFER_BIT) {
+        uint32_t image = r->swapchain.current_image;
 
-    rt_transition_all(r, cmd, &r->smaa_final[image], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                      VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+        rt_transition_all(r, cmd, &r->smaa_final[image], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                          VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
 
-    image_transition_swapchain(r, cmd, &r->swapchain, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                               VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+        image_transition_swapchain(r, cmd, &r->swapchain, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                   VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
 
-    flush_barriers(r, cmd);
+        flush_barriers(r, cmd);
 
-    VkImageBlit blit = {
-        .srcSubresource =
-            {
-                .aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
-                .mipLevel       = 0,
-                .baseArrayLayer = 0,
-                .layerCount     = 1,
-            },
+        VkImageBlit blit = {
+            .srcSubresource =
+                {
+                    .aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
+                    .mipLevel       = 0,
+                    .baseArrayLayer = 0,
+                    .layerCount     = 1,
+                },
 
-        .srcOffsets =
-            {
-                {0, 0, 0},
-                {(int32_t)r->swapchain.extent.width, (int32_t)r->swapchain.extent.height, 1},
-            },
+            .srcOffsets =
+                {
+                    {0, 0, 0},
+                    {(int32_t)r->swapchain.extent.width, (int32_t)r->swapchain.extent.height, 1},
+                },
 
-        .dstSubresource =
-            {
-                .aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
-                .mipLevel       = 0,
-                .baseArrayLayer = 0,
-                .layerCount     = 1,
-            },
+            .dstSubresource =
+                {
+                    .aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
+                    .mipLevel       = 0,
+                    .baseArrayLayer = 0,
+                    .layerCount     = 1,
+                },
 
-        .dstOffsets =
-            {
-                {0, 0, 0},
-                {(int32_t)r->swapchain.extent.width, (int32_t)r->swapchain.extent.height, 1},
-            },
-    };
+            .dstOffsets =
+                {
+                    {0, 0, 0},
+                    {(int32_t)r->swapchain.extent.width, (int32_t)r->swapchain.extent.height, 1},
+                },
+        };
 
-    vkCmdBlitImage(cmd, r->smaa_final[image].image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, r->swapchain.images[image],
-                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_NEAREST);
+        vkCmdBlitImage(cmd, r->smaa_final[image].image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, r->swapchain.images[image],
+                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_NEAREST);
+    }
 }
 
 static void pass_imgui(Renderer *r, VkCommandBuffer cmd) {
-    uint32_t image = r->swapchain.current_image;
+    GpuProfiler *frame_prof = &r->gpuprofiler[r->current_frame];
+    GPU_SCOPE(frame_prof, cmd, "ImGui Render", VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT) {
+        uint32_t image = r->swapchain.current_image;
 
-    image_transition_swapchain(r, cmd, &r->swapchain, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                               VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+        image_transition_swapchain(r, cmd, &r->swapchain, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                                   VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
 
-    flush_barriers(r, cmd);
+        flush_barriers(r, cmd);
 
-    VkRenderingAttachmentInfo color = {
-        .sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
-        .imageView   = r->swapchain.image_views[image],
-        .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-        .loadOp      = VK_ATTACHMENT_LOAD_OP_LOAD,
-        .storeOp     = VK_ATTACHMENT_STORE_OP_STORE,
-    };
+        VkRenderingAttachmentInfo color = {
+            .sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+            .imageView   = r->swapchain.image_views[image],
+            .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            .loadOp      = VK_ATTACHMENT_LOAD_OP_LOAD,
+            .storeOp     = VK_ATTACHMENT_STORE_OP_STORE,
+        };
 
-    VkRenderingInfo rendering = {
-        .sType                = VK_STRUCTURE_TYPE_RENDERING_INFO,
-        .renderArea.extent    = r->swapchain.extent,
-        .layerCount           = 1,
-        .colorAttachmentCount = 1,
-        .pColorAttachments    = &color,
-    };
+        VkRenderingInfo rendering = {
+            .sType                = VK_STRUCTURE_TYPE_RENDERING_INFO,
+            .renderArea.extent    = r->swapchain.extent,
+            .layerCount           = 1,
+            .colorAttachmentCount = 1,
+            .pColorAttachments    = &color,
+        };
 
-    vkCmdBeginRendering(cmd, &rendering);
+        vkCmdBeginRendering(cmd, &rendering);
 
-    ImDrawData *draw_data = igGetDrawData();
+        ImDrawData *draw_data = igGetDrawData();
 
-    ImGui_ImplVulkan_RenderDrawData(draw_data, cmd, VK_NULL_HANDLE);
+        ImGui_ImplVulkan_RenderDrawData(draw_data, cmd, VK_NULL_HANDLE);
 
-    vkCmdEndRendering(cmd);
+        vkCmdEndRendering(cmd);
+    }
 }
 
 FORCE_INLINE void imgui_shutdown(void) {
@@ -4348,16 +4550,13 @@ int main() {
             }
         }
 
-        pass_triangle(r, cmd);
+        pass_fire(r, cmd);
         post_pass(r, cmd);
-
         pass_smaa(r, cmd);
-
         pass_ldr_to_swapchain(r, cmd);
-
+        render_gpu_profiler_ui(r);
         igRender();
         pass_imgui(r, cmd);
-
         image_transition_swapchain(r, cmd, &r->swapchain, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
                                    VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, 0);
 

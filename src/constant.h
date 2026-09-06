@@ -14,5 +14,17 @@
 #define MAX_BINDLESS_SAMPLERS        256
 #define MAX_BINDLESS_TEXTURES        65536
 
+
+#define IMGUI_DESCRIPTOR_SET_COUNT  64
+#define IMGUI_SAMPLER_COUNT         64
+#define IMGUI_SAMPLED_IMAGE_COUNT   64
+#define IMGUI_COMBINED_IMAGE_COUNT  64
+#define IMGUI_UBO_COUNT             64
+#define IMGUI_SSBO_COUNT            64
+
+
+
+
+
 #define MAX_COLOR_ATTACHMENTS 8
-#define VALIDATION true
+#define VALIDATION false
