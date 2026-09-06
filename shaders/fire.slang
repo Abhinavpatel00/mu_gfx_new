@@ -657,7 +657,7 @@ float4 fs_main(VSOutput input) : SV_Target0
     // ========================================================
 
     float3 fire =
-        tanh(accum / 100.0);
+        tanh(accum / 442.0);
 
     return float4(fire, 1.0);
 }

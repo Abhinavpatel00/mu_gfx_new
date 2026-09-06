@@ -625,7 +625,7 @@ FORCE_INLINE void gpu_profiler_collect(GpuProfiler* p, VkDevice device)
 
 
 
-static void trigger_shader_compilation() {
+static bool trigger_shader_compilation(void) {
     // Use system() to run the bash script
     // Note: system() blocks until the process finishes. 
     // For a quick compilation script, this is acceptable, 
@@ -636,6 +636,8 @@ static void trigger_shader_compilation() {
     int result = system("bash compileslang.sh"); // Adjust path if needed
     if (result != 0) {
         fprintf(stderr, "[HotReload] compileslang.sh failed with code %d\n", result);
+        return false;
     }
+    return true;
 }
 
