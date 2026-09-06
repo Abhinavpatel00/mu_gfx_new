@@ -3891,8 +3891,8 @@ void graphics_init(void) {
         .instance_layer_count        = 0,
         .instance_extension_count    = glfw_ext_count,
         .device_extension_count      = 2,
-        .enable_gpu_based_validation = false,
-        .enable_validation           =  false,
+        .enable_gpu_based_validation = true,
+        .enable_validation           =  true,
 
         .validation_severity =
             VK_DEBUG_UTILS_MESSAGE_SEVERITY_VERBOSE_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT |
@@ -3910,11 +3910,11 @@ void graphics_init(void) {
         .vsync               = false,
         .enable_debug_printf = false,
 
-        .bindless_sampled_image_count     = 65536,
-        .bindless_sampler_count           = 256,
+        .bindless_sampled_image_count     = MAX_BINDLESS_TEXTURES,
+        .bindless_sampler_count           = MAX_BINDLESS_SAMPLERS,
         .bindless_storage_image_count     = 16384,
         .enable_pipeline_stats            = true,
-        .swapchain_preferred_present_mode = VK_PRESENT_MODE_IMMEDIATE_KHR,
+        .swapchain_preferred_present_mode = VK_PRESENT_MODE_MAILBOX_KHR,
 
         .size_of_cpu_pool     = MB(32),
         .size_of_gpu_pool     = MB(512),

@@ -1,0 +1,42 @@
+[submodule "external/cglm"]
+	path = external/cglm
+	url = https://github.com/recp/cglm.git
+[submodule "external/cimgui"]
+	path = external/cimgui
+	url = https://github.com/cimgui/cimgui.git
+[submodule "external/debugbreak"]
+	path = external/debugbreak
+	url = https://github.com/scottt/debugbreak.git
+[submodule "external/dmon"]
+	path = external/dmon
+	url = https://github.com/septag/dmon.git
+[submodule "external/logger-c"]
+	path = external/logger-c
+	url = https://github.com/JeepWay/logger-c.git
+[submodule "external/meshoptimizer"]
+	path = external/meshoptimizer
+	url = https://github.com/zeux/meshoptimizer.git
+[submodule "external/mu"]
+	path = external/mu
+	url = git@github.com:Abhinavpatel00/mylib.git
+[submodule "external/smaa"]
+	path = external/smaa
+	url = https://github.com/iryoku/smaa.git
+[submodule "external/stb"]
+	path = external/stb
+	url = git@github.com:nothings/stb.git
+[submodule "external/tracy"]
+	path = external/tracy
+	url = https://github.com/wolfpld/tracy.git
+[submodule "external/volk"]
+	path = external/volk
+	url = https://github.com/zeux/volk.git
+[submodule "external/vulkan_headers"]
+	path = external/vulkan_headers
+	url = https://github.com/KhronosGroup/vulkan-headers.git
+[submodule "external/VulkanMemoryAllocator"]
+	path = external/VulkanMemoryAllocator
+	url = https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator.git
+[submodule "external/xxHash"]
+	path = external/xxHash
+	url = https://github.com/Cyan4973/xxHash.git
