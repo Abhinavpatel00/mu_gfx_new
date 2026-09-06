@@ -3,6 +3,7 @@
 #include "external/stb/stb_image.h"
 #include "src/helpers.h"
 #include "src/slangtypes.h"
+#include <stdbool.h>
 #include <stdint.h>
 
 #define DMON_IMPL
@@ -2935,6 +2936,17 @@ void renderer_create(Renderer *r, RendererDesc *desc) {
     // Queues
     // Frame contexts
 
+    bool enable_validation = desc->enable_validation;
+    if (enable_validation && !is_instance_layer_supported("VK_LAYER_KHRONOS_validation")) {
+        log_warn("[instance] VK_LAYER_KHRONOS_validation not present, disabling validation");
+        enable_validation = false;
+    }
+
+    bool enable_debug_utils = enable_validation && is_instance_extension_supported(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+    if (enable_validation && !enable_debug_utils) {
+        log_warn("[instance] %s not supported by loader", VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+    }
+
     {
 
         VkApplicationInfo app = {.sType              = VK_STRUCTURE_TYPE_APPLICATION_INFO,
@@ -2953,16 +2965,6 @@ void renderer_create(Renderer *r, RendererDesc *desc) {
 
         extensions[ext_count++] = VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME;
 
-        bool enable_validation = desc->enable_validation;
-        if (enable_validation && !is_instance_layer_supported("VK_LAYER_KHRONOS_validation")) {
-            log_warn("[instance] VK_LAYER_KHRONOS_validation not present, disabling validation");
-            enable_validation = false;
-        }
-
-        bool enable_debug_utils = enable_validation && is_instance_extension_supported(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
-        if (enable_validation && !enable_debug_utils) {
-            log_warn("[instance] %s not supported by loader", VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
-        }
         if (enable_debug_utils) {
             extensions[ext_count++] = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
         }
@@ -3894,8 +3896,8 @@ void graphics_init(void) {
         .instance_layer_count        = 0,
         .instance_extension_count    = glfw_ext_count,
         .device_extension_count      = 2,
-        .enable_gpu_based_validation = true,
-        .enable_validation           =  true,
+        .enable_gpu_based_validation = false,
+        .enable_validation           =  false,
 
         .validation_severity =
             VK_DEBUG_UTILS_MESSAGE_SEVERITY_VERBOSE_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT |
