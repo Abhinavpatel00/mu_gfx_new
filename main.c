@@ -4140,6 +4140,8 @@ PUSH_CONSTANT(BlendPush, uint32_t color_tex; uint32_t weight_tex; uint32_t sampl
 
 PUSH_CONSTANT(WeightPush, uint32_t edge_tex; uint32_t area_tex; uint32_t search_tex; uint32_t sampler_id;);
 
+
+
 static void render_gpu_profiler_ui(Renderer *r) {
     if (!g_gpu_profiler_ui.open)
         return;
