@@ -4376,6 +4376,8 @@ static void post_pass(Renderer *r, VkCommandBuffer cmd) {
         rt_transition_all(r, cmd, &r->ldr_color[image], VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
                           VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
 
+
+
         flush_barriers(r, cmd);
 
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
