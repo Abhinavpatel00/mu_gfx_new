@@ -29,7 +29,7 @@
 #include "external/cimgui/cimgui_impl.h"
 
 #include "external/debugbreak/debugbreak.h"
-#include "external/tracy/public/tracy/TracyC.h"
+#include "src/tracy.h"
 #include "external/mu/mu.h"
 #include "src/constant.h"
 #include "stdbool.h"
