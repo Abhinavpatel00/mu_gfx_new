@@ -24,8 +24,27 @@ SRC_CPP := vma.cpp \
            external/cimgui/imgui/imgui_tables.cpp \
            external/cimgui/imgui/imgui_widgets.cpp \
            external/cimgui/imgui/backends/imgui_impl_glfw.cpp \
-           external/cimgui/imgui/backends/imgui_impl_vulkan.cpp \
-           external/tracy/public/TracyClient.cpp
+           external/cimgui/imgui/backends/imgui_impl_vulkan.cpp
+
+# =========================================================
+# Optional Tracy Profiler
+# Set USE_TRACY=1 (or TRACY=1) to enable Tracy profiling
+# =========================================================
+USE_TRACY ?= 0
+TRACY ?= 0
+TRACY_ENABLE ?= 0
+
+ifneq ($(filter 1, $(USE_TRACY) $(TRACY) $(TRACY_ENABLE)),)
+    ifneq ($(wildcard external/tracy/public/TracyClient.cpp),)
+        SRC_CPP += external/tracy/public/TracyClient.cpp
+        TRACY_FLAGS := -DTRACY_ENABLE
+    else
+        $(warning Tracy source external/tracy/public/TracyClient.cpp not found. Building without Tracy.)
+        TRACY_FLAGS :=
+    endif
+else
+    TRACY_FLAGS :=
+endif
 
 OBJ := $(addprefix $(BUILD_DIR)/, \
        $(SRC_C:.c=.o) \
@@ -36,6 +55,7 @@ OBJ := $(addprefix $(BUILD_DIR)/, \
 # =========================================================
 
 INCLUDES := \
+    -Iexternal/vulkan/include \
     -Iexternal/cimgui \
     -Iexternal/cimgui/imgui \
     -Iexternal/cimgui/imgui/backends
@@ -61,6 +81,7 @@ WARNINGS := \
 
 BASE_CFLAGS := \
     -std=gnu99 \
+    $(INCLUDES) \
     $(WARNINGS)
 
 BASE_CXXFLAGS := \
@@ -83,7 +104,7 @@ DEBUG_FLAGS := \
     -fno-omit-frame-pointer \
     -fno-strict-aliasing \
     -DDEBUG \
-    -DTRACY_ENABLE
+    $(TRACY_FLAGS)
 
 # =========================================================
 # Address Sanitizer Build
@@ -102,7 +123,7 @@ ASAN_FLAGS := \
     -fno-optimize-sibling-calls \
     -fno-strict-aliasing \
     -DDEBUG \
-    -DTRACY_ENABLE
+    $(TRACY_FLAGS)
 
 # =========================================================
 # Release Build
@@ -117,7 +138,7 @@ RELEASE_FLAGS := \
     -fno-trapping-math \
     -fno-semantic-interposition \
     -DNDEBUG \
-    -DTRACY_ENABLE
+    $(TRACY_FLAGS)
 
 # =========================================================
 # Libraries
