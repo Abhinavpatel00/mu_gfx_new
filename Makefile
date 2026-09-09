@@ -73,8 +73,7 @@ WARNINGS := \
     -Wshadow \
     -Wconversion \
     -Wstrict-aliasing=2 \
-    -Wno-unused-parameter
-
+    -Wno-unused-parameter -Wno-sign-conversion  -Wno-unused-function
 # =========================================================
 # Base Flags
 # =========================================================

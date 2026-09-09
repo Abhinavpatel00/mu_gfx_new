@@ -118,6 +118,7 @@ typedef struct {
     uint32_t bindless_sampler_count;
     uint32_t bindless_storage_image_count;
     bool     enable_pipeline_stats;
+    bool     enable_graphics_profiler;
 
     VkDeviceSize size_of_cpu_pool;
 
@@ -424,6 +425,7 @@ typedef struct {
     Buffer global_ubo[MAX_FRAMES_IN_FLIGHT];
 
     GpuProfiler gpuprofiler[MAX_FRAMES_IN_FLIGHT];
+    bool        enable_graphics_profiler;
 
     DefaultSamplerTable default_samplers;
 
@@ -3716,8 +3718,10 @@ void renderer_create(Renderer *r, RendererDesc *desc) {
         r->dummy_texture = id;
     };
     {
+        r->enable_graphics_profiler = desc->enable_graphics_profiler;
         forEach(i, MAX_FRAMES_IN_FLIGHT) {
             gpu_profiler_init(&r->gpuprofiler[i], r->devc.device, r->info.properties.limits.timestampPeriod,
+                              desc->enable_graphics_profiler,
                               desc->enable_pipeline_stats &&
                                   r->info.feature_chain.core.features.pipelineStatisticsQuery);
         }
@@ -3919,6 +3923,7 @@ void graphics_init(void) {
         .bindless_sampler_count           = MAX_BINDLESS_SAMPLERS,
         .bindless_storage_image_count     = 16384,
         .enable_pipeline_stats            = true,
+        .enable_graphics_profiler         = true,
         .swapchain_preferred_present_mode = VK_PRESENT_MODE_MAILBOX_KHR,
 
         .size_of_cpu_pool     = MB(32),
@@ -4007,7 +4012,7 @@ static GpuProfilerUIState g_gpu_profiler_ui = {
 };
 
 static void gpu_profiler_ui_update(GpuProfiler *p) {
-    if (g_gpu_profiler_ui.paused || !p || p->pass_count == 0)
+    if (g_gpu_profiler_ui.paused || !p || !p->enabled || p->pass_count == 0)
         return;
 
     g_gpu_profiler_ui.pass_count = MIN(p->pass_count, MAX_RECORDED_PASSES);
@@ -4219,6 +4224,8 @@ PUSH_CONSTANT(BlendPush, uint32_t color_tex; uint32_t weight_tex; uint32_t sampl
 PUSH_CONSTANT(WeightPush, uint32_t edge_tex; uint32_t area_tex; uint32_t search_tex; uint32_t sampler_id;);
 
 static void render_gpu_profiler_ui(Renderer *r) {
+    if (!r->enable_graphics_profiler)
+        return;
 
     ImGuiIO *io = igGetIO_Nil();
     if (!g_gpu_profiler_ui.open) {
