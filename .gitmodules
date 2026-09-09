@@ -19,9 +19,6 @@
 [submodule "external/mu"]
 	path = external/mu
 	url = git@github.com:Abhinavpatel00/mylib.git
-[submodule "external/smaa"]
-	path = external/smaa
-	url = https://github.com/iryoku/smaa.git
 [submodule "external/stb"]
 	path = external/stb
 	url = git@github.com:nothings/stb.git
