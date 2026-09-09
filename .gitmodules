@@ -28,9 +28,6 @@
 [submodule "external/volk"]
 	path = external/volk
 	url = https://github.com/zeux/volk.git
-[submodule "external/vulkan_headers"]
-	path = external/vulkan_headers
-	url = https://github.com/KhronosGroup/vulkan-headers.git
 [submodule "external/VulkanMemoryAllocator"]
 	path = external/VulkanMemoryAllocator
 	url = https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator.git
