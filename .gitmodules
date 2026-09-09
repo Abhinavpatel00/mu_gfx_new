@@ -34,3 +34,6 @@
 [submodule "external/slug"]
 	path = external/slug
 	url = https://github.com/EricLengyel/Slug.git
+[submodule "external/RGFW"]
+	path = external/RGFW
+	url = https://github.com/ColleagueRiley/RGFW.git
