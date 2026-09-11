@@ -1,9 +1,3 @@
-
-
-// ============================================================
-// Optimized procedural fire - Slang / Vulkan
-// ============================================================
-
 #include "common.slang"
 
 
@@ -28,114 +22,90 @@ VSOutput vs_main(uint id : SV_VertexID)
     return o;
 }
 
+float lp_norm(float2 v, float p)
+{
+    return pow(pow(abs(v.x), p) + pow(abs(v.y), p), 1.0 / p);
+}
+
+
 
 [shader("fragment")]
 float4 fs_main(VSOutput input) : SV_Target0
 {
     float2 R = global_data.screen_params.xy;
     float  T = global_data.time;
+    float2 uv = pixel_to_uv(input.position.xy, R);
+ //   float r = length(uv);
+    //float color = dot(uv, uv) <=  0.2;
+    //float color = abs(uv.x) +abs(uv.y) <= 0.4;
+//    float color = max(abs(uv.x),abs(uv.y)) <= 0.4;
+/*
+ cool rounded shape form lp spaces experiment the more u increase p the less  rounded sq will become
+float p = 3.0;
+float r = 0.6;
+float c = pow(abs(uv.x), p) + pow(abs(uv.y), p) <= pow(r, p);
+*/
+//       - 0.5 is coordinate shift to center
+//
+/*
 
+float2 g = abs(frac( 6*uv) - 0.5);
 
-    float2 C = input.position.xy;
+//float line = min(g.x, g.y);
+float line = 0.5 - min(g.x, g.y);   // 0.5 at midline, 0 at boundary
+// float c = smoothstep(0.0, 0.5, line); // invert: bright near boundary
+//
+//
+// float color =c;
+//
 
-    float3 rd = normalize(float3(
-        2.0 * C.x - R.x,
-        2.0 * C.y - R.y,
-        -R.y
-    ));
+line += sin(T*line);
+    // --- line mask + glow ---
+    float thickness = 0.08;           // core line half-width in cell units
+    float core  = smoothstep(thickness, 0.0, line);      // 1 on line, 0 off
+    float glow  = exp(-line * 12.0);                     // soft bloom falloff
 
+    // --- neon blue ---
+    float3 lineColor = float3(0.20, 0.70, 1.00);
+    float3 bgColor   = float3(0.02, 0.03, 0.08);
 
-    float z = 0.0;
-    float3 O = 0.0;
+    float3 color = bgColor
+                 + lineColor * glow * 0.8     // bloom
+                 + lineColor * core * 1.5;    // hot core (over-bright)
 
-    // Constants for cos(a + 5), cos(a + 8)
-    // cos(a+b) = cos(a)cos(b) - sin(a)sin(b)
-    const float C5 =  0.2836621855;
-    const float S5 = -0.9589242747;
-    const float C8 = -0.1455000338;
-    const float S8 =  0.9893582468;
+return float4( color, 1.0);
+*/
+float2 cell = frac(6.0 * uv) - 0.5;         // per-cell coords, keeps full-screen grid
+float d = max(abs(cell.x), abs(cell.y));    // Chebyshev: 0 at cell center, 0.5 at edge
 
-    // Color phase constants.
-    const float C1 =  0.5403023059;
-    const float S1 =  0.8414709848;
-    const float C2 = -0.4161468365;
-    const float S2 =  0.9092974268;
+// --- three rings cycling outward ---
+float speed = 0.35;
+float r1 = frac(T * speed + 0.0 / 3.0) * 0.5;
+float r2 = frac(T * speed + 1.0 / 3.0) * 0.5;
+float r3 = frac(T * speed + 2.0 / 3.0) * 0.5;
 
-    [loop]
-    for (int i = 0; i < 48; ++i)
-    {
+// distance to nearest of the three square outlines
+float line = min(min(abs(d - r1), abs(d - r2)), abs(d - r3));
 
-        float3 p = z * rd;
+// keep the original wobble
+line += 0.01 * sin(T * line);
 
-        p.z += 5.0 + cos(T);
-        float a = T + p.y * 0.25;
+// --- line mask + glow ---
+float thickness = 0.012;
+float core  = smoothstep(thickness, 0.0, line);
+float glow  = exp(-line * 40.0);
 
-        float sa, ca;
-        sincos(a, sa, ca);
+// fade out as rings approach the cell edge so they don't pop hard
+float edgeFade = smoothstep(0.5, 0.35, d);
 
-        float ca5 = ca * C5 - sa * S5;
-        float ca8 = ca * C8 - sa * S8;
+// --- neon blue (same palette) ---
+float3 lineColor = float3(0.20, 0.70, 1.00);
+float3 bgColor   = float3(0.02, 0.03, 0.08);
 
-        float x = p.x;
-        float zz = p.z;
+float3 color = bgColor
+             + lineColor * glow * 0.8 * edgeFade
+             + lineColor * core * 1.5 * edgeFade;
 
-        p.x = x * ca  + zz * ca8;
-        p.z = x * ca5 + zz * ca;
-
-
-
-        float freq = 2.5;
-        float amp  = 0.4;
-
-        [loop]
-        for (int j = 0; j < 6; ++j)
-        {
-            // p.yzx - float3(T,0,0)*8
-            float3 q = float3(
-                p.y - 8.0 * T,
-                p.z,
-                p.x
-            );
-
-            p += cos(q * freq + T) * amp;
-
-            freq *= 1.25;
-            amp  *= 0.8;
-        }
-
-
-
-        float d = 0.01 + abs  (length(p.xz)
-                + p.y * 0.3
-                - 1.0
-            ) * (1.0 / 9.0);
-
-
-
-        float y = p.y * 0.5;
-
-        float sy, cy;
-        sincos(y, sy, cy);
-
-        float3 emission =
-            float3(
-                sy,
-                sy * C1 - cy * S1,
-                sy * C2 - cy * S2
-            ) + 1.1;
-
-        O += emission / d;
-
-        z += d;
-
-        // near/mid-depth region. Stop once we are well past it.
-        if (z > 12.0)
-            break;
-    }
-
-
-
-    O = tanh(O * 0.001);
-
-    return float4(O, 1.0);
+return float4(color, 1.0);
 }
+
