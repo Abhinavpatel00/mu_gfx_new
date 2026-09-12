@@ -3066,14 +3066,17 @@ bool capture_start_video(Renderer *r, const char *path, uint32_t fps) {
     if (!c->inited || c->recording)
         return false;
 
-    // Bitrate knobs: -crf 18 = high quality, -crf 0 = lossless,
-    // or use libx264rgb for pixel-perfect BGRA
+    // libx264 requires even width/height. Pad to the next even value if needed.
+    // The readback buffer is still c->width x c->height; ffmpeg pads the frame
+    // on its side after receiving it.
     char cmd[1024];
     snprintf(cmd, sizeof(cmd),
              "ffmpeg -y -loglevel error "
              "-f rawvideo -pix_fmt %s -s %ux%u -r %u -i - "
+             "-vf \"pad=ceil(iw/2)*2:ceil(ih/2)*2\" "
              "-c:v libx264 -preset ultrafast -crf 18 -pix_fmt yuv420p \"%s\"",
-             c->src_is_bgra ? "bgra" : "rgba", c->width, c->height, fps, path);
+             c->src_is_bgra ? "bgra" : "rgba",
+             c->width, c->height, fps, path);
 
     FILE *p = popen(cmd, "w");
     if (!p) {
@@ -3088,7 +3091,6 @@ bool capture_start_video(Renderer *r, const char *path, uint32_t fps) {
     log_info("[capture] recording -> %s (%ux%u @ %u fps)", path, c->width, c->height, fps);
     return true;
 }
-
 void capture_stop_video(Renderer *r) {
     CaptureState *c = &r->capture;
     if (!c->recording)
@@ -3104,13 +3106,13 @@ void capture_stop_video(Renderer *r) {
 // ---- per-frame hooks -----------------------------------------
 
 // Call in frame_start() after vkWaitForFences() succeeded.
-// The copy recorded 2-3 frames ago on this slot has now completed.
+// The copy recorded MAX_FRAMES_IN_FLIGHT frames ago on this slot has now completed.
 static void capture_consume(Renderer *r) {
     CaptureState *c = &r->capture;
     if (!c->inited)
         return;
 
-    uint32_t slot = r->current_frame % CAPTURE_SLOTS;
+    uint32_t slot = (r->current_frame + CAPTURE_SLOTS - 1) % CAPTURE_SLOTS;
     if (!c->in_flight[slot])
         return;
 
@@ -3203,7 +3205,7 @@ static void capture_record(Renderer *r, VkCommandBuffer cmd) {
         .imageSubresource =
             {
                 .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-                .levelCount = 1,
+                .mipLevel   = 0,
                 .layerCount = 1,
             },
         .imageExtent = {c->width, c->height, 1},
@@ -4438,7 +4440,7 @@ static MU_INLINE void frame_start(Renderer *r) {
 
     VK_CHECK(vkResetFences(r->devc.device, 1, &f->in_flight_fence));
 
-        capture_consume(g_renderer);
+    capture_consume(g_renderer);
     buffer_pool_linear_reset(&r->cpu_pool);
     buffer_pool_ring_free_to(&r->staging_pool, f->staging_tail);
 
@@ -5078,7 +5080,59 @@ FORCE_INLINE void imgui_begin_frame(void) {
     ImGui_ImplGlfw_NewFrame();
     igNewFrame();
 }
+static void render_capture_ui(Renderer *r) {
+    CaptureState *c = &r->capture;
+    if (!c->inited)
+        return;
 
+    static bool show = true;
+
+    // Small floating window bottom-right-ish; user can move it.
+    igSetNextWindowPos((ImVec2_c){10.0f, 10.0f}, ImGuiCond_FirstUseEver, (ImVec2_c){0, 0});
+    igSetNextWindowSize((ImVec2_c){260.0f, 0.0f}, ImGuiCond_FirstUseEver);
+
+    if (!igBegin("Capture", &show, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoCollapse)) {
+        igEnd();
+        return;
+    }
+
+    // ---- Screenshot ----
+    if (igButton("Screenshot", (ImVec2_c){-1.0f, 0.0f})) {
+        char path[256];
+        snprintf(path, sizeof(path), "screenshot_%llu.png", (unsigned long long)(glfwGetTime() * 1000.0));
+        if (capture_take_screenshot(r, path)) {
+            log_info("[ui] screenshot queued: %s", path);
+        } else {
+            log_warn("[ui] screenshot request rejected");
+        }
+    }
+
+    igSeparator();
+
+    // ---- Recording ----
+    if (!c->recording) {
+        if (igButton("Start Recording", (ImVec2_c){-1.0f, 0.0f})) {
+            char path[256];
+            snprintf(path, sizeof(path), "recording_%llu.mp4", (unsigned long long)glfwGetTime());
+            if (!capture_start_video(r, path, 60)) {
+                log_error("[ui] failed to start recording");
+            }
+        }
+    } else {
+        ImVec4_c rec_col = {1.0f, 0.3f, 0.3f, 1.0f};
+        igTextColored(rec_col, "● REC  %llu frames", (unsigned long long)c->frames_written);
+
+        if (igButton("Stop Recording", (ImVec2_c){-1.0f, 0.0f})) {
+            capture_stop_video(r);
+        }
+    }
+
+    igSeparator();
+    igTextDisabled("%ux%u | %d slots | bgra=%d", c->width, c->height, CAPTURE_SLOTS, (int)c->src_is_bgra);
+    igTextDisabled("F = shot   F9 = record");
+
+    igEnd();
+}
 int main() {
 
     graphics_init();
@@ -5094,7 +5148,7 @@ int main() {
         glfwPollEvents();
         // R → screenshot
         static bool shot_held = false;
-        if (glfwGetKey(g_renderer->window, GLFW_KEY_F) == GLFW_PRESS) {
+        if (glfwGetKey(g_renderer->window, GLFW_KEY_R) == GLFW_PRESS) {
             if (!shot_held) {
                 char path[256];
                 snprintf(path, sizeof(path), "screenshot_%llu.png", (unsigned long long)(glfwGetTime() * 1000.0));
@@ -5157,6 +5211,7 @@ int main() {
         pass_smaa(r, cmd);
         pass_ldr_to_swapchain(r, cmd);
         render_gpu_profiler_ui(r);
+        render_capture_ui(r);
         igRender();
         pass_imgui(r, cmd);
         capture_record(r, cmd);
@@ -5169,7 +5224,7 @@ int main() {
 
         submit_frame(renderer);
     }
-capture_shutdown(g_renderer);
+    capture_shutdown(g_renderer);
     dmon_deinit();
     pipeline_cache_save(g_renderer->devc.device, g_renderer->devc.physical_device, g_renderer->devc.pipeline_cache,
                         "pipeline_cache.bin");

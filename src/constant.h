@@ -30,3 +30,9 @@
 
 #define MAX_COLOR_ATTACHMENTS 8
 #define VALIDATION false
+
+
+// Root capture directory. Everything user-facing goes under here.
+#define CAPTURE_DIR            "captures"
+#define CAPTURE_SCREENSHOT_DIR CAPTURE_DIR "/screenshots"
+#define CAPTURE_VIDEO_DIR      CAPTURE_DIR "/videos"
