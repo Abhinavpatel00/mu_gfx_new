@@ -1,13 +1,12 @@
+#include "external/dmon/dmon.h"
 #include "external/mu/mu/mu_perf.h"
 #include "external/mu/offset_allocator.h"
 #include "external/stb/stb_image.h"
+#include "external/stb/stb_image_write.h"
 #include "src/helpers.h"
 #include "src/slangtypes.h"
 #include <stdbool.h>
 #include <stdint.h>
-
-#define DMON_IMPL
-#include "external/dmon/dmon.h"
 // ids
 
 typedef uint32_t TextureID;
@@ -362,6 +361,32 @@ typedef struct BarrierBatch {
     uint32_t image_count;
 } BarrierBatch;
 
+typedef struct CaptureState {
+    Buffer readback[CAPTURE_SLOTS];
+    bool   in_flight[CAPTURE_SLOTS];  // GPU copy recorded, not yet consumed
+    bool   shot_slot[CAPTURE_SLOTS];  // save a PNG when consumed
+    bool   video_slot[CAPTURE_SLOTS]; // feed ffmpeg when consumed
+    char   shot_path[CAPTURE_SLOTS][512];
+
+    uint32_t     width;
+    uint32_t     height;
+    VkDeviceSize bytes_per_frame;
+    bool         src_is_bgra;
+
+    // video
+    bool     recording;
+    FILE    *pipe;
+    uint32_t fps;
+    uint64_t frames_written;
+
+    // pending request (set from main thread / UI)
+    bool screenshot_pending;
+    char screenshot_path[512];
+
+    uint8_t *png_scratch;
+
+    bool inited;
+} CaptureState;
 typedef struct {
     // ---- CPU profiling ----
     double   cpu_frame_ns;      // total frame time (e.g., from glfwGetTime)
@@ -434,6 +459,7 @@ typedef struct {
     BufferPool staging_pool;
 
     Buffer            readback_buffer;
+    CaptureState      capture;
     RendererPipelines render_pipelines;
     VkDeviceAddress   gpu_base_addr;
     VkSampler         samplers[MAX_BINDLESS_SAMPLERS];
@@ -2012,7 +2038,7 @@ static bool rt_create_internal(Renderer *r, RenderTarget *rt, const RenderTarget
     rt->mip_count = mips;
 
     // // Bindless slots unused until registered
-     rt->bindless_index = r->dummy_texture;
+    rt->bindless_index = r->dummy_texture;
     //
     // Create image
     VkImageCreateInfo image_info = {
@@ -2114,40 +2140,40 @@ static void rt_update_bindless_descriptors(Renderer *r, const RenderTarget *rt) 
     if (!r || !rt || rt->bindless_index == UINT32_MAX)
         return;
 
-    VkWriteDescriptorSet writes[2];
+    VkWriteDescriptorSet  writes[2];
     VkDescriptorImageInfo images[2];
-    uint32_t write_count = 0;
+    uint32_t              write_count = 0;
 
     if (rt->usage & VK_IMAGE_USAGE_SAMPLED_BIT) {
         images[write_count] = (VkDescriptorImageInfo){
-            .imageView = rt->view,
+            .imageView   = rt->view,
             .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
         };
         writes[write_count] = (VkWriteDescriptorSet){
-            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-            .dstSet = r->bindless_system.set,
-            .dstBinding = BINDLESS_TEXTURE_BINDING,
+            .sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet          = r->bindless_system.set,
+            .dstBinding      = BINDLESS_TEXTURE_BINDING,
             .dstArrayElement = rt->bindless_index,
             .descriptorCount = 1,
-            .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
-            .pImageInfo = &images[write_count],
+            .descriptorType  = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+            .pImageInfo      = &images[write_count],
         };
         write_count++;
     }
 
     if (rt->usage & VK_IMAGE_USAGE_STORAGE_BIT) {
         images[write_count] = (VkDescriptorImageInfo){
-            .imageView = rt->view,
+            .imageView   = rt->view,
             .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
         };
         writes[write_count] = (VkWriteDescriptorSet){
-            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-            .dstSet = r->bindless_system.set,
-            .dstBinding = BINDLESS_STORAGE_IMAGE_BINDING,
+            .sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet          = r->bindless_system.set,
+            .dstBinding      = BINDLESS_STORAGE_IMAGE_BINDING,
             .dstArrayElement = rt->bindless_index,
             .descriptorCount = 1,
-            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-            .pImageInfo = &images[write_count],
+            .descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+            .pImageInfo      = &images[write_count],
         };
         write_count++;
     }
@@ -2213,9 +2239,7 @@ static void rt_destroy_internal(Renderer *r, RenderTarget *rt, bool release_id) 
     memset(rt, 0, sizeof(*rt));
 }
 
-void rt_destroy(Renderer *r, RenderTarget *rt) {
-    rt_destroy_internal(r, rt, true);
-}
+void rt_destroy(Renderer *r, RenderTarget *rt) { rt_destroy_internal(r, rt, true); }
 
 bool rt_resize(Renderer *r, RenderTarget *rt, uint32_t width, uint32_t height)
 
@@ -2226,15 +2250,15 @@ bool rt_resize(Renderer *r, RenderTarget *rt, uint32_t width, uint32_t height)
     if (width == rt->width && height == rt->height)
         return true;
 
-    uint32_t bindless_index = rt->bindless_index;
-    RenderTargetSpec spec = {.width      = width,
-                             .height     = height,
-                             .layers     = rt->layers,
-                             .format     = rt->format,
-                             .usage      = rt->usage,
-                             .aspect     = rt->aspect,
-                             .mip_count  = rt->mip_count,
-                             .debug_name = rt->debug_name};
+    uint32_t         bindless_index = rt->bindless_index;
+    RenderTargetSpec spec           = {.width      = width,
+                                       .height     = height,
+                                       .layers     = rt->layers,
+                                       .format     = rt->format,
+                                       .usage      = rt->usage,
+                                       .aspect     = rt->aspect,
+                                       .mip_count  = rt->mip_count,
+                                       .debug_name = rt->debug_name};
 
     rt_destroy_internal(r, rt, false);
     return rt_create_internal(r, rt, &spec, bindless_index);
@@ -2567,9 +2591,9 @@ VkPipeline create_compute_pipeline(Renderer *renderer, const char *compute_path)
 void vk_cmd_set_viewport_scissor(VkCommandBuffer cmd, VkExtent2D extent) {
     VkViewport vp = {
         .x        = 0.0f,
-        .y        =       (float)extent.height ,
+        .y        = (float)extent.height,
         .width    = (float)extent.width,
-        .height   =- (float)extent.height,
+        .height   = -(float)extent.height,
         .minDepth = 0.0f,
         .maxDepth = 1.0f,
     };
@@ -2927,7 +2951,291 @@ MU_INLINE void rt_transition_all(Renderer *r, VkCommandBuffer cmd, RenderTarget 
                            VK_QUEUE_FAMILY_IGNORED);
     }
 }
+// ============================================================
+// Capture implementation
+// ============================================================
 
+static bool capture_alloc_slot(Renderer *r, Buffer *b, VkDeviceSize size) {
+    VkBufferCreateInfo bi = {
+        .sType       = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size        = size,
+        .usage       = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+    };
+    VmaAllocationCreateInfo ai = {
+        .usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+        .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT,
+    };
+    VmaAllocationInfo info;
+    if (vmaCreateBuffer(r->devc.vmaallocator, &bi, &ai, &b->buffer, &b->allocation, &info) != VK_SUCCESS)
+        return false;
+    b->buffer_size = size;
+    b->mapping     = info.pMappedData;
+    b->address     = 0;
+    return true;
+}
+
+static void capture_free_slot(Renderer *r, Buffer *b) {
+    if (b->buffer)
+        vmaDestroyBuffer(r->devc.vmaallocator, b->buffer, b->allocation);
+    memset(b, 0, sizeof(*b));
+}
+
+void capture_init(Renderer *r, uint32_t w, uint32_t h) {
+    CaptureState *c = &r->capture;
+    if (c->inited || w == 0 || h == 0)
+        return;
+
+    memset(c, 0, sizeof(*c));
+    c->width           = w;
+    c->height          = h;
+    c->fps             = 60;
+    c->bytes_per_frame = (VkDeviceSize)w * h * 4;
+    c->src_is_bgra =
+        (r->swapchain.format == VK_FORMAT_B8G8R8A8_SRGB || r->swapchain.format == VK_FORMAT_B8G8R8A8_UNORM);
+
+    for (uint32_t i = 0; i < CAPTURE_SLOTS; i++) {
+        if (!capture_alloc_slot(r, &c->readback[i], c->bytes_per_frame))
+            log_error("[capture] slot %u alloc failed", i);
+    }
+
+    c->png_scratch = malloc((size_t)w * h * 4);
+    c->inited      = true;
+
+    log_info("[capture] ready %ux%u (%d slots, bgra=%d)", w, h, CAPTURE_SLOTS, (int)c->src_is_bgra);
+}
+
+void capture_shutdown(Renderer *r) {
+    CaptureState *c = &r->capture;
+    if (!c->inited)
+        return;
+
+    if (c->recording) {
+        pclose(c->pipe);
+        c->pipe      = NULL;
+        c->recording = false;
+    }
+
+    vkDeviceWaitIdle(r->devc.device);
+    for (uint32_t i = 0; i < CAPTURE_SLOTS; i++)
+        capture_free_slot(r, &c->readback[i]);
+
+    free(c->png_scratch);
+    memset(c, 0, sizeof(*c));
+}
+
+void capture_resize(Renderer *r, uint32_t w, uint32_t h) {
+    CaptureState *c = &r->capture;
+    if (!c->inited || (w == c->width && h == c->height))
+        return;
+
+    if (c->recording) {
+        log_warn("[capture] resize during recording; stopping");
+        pclose(c->pipe);
+        c->pipe      = NULL;
+        c->recording = false;
+    }
+
+    vkDeviceWaitIdle(r->devc.device);
+    for (uint32_t i = 0; i < CAPTURE_SLOTS; i++) {
+        capture_free_slot(r, &c->readback[i]);
+        capture_alloc_slot(r, &c->readback[i], (VkDeviceSize)w * h * 4);
+    }
+    free(c->png_scratch);
+    c->png_scratch = malloc((size_t)w * h * 4);
+
+    c->width           = w;
+    c->height          = h;
+    c->bytes_per_frame = (VkDeviceSize)w * h * 4;
+}
+
+// ---- public API ----------------------------------------------
+
+bool capture_take_screenshot(Renderer *r, const char *path) {
+    CaptureState *c = &r->capture;
+    if (!c->inited || !path)
+        return false;
+    strncpy(c->screenshot_path, path, sizeof(c->screenshot_path) - 1);
+    c->screenshot_path[sizeof(c->screenshot_path) - 1] = '\0';
+    c->screenshot_pending                              = true;
+    return true;
+}
+
+bool capture_start_video(Renderer *r, const char *path, uint32_t fps) {
+    CaptureState *c = &r->capture;
+    if (!c->inited || c->recording)
+        return false;
+
+    // Bitrate knobs: -crf 18 = high quality, -crf 0 = lossless,
+    // or use libx264rgb for pixel-perfect BGRA
+    char cmd[1024];
+    snprintf(cmd, sizeof(cmd),
+             "ffmpeg -y -loglevel error "
+             "-f rawvideo -pix_fmt %s -s %ux%u -r %u -i - "
+             "-c:v libx264 -preset ultrafast -crf 18 -pix_fmt yuv420p \"%s\"",
+             c->src_is_bgra ? "bgra" : "rgba", c->width, c->height, fps, path);
+
+    FILE *p = popen(cmd, "w");
+    if (!p) {
+        log_error("[capture] ffmpeg not found on PATH");
+        return false;
+    }
+
+    c->pipe           = p;
+    c->recording      = true;
+    c->fps            = fps;
+    c->frames_written = 0;
+    log_info("[capture] recording -> %s (%ux%u @ %u fps)", path, c->width, c->height, fps);
+    return true;
+}
+
+void capture_stop_video(Renderer *r) {
+    CaptureState *c = &r->capture;
+    if (!c->recording)
+        return;
+    c->recording = false;
+    if (c->pipe) {
+        pclose(c->pipe);
+        c->pipe = NULL;
+    }
+    log_info("[capture] stopped (%llu frames)", (unsigned long long)c->frames_written);
+}
+
+// ---- per-frame hooks -----------------------------------------
+
+// Call in frame_start() after vkWaitForFences() succeeded.
+// The copy recorded 2-3 frames ago on this slot has now completed.
+static void capture_consume(Renderer *r) {
+    CaptureState *c = &r->capture;
+    if (!c->inited)
+        return;
+
+    uint32_t slot = r->current_frame % CAPTURE_SLOTS;
+    if (!c->in_flight[slot])
+        return;
+
+    Buffer *b = &c->readback[slot];
+    if (!b->mapping)
+        return;
+
+    vmaInvalidateAllocation(r->devc.vmaallocator, b->allocation, 0, VK_WHOLE_SIZE);
+    const uint8_t *src = (const uint8_t *)b->mapping;
+
+    if (c->shot_slot[slot]) {
+        if (c->src_is_bgra) {
+            size_t npix = (size_t)c->width * (size_t)c->height;
+            for (size_t i = 0; i < npix; i++) {
+                c->png_scratch[i * 4 + 0] = src[i * 4 + 2];
+                c->png_scratch[i * 4 + 1] = src[i * 4 + 1];
+                c->png_scratch[i * 4 + 2] = src[i * 4 + 0];
+                c->png_scratch[i * 4 + 3] = src[i * 4 + 3];
+            }
+            stbi_write_png(c->shot_path[slot], (int)c->width, (int)c->height, 4, c->png_scratch, (int)(c->width * 4));
+        } else {
+            stbi_write_png(c->shot_path[slot], (int)c->width, (int)c->height, 4, src, (int)(c->width * 4));
+        }
+        log_info("[capture] screenshot: %s", c->shot_path[slot]);
+        c->shot_slot[slot] = false;
+    }
+
+    if (c->video_slot[slot] && c->pipe) {
+        fwrite(src, 1, (size_t)c->bytes_per_frame, c->pipe);
+        c->frames_written++;
+        c->video_slot[slot] = false;
+    }
+
+    c->in_flight[slot] = false;
+}
+
+// Call right after pass_imgui(), before the swapchain is transitioned
+// to PRESENT_SRC. Handles the temporary TRANSFER_SRC layout ourselves.
+static void capture_record(Renderer *r, VkCommandBuffer cmd) {
+    CaptureState *c = &r->capture;
+    if (!c->inited)
+        return;
+
+    uint32_t slot = r->current_frame % CAPTURE_SLOTS;
+    if (c->in_flight[slot])
+        return;
+
+    bool want_shot  = c->screenshot_pending;
+    bool want_video = c->recording;
+    if (!want_shot && !want_video)
+        return;
+
+    if (c->width != r->swapchain.extent.width || c->height != r->swapchain.extent.height)
+        return;
+
+    uint32_t image = r->swapchain.current_image;
+    VkImage  src   = r->swapchain.images[image];
+
+    ImageState           *st          = &r->swapchain.states[image];
+    VkImageLayout         prev_layout = st->layout;
+    VkPipelineStageFlags2 prev_stage  = st->stage;
+    VkAccessFlags2        prev_access = st->access;
+
+    VkImageMemoryBarrier2 to_src = {
+        .sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+        .srcStageMask        = prev_stage ? prev_stage : VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+        .srcAccessMask       = prev_access ? prev_access : VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+        .dstStageMask        = VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+        .dstAccessMask       = VK_ACCESS_2_TRANSFER_READ_BIT,
+        .oldLayout           = prev_layout,
+        .newLayout           = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image               = src,
+        .subresourceRange =
+            {
+                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .levelCount = 1,
+                .layerCount = 1,
+            },
+    };
+    VkDependencyInfo dep = {
+        .sType                   = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+        .imageMemoryBarrierCount = 1,
+        .pImageMemoryBarriers    = &to_src,
+    };
+    vkCmdPipelineBarrier2(cmd, &dep);
+
+    VkBufferImageCopy region = {
+        .imageSubresource =
+            {
+                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .levelCount = 1,
+                .layerCount = 1,
+            },
+        .imageExtent = {c->width, c->height, 1},
+    };
+    vkCmdCopyImageToBuffer(cmd, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, c->readback[slot].buffer, 1, &region);
+
+    VkImageMemoryBarrier2 to_att = to_src;
+    to_att.srcStageMask          = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+    to_att.srcAccessMask         = VK_ACCESS_2_TRANSFER_READ_BIT;
+    to_att.dstStageMask          = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+    to_att.dstAccessMask         = VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+    to_att.oldLayout             = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    to_att.newLayout             = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    dep.pImageMemoryBarriers     = &to_att;
+    vkCmdPipelineBarrier2(cmd, &dep);
+
+    // Restore the tracker so the later transition to PRESENT sees the state
+    // it would have seen without us.
+    st->layout = prev_layout;
+    st->stage  = prev_stage;
+    st->access = prev_access;
+
+    c->in_flight[slot]  = true;
+    c->shot_slot[slot]  = want_shot;
+    c->video_slot[slot] = want_video;
+
+    if (want_shot) {
+        strncpy(c->shot_path[slot], c->screenshot_path, sizeof(c->shot_path[slot]) - 1);
+        c->shot_path[slot][sizeof(c->shot_path[slot]) - 1] = '\0';
+        c->screenshot_pending                              = false;
+    }
+}
 void renderer_create(Renderer *r, RendererDesc *desc) {
     TracyCZoneN(ctx, "renderer_create", 1);
     // Instance
@@ -3418,6 +3726,8 @@ void renderer_create(Renderer *r, RendererDesc *desc) {
     vk_create_swapchain(r->devc.device, r->devc.physical_device, &r->swapchain, &sci, r->devc.graphics_queue,
                         r->one_time_gfx_pool, r);
 
+    capture_init(r, r->swapchain.extent.width, r->swapchain.extent.height);
+
     RenderTargetSpec depth_spec = {.width  = r->swapchain.extent.width,
                                    .height = r->swapchain.extent.height,
                                    .layers = 1,
@@ -3901,7 +4211,7 @@ void graphics_init(void) {
         .instance_extension_count    = glfw_ext_count,
         .device_extension_count      = 2,
         .enable_gpu_based_validation = false,
-        .enable_validation           =  false,
+        .enable_validation           = false,
 
         .validation_severity =
             VK_DEBUG_UTILS_MESSAGE_SEVERITY_VERBOSE_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT |
@@ -4108,10 +4418,11 @@ static MU_INLINE void frame_start(Renderer *r) {
             rt_resize(r, &r->hdr_color[i], fb_w, fb_h);
 
             rt_resize(r, &r->ldr_color[i], fb_w, fb_h);
-           
+
             rt_resize(r, &r->smaa_final[i], fb_w, fb_h);
             rt_resize(r, &r->smaa_edges[i], fb_w, fb_h);
             rt_resize(r, &r->smaa_weights[i], fb_w, fb_h);
+            capture_resize(r, fb_w, fb_h);
         }
 
         r->swapchain.needs_recreate = false;
@@ -4127,6 +4438,7 @@ static MU_INLINE void frame_start(Renderer *r) {
 
     VK_CHECK(vkResetFences(r->devc.device, 1, &f->in_flight_fence));
 
+        capture_consume(g_renderer);
     buffer_pool_linear_reset(&r->cpu_pool);
     buffer_pool_ring_free_to(&r->staging_pool, f->staging_tail);
 
@@ -4151,9 +4463,9 @@ static void update_global_data(Renderer *r) {
     glm_mat4_identity(data.inv_projection);
     glm_mat4_identity(data.inv_viewproj);
 
-    data.time = (float)glfwGetTime();
-    data.delta_time = (float)((double)r->cpu_frame_ns / 1000000000.0);
-    data.frame_count = r->frame_count++;
+    data.time             = (float)glfwGetTime();
+    data.delta_time       = (float)((double)r->cpu_frame_ns / 1000000000.0);
+    data.frame_count      = r->frame_count++;
     data.screen_params[0] = (float)r->swapchain.extent.width;
     data.screen_params[1] = (float)r->swapchain.extent.height;
     data.screen_params[2] = 1.0f / data.screen_params[0];
@@ -4166,15 +4478,15 @@ static void update_global_data(Renderer *r) {
     VkDescriptorBufferInfo info = {
         .buffer = global_buffer->buffer,
         .offset = 0,
-        .range = sizeof(data),
+        .range  = sizeof(data),
     };
     VkWriteDescriptorSet write = {
-        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-        .dstSet = r->bindless_system.set,
-        .dstBinding = GLOBAL_DATA_BINDING,
+        .sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+        .dstSet          = r->bindless_system.set,
+        .dstBinding      = GLOBAL_DATA_BINDING,
         .descriptorCount = 1,
-        .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-        .pBufferInfo = &info,
+        .descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+        .pBufferInfo     = &info,
     };
     vkUpdateDescriptorSets(r->devc.device, 1, &write, 0, NULL);
 }
@@ -4460,8 +4772,6 @@ static void post_pass(Renderer *r, VkCommandBuffer cmd) {
                           VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
         rt_transition_all(r, cmd, &r->ldr_color[image], VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
                           VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
-
-
 
         flush_barriers(r, cmd);
 
@@ -4782,6 +5092,33 @@ int main() {
 
         TracyCFrameMark;
         glfwPollEvents();
+        // R → screenshot
+        static bool shot_held = false;
+        if (glfwGetKey(g_renderer->window, GLFW_KEY_F) == GLFW_PRESS) {
+            if (!shot_held) {
+                char path[256];
+                snprintf(path, sizeof(path), "screenshot_%llu.png", (unsigned long long)(glfwGetTime() * 1000.0));
+                capture_take_screenshot(g_renderer, path);
+                shot_held = true;
+            }
+        } else
+            shot_held = false;
+
+        // F9 → toggle recording
+        static bool rec_held = false;
+        if (glfwGetKey(g_renderer->window, GLFW_KEY_F9) == GLFW_PRESS) {
+            if (!rec_held) {
+                if (!g_renderer->capture.recording) {
+                    char path[256];
+                    snprintf(path, sizeof(path), "recording_%llu.mp4", (unsigned long long)glfwGetTime());
+                    capture_start_video(g_renderer, path, 60);
+                } else {
+                    capture_stop_video(g_renderer);
+                }
+                rec_held = true;
+            }
+        } else
+            rec_held = false;
 
         pipeline_rebuild(g_renderer);
         frame_start(g_renderer);
@@ -4822,6 +5159,7 @@ int main() {
         render_gpu_profiler_ui(r);
         igRender();
         pass_imgui(r, cmd);
+        capture_record(r, cmd);
         image_transition_swapchain(r, cmd, &r->swapchain, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
                                    VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, 0);
 
@@ -4831,7 +5169,7 @@ int main() {
 
         submit_frame(renderer);
     }
-
+capture_shutdown(g_renderer);
     dmon_deinit();
     pipeline_cache_save(g_renderer->devc.device, g_renderer->devc.physical_device, g_renderer->devc.pipeline_cache,
                         "pipeline_cache.bin");
