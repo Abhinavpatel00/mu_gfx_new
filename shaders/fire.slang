@@ -1,4 +1,112 @@
+
 #include "common.slang"
+struct Quat { float4 v; };  // v.x = w, v.yzw = (x, y, z)
+
+Quat q_identity() { return Quat(float4(1, 0, 0, 0)); }
+
+Quat q_mul(Quat a, Quat b) {
+    float aw = a.v.x, ax = a.v.y, ay = a.v.z, az = a.v.w;
+    float bw = b.v.x, bx = b.v.y, by = b.v.z, bz = b.v.w;
+    return Quat(float4(
+        aw * bw - ax * bx - ay * by - az * bz,
+        aw * bx + ax * bw + ay * bz - az * by,
+        aw * by - ax * bz + ay * bw + az * bx,
+        aw * bz + ax * by - ay * bx + az * bw
+    ));
+}
+
+Quat q_conj(Quat q) { return Quat(float4(q.v.x, -q.v.yzw)); }
+
+float q_len(Quat q) { return length(q.v); }
+
+Quat q_normalize(Quat q) { return Quat(q.v / q_len(q)); }
+
+// Rotate a 3D vector. q must be unit length.
+float3 q_rotate(Quat q, float3 v) {
+    // v' = q * (0, v) * q^-1, expanded for efficiency
+    float3 u = q.v.yzw;
+    float  s = q.v.x;
+    return v + 2.0 * cross(u, cross(u, v) + s * v);
+}
+
+// Axis-angle → quaternion
+Quat q_from_axis_angle(float3 axis, float angle) {
+    float h = angle * 0.5;
+    float s = sin(h);
+    return Quat(float4(cos(h), normalize(axis) * s));
+}
+
+// Slerp — useful to see the "shortest arc" property
+Quat q_slerp(Quat a, Quat b, float t) {
+    float d = dot(a.v, b.v);
+    if (d < 0.0) { b = Quat(-b.v); d = -d; }
+    if (d > 0.9995) return q_normalize(Quat(a.v + (b.v - a.v) * t));
+    float th0 = acos(clamp(d, -1.0, 1.0));
+    float th  = th0 * t;
+    float s0  = sin(th0 - th) / sin(th0);
+    float s1  = sin(th) / sin(th0);
+    return Quat(a.v * s0 + b.v * s1);
+}
+
+// ===================== HOPF FIBRATION =====================
+// Every glowing circle is the stereographic image of one Hopf fiber,
+// i.e. the circle { q * (cos a, sin a, 0, 0) : a } of unit quaternions.
+
+float3 pal(float t)   // shared cosine palette
+{
+    return 0.55 + 0.45*cos(6.28318*(t*0.9 + float3(0.0, 0.28, 0.55)));
+}
+
+float3 shader_hopf(float2 uv, float T)
+{
+    const int   N    = 9;      // fibers — raise for density
+    const float GLOW = 700.0;   // line sharpness
+
+    // slowly orbiting camera
+    float ca = 0.28*T;
+    float el = 0.45 + 0.18*sin(0.19*T);
+    float3 ro = 3.4*float3(cos(el)*sin(ca), sin(el), cos(el)*cos(ca));
+    float3 fw = normalize(-ro);
+    float3 rt = normalize(cross(fw, float3(0,1,0)));
+    float3 up = cross(rt, fw);
+    float3 rd = normalize(uv.x*rt + uv.y*up + 1.75*fw);
+
+    float3 col = float3(0.010, 0.014, 0.032);
+
+    [loop]
+    for (int i = 0; i < N; i++)
+    {
+        float f = ((float)i + 0.5) / (float)N;
+
+        // base points spread over S^2 (cosine-distributed), precessing
+        float theta = clamp(acos(clamp(1.0 - 2.0*f, -1.0, 1.0)), 0.07, 3.07);
+        float phi   = f * 2.39996323 + 0.5*T;          // golden angle
+
+        // analytic projected fiber (derivation above)
+        float ct = cos(theta*0.5), st = sin(theta*0.5);
+        float3 C = (st/ct) * float3(-sin(phi), cos(phi), 0.0);
+        float3 n = float3(-st*cos(phi), -st*sin(phi), ct);
+        float  r = 1.0/ct;
+
+        // ray vs. the circle's plane -> distance to circle
+        float dn = dot(rd, n);
+        if (abs(dn) < 0.0001) continue;
+        float t = dot(C - ro, n) / dn;
+        if (t < 0.05) continue;
+
+        float3 h = ro + t*rd;
+        float  d = length(h - C) - r;
+
+        float att    = 1.0 / (1.0 + 0.13*t*t);         // depth cue
+        float3 tint  = pal(0.05 + theta*0.30);         // color = latitude on S^2
+
+        col += tint * exp(-d*d*GLOW)     * att * 0.45; // halo
+        col += tint * exp(-d*d*GLOW*6.0) * att * 1.30; // hot core
+    }
+
+    return col;                       
+}
+
 
 
 struct VSOutput
@@ -109,99 +217,112 @@ float3 color = bgColor
              + lineColor * core * 1.5 * edgeFade;
 */
 
-// Compactness: every open cover has a finite subcover.
-// Visual: K = closed disk. Cover = open disks B(c_n, r_n) indexed by n.
-// Show: a finite set of them already covers K.
+/*
 
-float2 uv2 = (uv - 0.5) * float2(R.x/R.y, 1.0) * 2.2;
+ float2 C = input.position.xy;
 
-// --- K : the compact set (closed disk) ---
-float2 kC = float2(0.0);
-float  kR = 0.85;
-float  dK = length(uv2 - kC);
 
-// --- open cover: family of open disks whose union ⊇ K ---
-// parametrize by integer n; use ~24 sample disks, animate their centers
-float cover = 0.0;          // 1 if point is inside at least one open disk
-float used  = 0.0;          // 1 if inside one of the FINITE subcover disks
-int   N     = 24;           // total (pretend-infinite) family size shown
+ float3 ray_origin = float3(0.0, 0.0, 5.0 + cos(T));
 
-// phase: how many of the family we currently "activate" as the finite subcover
-float activeF = 6.0 + 6.0 * (0.5 + 0.5*sin(T*0.6)); // cycles 6..12
-int   active  = int(activeF);
+    // --- Ray direction (unchanged) ---
+float3 rd = normalize(float3(
+    uv.x,
+    uv.y,
+    -1.0
+));
+    float  z   = 0.0;
+    float3 col = 0.0;
 
-for (int n = 0; n < N; n++) {
-    float fn = float(n);
-    // centers spiral around K, all at radius ~1.15 so their union covers K
-    float a  = fn * 2.399963;                 // golden angle
-    float rr = 1.15 + 0.15*sin(T*0.3 + fn);
-    float2 c = float2(cos(a), sin(a)) * rr;
+    // Inner-loop constants (lacunarity 1.25, gain 0.8)
+    static const float FREQ[6] = { 2.5000000, 3.1250000, 3.9062500, 4.8828125, 6.1035156, 7.6293945 };
+    static const float AMP [6] = { 0.4000000, 0.3200000, 0.2560000, 0.2048000, 0.1638400, 0.1310720 };
 
-    // radii chosen so disks overlap generously and reach K's interior
-    float r  = 0.75;
+    const float STEP_SCALE = 1.0 / 9.0;
 
-    float d = length(uv2 - c);
-    float inside = smoothstep(r, r-0.01, d);  // soft edge
+    [loop]
+    for (int i = 0; i < 48; ++i)
+    {
+        float3 p = ray_origin + z * rd;
 
-    cover = max(cover, inside);
-    if (n < active) used = max(used, inside);
-}
+        float a = T + p.y * 0.25;
+        float sa = sin(a), ca = cos(a);
 
-// --- drawing ---
-float3 bg        = float3(0.02, 0.03, 0.08);
+        float c5 = cos(a + 5.0), s5 = sin(a + 5.0);
+        float c8 = cos(a + 8.0), s8 = sin(a + 8.0);
 
-// K outline (compact set boundary)
-float kEdge = smoothstep(0.015, 0.0, abs(dK - kR));
+        // Two consecutive Y-axis rotations: first by (a+5), then by (a+8).
+        float2 xz = p.xz;
+        float2 r5 = float2(xz.x * c5 - xz.y * s5,
+                           xz.x * s5 + xz.y * c5);
+        float2 r58 = float2(r5.x * c8 - r5.y * s8,
+                            r5.x * s8 + r5.y * c8);
+        p.x = r58.x;
+        p.z = r58.y;
 
-// point inside K ?
-float inK = smoothstep(kR, kR-0.01, dK);
+        [unroll]
+        for (int j = 0; j < 6; ++j)
+        {
+            float3 q = float3(p.y - 8.0 * T, p.z, p.x);
+            p += cos(q * FREQ[j] + T) * AMP[j];
+        }
 
-// colors matching your neon palette
-float3 kColor    = float3(1.00, 0.85, 0.30);   // compact set = gold
-float3 coverCol  = float3(0.20, 0.70, 1.00);   // open cover = neon blue
-float3 subCol    = float3(0.45, 1.00, 0.55);   // finite subcover = green
+        float d = 0.01 + abs(length(p.xz) + p.y * 0.3 - 1.0) * STEP_SCALE;
 
-// show the open cover disks faintly
-float3 col = bg;
-col += coverCol * cover * 0.10;
+        float y  = p.y * 0.5;
+        float3 emission = float3(sin(y), sin(y - 1.0), sin(y - 2.0)) + 1.1;
 
-// highlight the finite subcover
-col += subCol * used * 0.22;
+        col += emission / d;
 
-// draw K boundary strongly
-col += kColor * kEdge * 1.5;
+        z += d;
+        if (z > 12.0) break;   // far plane
+    }
 
-// fill K slightly
-col += kColor * inK * 0.10;
+    col = tanh(col * 0.001);   // default ~0.001
+*/
+/*
 
-// outline each active subcover disk
-for (int n = 0; n < N; n++) {
-    float fn = float(n);
-    float a  = fn * 2.399963;
-    float rr = 1.15 + 0.15*sin(T*0.3 + fn);
-    float2 c = float2(cos(a), sin(a)) * rr;
-    float r  = 0.75;
-    float ring = smoothstep(0.008, 0.0, abs(length(uv2-c) - r));
-    float on = step(fn, activeF - 0.5);
-    col += subCol * ring * on * 1.2;
-    col += coverCol * ring * (1.0 - on) * 0.15;
-}
 
+   // ------------------------------------------------------------------
+    // 1) Time-varying unit quaternion  q = (cos(θ/2), sin(θ/2)·n̂)
+    // ------------------------------------------------------------------
+    float3 axis  = normalize(float3(sin(0.5 * T),cos(0.5 * T),1.0));
+    float  theta = 1.5 + 1.2 * frac(0.4 * T);      // ≈ [0.3, 2.7] rad
+    Quat   q     = q_from_axis_angle(axis, theta);
+
+
+    // ------------------------------------------------------------------
+    // 2) Map each pixel to a 3D direction on the front hemisphere.
+    //    v is the vector "seen" through that pixel.
+    // ------------------------------------------------------------------
+    float  r2 = dot(uv, uv);
+    float3 v  = float3(uv, sqrt(1.0 - r2));   // |v| = 1
+
+    // ------------------------------------------------------------------
+    // 3) Rotate it:  rv = q v q*
+    // ------------------------------------------------------------------
+    float3 rv = q_rotate(q, v);
+
+    // ------------------------------------------------------------------
+    // 4) Draw.
+    //    • RGB = rotated direction → the sphere appears to spin.
+    //    • Dark core where rv == v → the two points where the axis
+    //      pierces the sphere. Those are the *only* directions q
+    //      leaves invariant.
+    // ------------------------------------------------------------------
+    float3 col = rv * 0.5 + 0.5;
+
+    float moved = length(rv - v);              // 0 exactly on the axis
+    col = lerp(float3(0.04, 0.04, 0.07), col,
+               smoothstep(0.0, 0.22, moved));
+
+    // Dark background outside the sphere
+    float mask = step(r2, 1.0);
+    col = lerp(float3(0.015, 0.02, 0.035), col, mask);
+*/
+
+
+
+
+ float3 col = shader_hopf(uv, T);
 return float4(col, 1.0);
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-return float4(color, 1.0);
 }
-
