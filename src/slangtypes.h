@@ -68,6 +68,21 @@ typedef struct GlobalData {
 
 } GlobalData;
 
+/* ---------------------------------------------------------
+   Game entity — shared between the CPU sim (src/game.h) and
+   the instanced sprite shader (shaders/game.slang).
+   Keep this layout EXACTLY in sync in both branches.
+   --------------------------------------------------------- */
+typedef struct GameEntity {
+    float2 pos;      // world position (aspect-corrected units)
+    float2 vel;      // velocity
+    float2 size;     // half-extents (x = half width, y = half height)
+    uint   kind;     // 0 = player, 1 = enemy, 2 = bullet, 3 = particle
+    uint   alive;    // 0 = dead / free slot
+    float  angle;    // rotation (radians)
+    uint   color_rgba; // packed 0xAABBGGRR — decoded in the shader
+} GameEntity;
+
 static inline void mul_mat4(mat4 a, mat4 b, mat4 out) { glm_mat4_mul(a, b, out); }
 
 static inline void mul_mat4_vec4(mat4 m, vec4 v, vec4 out) { glm_mat4_mulv(m, v, out); }
@@ -130,6 +145,17 @@ struct GlobalData {
    float4   screen_params;
    float2   mouse_pos;
    float2   mouse_buttons;
+};
+
+/* Game entity — MUST stay in sync with the C definition above. */
+struct GameEntity {
+    float2 pos;
+    float2 vel;
+    float2 size;
+    uint   kind;
+    uint   alive;
+    float  angle;
+    uint   color_rgba;
 };
 
 #else

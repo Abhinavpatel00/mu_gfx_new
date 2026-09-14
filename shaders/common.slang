@@ -15,6 +15,9 @@ RWTexture2D<float4> storage_images[];
 [[vk::binding(3, 0)]]
 ConstantBuffer<GlobalData> global_data;
 
+[[vk::binding(4, 0)]]
+StructuredBuffer<GameEntity> game_entities;
+
 float2 pixel_to_uv(float2 pixel, float2 screen)
 {
     float2 uv = (pixel / screen) * 2.0 - 1.0;
