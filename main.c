@@ -13,6 +13,8 @@ typedef uint32_t TextureID;
 typedef uint32_t SamplerID;
 typedef uint32_t PipelineID;
 
+
+
 typedef struct Texture {
     VkImage       image;
     VkImageView   view;
@@ -359,6 +361,10 @@ typedef struct BarrierBatch {
     VkImageMemoryBarrier2 image_barriers[32];
 
     uint32_t image_count;
+    // Number of barriers silently dropped when the batch was full. Flushed as
+    // an error counter once per flush so API misuse surfaces as a loud,
+    // once-per-frame log instead of a corrupt stack.
+    uint32_t overflow_count;
 } BarrierBatch;
 
 typedef struct CaptureState {
@@ -1332,12 +1338,17 @@ void vk_swapchain_recreate(VkDevice device, VkPhysicalDevice gpu, FlowSwapchain 
         return;
     vkDeviceWaitIdle(device);
 
-    forEach(i, sc->image_count) {
-        if (sc->image_views[i])
-            vkDestroyImageView(device, sc->image_views[i], NULL);
-    }
+    // Release the old swapchain's views AND its bindless texture slots by
+    // reusing vk_swapchain_destroy. It destroys images views, semaphores,
+    // frees id-pool entries and memsets its argument, so operate on a copy and
+    // keep the old VkSwapchainKHR handle alive for oldSwapchain reuse.
+    VkSwapchainKHR   old       = sc->swapchain;
+    FlowSwapchain    old_state = *sc;
+    // Keep the old VkSwapchainKHR alive for oldSwapchain reuse below; only
+    // destroy its views/semaphores/bindless slots here.
+    old_state.swapchain = VK_NULL_HANDLE;
+    vk_swapchain_destroy(device, &old_state, &r->texture_system.id_pool);
 
-    vk_destroy_semaphores(device, sc->image_count, sc->render_finished);
     FlowSwapchainCreateInfo info = {0};
     info.surface                 = sc->surface;
     info.width                   = new_w;
@@ -1347,9 +1358,7 @@ void vk_swapchain_recreate(VkDevice device, VkPhysicalDevice gpu, FlowSwapchain 
     info.preferred_color_space   = sc->color_space;
     info.preferred_present_mode  = sc->present_mode;
     info.extra_usage             = sc->image_usage & ~VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
-    info.old_swapchain           = sc->swapchain;
-
-    VkSwapchainKHR old = sc->swapchain;
+    info.old_swapchain           = old;
 
     vk_create_swapchain(device, gpu, sc, &info, graphics_queue, one_time_pool, r);
 
@@ -2550,6 +2559,10 @@ VkPipeline create_graphics_pipeline(Renderer *renderer, const GraphicsPipelineCo
         fprintf(stderr, "Failed to create graphics pipeline\n");
         abort();
     }
+
+    vkDestroyShaderModule(renderer->devc.device, vs, NULL);
+    vkDestroyShaderModule(renderer->devc.device, fs, NULL);
+
     free(vs_code);
     free(fs_code);
 
@@ -2605,12 +2618,12 @@ void vk_cmd_set_viewport_scissor(VkCommandBuffer cmd, VkExtent2D extent) {
     vkCmdSetScissor(cmd, 0, 1, &sc);
 }
 
-static void spv_to_slang(const char *spv, char *out) {
+static void spv_to_slang(const char *spv, char *out, size_t out_size) {
     const char *name = strrchr(spv, '/');
     name             = name ? name + 1 : spv;
 
     char tmp[256];
-    strcpy(tmp, name);
+    snprintf(tmp, sizeof(tmp), "%s", name);
 
     char *stage = strstr(tmp, ".vert");
     if (!stage)
@@ -2621,7 +2634,7 @@ static void spv_to_slang(const char *spv, char *out) {
     if (stage)
         *stage = '\0';
 
-    sprintf(out, "shaders/%s.slang", tmp);
+    snprintf(out, out_size, "shaders/%s.slang", tmp);
 }
 
 static const char *path_basename(const char *path) {
@@ -2634,7 +2647,7 @@ static bool shader_change_matches_spv(const char *changed, const char *spv) {
         return false;
 
     char slang[256];
-    spv_to_slang(spv, slang);
+    spv_to_slang(spv, slang, sizeof(slang));
 
     const char *changed_name = path_basename(changed);
     const char *spv_name     = path_basename(spv);
@@ -2775,6 +2788,17 @@ static void watch_callback(dmon_watch_id watch_id, dmon_action action, const cha
     }
 }
 
+static MU_INLINE void barrier_batch_push(Renderer *r, const VkImageMemoryBarrier2 *barrier) {
+    if (r->barrierbatch.image_count < (uint32_t)ARRAY_COUNT(r->barrierbatch.image_barriers)) {
+        r->barrierbatch.image_barriers[r->barrierbatch.image_count++] = *barrier;
+    } else {
+        // Dropped: state tracking is still updated by the caller, so if this
+        // ever fires, images may reach a draw in the wrong layout. Call
+        // flush_barriers() more often in the offending pass.
+        r->barrierbatch.overflow_count++;
+    }
+}
+
 void image_transition_swapchain(Renderer *r, VkCommandBuffer cmd, FlowSwapchain *sc, VkImageLayout new_layout,
                                 VkPipelineStageFlags2 dst_stage, VkAccessFlags2 dst_access) {
     uint32_t index = sc->current_image;
@@ -2812,7 +2836,7 @@ void image_transition_swapchain(Renderer *r, VkCommandBuffer cmd, FlowSwapchain 
                                                           .baseArrayLayer = 0,
                                                           .layerCount     = 1}};
 
-    r->barrierbatch.image_barriers[r->barrierbatch.image_count++] = barrier;
+    barrier_batch_push(r, &barrier);
     state->layout                                                 = new_layout;
     state->stage                                                  = dst_stage;
     state->access                                                 = dst_access;
@@ -2862,7 +2886,7 @@ inline void cmd_transition_all_mips(Renderer *r, VkCommandBuffer cmd, VkImage im
 
         .subresourceRange = image_subresource_range(aspect, 0, mipCount)};
 
-    r->barrierbatch.image_barriers[r->barrierbatch.image_count++] = barrier;
+    barrier_batch_push(r, &barrier);
     state->stage                                                  = newStage;
     state->access                                                 = newAccess;
     state->layout                                                 = newLayout;
@@ -2905,7 +2929,7 @@ void cmd_transition_mip(Renderer *r, VkCommandBuffer cmd, VkImage image, ImageSt
 
         .subresourceRange = image_subresource_range(aspect, mip, 1)};
 
-    r->barrierbatch.image_barriers[r->barrierbatch.image_count++] = barrier;
+    barrier_batch_push(r, &barrier);
 
     state->stage        = newStage;
     state->access       = newAccess;
@@ -2925,6 +2949,13 @@ void flush_barriers(Renderer *r, VkCommandBuffer cmd) {
                             .pImageMemoryBarriers    = r->barrierbatch.image_barriers};
 
     vkCmdPipelineBarrier2(cmd, &dep);
+
+    if (r->barrierbatch.overflow_count != 0) {
+        log_error("[barriers] batch overflow: %u image barrier(s) dropped this flush "
+                  "(batch capacity: %u)",
+                  r->barrierbatch.overflow_count, (uint32_t)ARRAY_COUNT(r->barrierbatch.image_barriers));
+        r->barrierbatch.overflow_count = 0;
+    }
 
     r->barrierbatch.image_count = 0;
 }
@@ -3805,59 +3836,6 @@ void renderer_create(Renderer *r, RendererDesc *desc) {
 
     {
 
-        TextureCreateDesc desc = {.width     = AREATEX_WIDTH,
-                                  .height    = AREATEX_HEIGHT,
-                                  .mip_count = 1,
-                                  .format    = VK_FORMAT_R8G8_UNORM,
-                                  .usage     = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT};
-
-        TextureID id  = create_texture(r, &desc);
-        Texture  *tex = &r->texture_system.textures[id];
-
-        VkDeviceSize size = AREATEX_SIZE;
-
-        Buffer staging;
-        create_buffer(r, size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VMA_MEMORY_USAGE_CPU_ONLY, &staging);
-
-        memcpy(staging.mapping, areaTexBytes, size);
-
-        VkCommandBuffer cmd = vk_begin_one_time_cmd(r->devc.device, r->one_time_gfx_pool);
-
-        VkImageMemoryBarrier barrier = {
-            .sType                       = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-            .oldLayout                   = VK_IMAGE_LAYOUT_UNDEFINED,
-            .newLayout                   = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-            .srcAccessMask               = 0,
-            .dstAccessMask               = VK_ACCESS_TRANSFER_WRITE_BIT,
-            .image                       = tex->image,
-            .subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-            .subresourceRange.levelCount = 1,
-            .subresourceRange.layerCount = 1,
-        };
-
-        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0,
-                             NULL, 1, &barrier);
-
-        VkBufferImageCopy region = {.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-                                    .imageSubresource.layerCount = 1,
-                                    .imageExtent                 = {AREATEX_WIDTH, AREATEX_HEIGHT, 1}};
-
-        vkCmdCopyBufferToImage(cmd, staging.buffer, tex->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
-
-        barrier.oldLayout     = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-        barrier.newLayout     = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-        barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-
-        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0,
-                             NULL, 1, &barrier);
-
-        vk_end_one_time_cmd(r->devc.device, r->devc.graphics_queue, r->one_time_gfx_pool, cmd);
-
-        destroy_buffer(r, &staging);
-    }
-    {
-
         TextureID smaa_area;
         TextureID smaa_search;
 
@@ -4391,7 +4369,13 @@ static void profiler_format_count(char *buffer, size_t buffer_size, uint64_t val
     }
 }
 
-static MU_INLINE void frame_start(Renderer *r) {
+// Returns false when no frame should be recorded this iteration:
+//   - window minimized (fb 0x0)
+//   - swapchain (re)creation pending
+//   - vkAcquireNextImageKHR returned OUT_OF_DATE / SUBOPTIMAL
+// In those cases the acquire semaphore is NOT signaled and current_image is
+// stale, so the caller must skip recording + submitting entirely.
+static MU_INLINE bool frame_start(Renderer *r) {
     TracyCZoneNC(ctx, "frame_start", 0x00FF00, 1);
     uint64_t frame_now = mu_time_now();
     r->cpu_frame_ns    = (double)(frame_now - r->cpu_prev_frame);
@@ -4405,10 +4389,12 @@ static MU_INLINE void frame_start(Renderer *r) {
         uint64_t wait_start = mu_time_now();
         glfwWaitEvents();
         r->cpu_wait_accum_ns += (double)(mu_time_now() - wait_start);
-        return;
+        return false;
     }
     r->swapchain.needs_recreate |= fb_w != (int)r->swapchain.extent.width || fb_h != (int)r->swapchain.extent.height;
 
+    // Recreate first, acquire after: if the swapchain is (re)created, the old
+    // acquired image would be invalid. Skip the frame and acquire fresh next time.
     if (r->swapchain.needs_recreate) {
         vkDeviceWaitIdle(r->devc.device);
 
@@ -4428,6 +4414,8 @@ static MU_INLINE void frame_start(Renderer *r) {
         }
 
         r->swapchain.needs_recreate = false;
+        TracyCZoneEnd(ctx);
+        return false;
     }
 
     FrameContext *f = &r->frames[r->current_frame];
@@ -4451,9 +4439,15 @@ static MU_INLINE void frame_start(Renderer *r) {
 
     vkResetCommandPool(r->devc.device, f->cmdbufpool, 0);
 
-    vk_swapchain_acquire(r->devc.device, &r->swapchain, r->frames[r->current_frame].image_available_semaphore,
-                         VK_NULL_HANDLE, UINT64_MAX);
+    // On OUT_OF_DATE/SUBOPTIMAL the semaphore is not signaled and current_image
+    // is not updated: bail out before any recording/submission happens.
+    if (!vk_swapchain_acquire(r->devc.device, &r->swapchain, r->frames[r->current_frame].image_available_semaphore,
+                              VK_NULL_HANDLE, UINT64_MAX)) {
+        TracyCZoneEnd(ctx);
+        return false;
+    }
     TracyCZoneEnd(ctx);
+    return true;
 }
 
 static void update_global_data(Renderer *r) {
@@ -5135,6 +5129,8 @@ static void render_capture_ui(Renderer *r) {
 }
 int main() {
 
+
+
     graphics_init();
     dmon_init();
 
@@ -5175,7 +5171,8 @@ int main() {
             rec_held = false;
 
         pipeline_rebuild(g_renderer);
-        frame_start(g_renderer);
+        if (!frame_start(g_renderer))
+            continue; // swapchain out-of-date / minimized: nothing to record
         update_global_data(g_renderer);
 
         imgui_begin_frame();
