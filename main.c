@@ -612,9 +612,6 @@ VKAPI_ATTR VkBool32 VKAPI_CALL debug_callback(VkDebugUtilsMessageSeverityFlagBit
         debug_break();
     }
 
-    // {
-    //     raise(SIGTRAP);
-    // }
     return VK_FALSE;
 }
 

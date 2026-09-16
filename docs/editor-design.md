@@ -8,6 +8,9 @@ Non-goals for v1: undo/redo trees, multiple cursors, IME/CJK shaping, ligatures,
 find/replace UI beyond a bare minimum. The architecture must not *block* them later, but none of
 them justify complexity now.
 
+Section 16 is the decision log: every major choice with its justification, the alternatives
+rejected, and the concrete signal that should make us revisit it.
+
 ---
 
 ## 1. Ground rules (from AGENTS.md, applied to this project)
@@ -387,3 +390,205 @@ root push carries a simple 2D transform), meshoptimizer/VMA (no new buffers beyo
   first in the instance stream with `color_index = background`).
 - **UTF-8 width in status line/column display**: byte columns vs display columns diverge; v1 shows
   display columns derived during layout (already computed), not stored.
+
+---
+
+## 16. Decision log
+
+The comparison tables in §3 and §8 hold the detailed alternatives; this log records what we
+chose, why, and what would change our mind. Decisions were optimized for **cheap reversal**
+(seams, not predictions) — most entries end with a low reversal cost, which is deliberate.
+
+### D1 — Document storage: gap buffer + incremental line index
+
+**Why:** editors are cursor-centric — the overwhelming majority of edits land at or one step from
+the cursor, which is exactly the operation a gap buffer makes free. At v1 file sizes (≤ 10 MB,
+fits L3) the worst case, moving the gap, is a ~100 µs memcpy; a rope spends more total bandwidth
+on navigation/rebalancing for the same edits, and the piece tree's O(log n) advantage only exists
+at 100+ MB — where we gate to read-only anyway. Doctrine weights locality and predictability over
+asymptotics that don't manifest at our scale.
+
+**Rejected:** piece table (undo-friendly but every read is a pointer chase), rope (tree bugs,
+high memory), piece tree (the "best" but furthest from minimal). Full table in §3.
+
+**Revisit when:** multiple distant cursors or read-write 100+ MB files become real requirements.
+**Reversal cost:** low — the storage seam (§3.1) hides the representation behind byte-offset
+insert/delete/read.
+
+### D2 — Byte offsets are the only canonical positions
+
+**Why:** storing line/column as primary state makes every edit rewrite cursor, selection, marks,
+and view anchors consistently — three sources of truth instead of one, and the classic source of
+cursor-drift bugs. A byte offset is also the one representation every candidate storage (gap,
+piece table, rope) serves directly, so it carries no storage-specific assumptions. Line/column
+cost O(log n) to derive from the line index and are free in hot paths.
+
+**Rejected:** (line, column) tuples as state — consistency maintenance dominates their ergonomics.
+**Revisit when:** never.
+**Reversal cost:** high — but there is no scenario that favors it.
+
+### D3 — Line index: flat prefix-offset array
+
+**Why:** the only query is "first byte of line i" — a rank query, for which a flat offset array
+is the floor: one load, zero branches, ~4 bytes/line. Trees or hashes add indirection and cache
+misses to save memory we are not short of. `mu_multi_index` (key→many) was the considered mu
+primitive and is the wrong shape: line lookup is by ordinal, not by key.
+
+**Rejected:** B-tree/uffix structures, hash indices — wrong access pattern.
+**Revisit when:** documents with millions of lines (then a two-level chunked array keeps the same
+property with better splice behavior).
+**Reversal cost:** low — internal to `LineIndex`.
+
+### D4 — Index updates: splice-or-rebuild threshold (measured, not guessed)
+
+**Why:** incremental splicing is O(affected lines) with bookkeeping overhead; a full rebuild is
+O(document) with a tiny memchr-class constant. Above a few thousand affected lines the rebuild
+wins outright and is simpler code. The threshold is picked by measurement in M4, because the
+crossover depends on constants we can't predict honestly on paper.
+
+**Rejected:** always-splice (pathological for pastes), always-rebuild (wastes the incremental
+case that gave the gap buffer its point).
+**Revisit when:** profiling shows either path mispriced by > 2× vs the estimate.
+**Reversal cost:** trivial — one constant.
+
+### D5 — Cursor & scroll: exact target + exponential visual relaxation
+
+**Why:** one mechanism serves both (§5, §6). Against the alternatives:
+
+- *Instant movement* — violates requirement #1 (smoothness); also makes 144 Hz feel identical
+  to 30 Hz because there is no motion to see.
+- *Fixed-duration tweens* — velocity discontinuity every time a new input restarts the tween,
+  plus per-animation state to track.
+- *Springs* — overshoot reads as sloppiness in text and adds velocity state to keep stable.
+
+Exponential relaxation is stateless (two floats per channel), frame-rate independent by
+construction (`k = 1 − e^(−λ·dt)`), has a constant settle time (~3/λ), and behaves correctly when
+the target changes mid-flight — which is the *normal* case while typing, not the exception.
+
+**Revisit when:** the "feel" is wrong — a critically-damped spring is a 5-line change behind the
+same helper.
+**Reversal cost:** trivial.
+
+### D6 — Scroll accumulates in pixels, not lines
+
+**Why:** the viewport is float pixels; lines are derived. Pixel accumulation makes smoothing, DPI
+changes, and non-integer line heights identical code paths; line accumulation needs a second
+rounding rule per DPI and produces visible stepping when `line_height` is fractional (it is, at
+common font sizes).
+
+**Revisit when:** never.
+**Reversal cost:** low — input mapping only.
+
+### D7 — Layout cache keyed by (line, generation), 8-line margin
+
+**Why (honest accounting):** laying out 60 visible lines *without* lexing is cheap (~µs). What
+the cache actually skips is relexing and glyph generation, and it is what enforces the hard
+requirement "scrolling never reparses." Generation-keyed invalidation means correctness needs no
+manual dirty lists — edits bump one counter; the margin exists so slow scroll frames don't thrash
+the ring.
+
+**Rejected:** no cache (violates the incremental requirement), per-line hash entries (the ring
+gives the same hit rate with less machinery).
+**Revisit when:** measured per-frame layout beats cache maintenance — then delete the cache; the
+instance format doesn't care.
+**Reversal cost:** low — cache sits behind one function.
+
+### D8 — Bitmap atlas first; SDF/MSDF/Slug behind two seams
+
+**Why:** the comparison (§8) shows bitmap winning every axis that matters at code sizes: one-time
+bake, trivial shader, smallest VRAM, perfect quality at the sizes editors actually run. MSDF and
+Slug buy zoom-independence we don't have yet and cost a real toolchain/stencil/shader-port
+budget. The seams — `GlyphInstance` format and `text_atlas_*` — are chosen so the swap touches no
+editor code. Slug's shaders are already vendored as the reference implementation.
+
+**Rejected:** MSDF (no single-header C generator; C++ toolchain against doctrine), Slug now
+(largest work item in this doc, pays off only with zoom/DPI problems we don't have).
+**Revisit when:** multi-DPI quality complaints or a zoom feature are scheduled.
+**Reversal cost:** medium — one shader + bake code; instances unchanged.
+
+### D9 — Instances bump-allocated per frame from `r->cpu_pool`
+
+**Why:** the pool exists, is reset in `frame_start`, and needs no lifetime tracking; worst case
+~320 KB/frame of upload is noise at any refresh rate. A persistent device-local ring saves well
+under 0.5 MB/s of bandwidth and reintroduces exactly the in-flight-slot bookkeeping class we just
+spent phase 2 eliminating.
+
+**Rejected:** persistent instance buffer with per-frame rings — bandwidth saved is immeasurable,
+sync complexity is not.
+**Revisit when:** profiling at 144 Hz shows the upload; the change is local to the layout writer.
+**Reversal cost:** low.
+
+### D10 — One draw call; quads from `SV_VertexID`
+
+**Why:** N instances → 6N vertices with corner math in the vertex shader: zero vertex buffers,
+zero attribute fetches, and the packed 16-byte instance is read exactly once per glyph. Hardware
+instancing would add an input binding to save ALU the shader is nowhere near bound by. One draw
+also means one root push, one scissor, one profiler span — preparation/execution separation per
+doctrine.
+
+**Rejected:** per-glyph binds (absurd), instanced draws (equivalent outcome, more binding state).
+**Revisit when:** never for v1; instanced/indexed variants are trivial if a need appears.
+**Reversal cost:** low.
+
+### D11 — Highlighting computed during layout; tokens never stored
+
+**Why:** storing tokens buys future features (folding, match-brace) at the cost of a mutable
+per-line token container plus invalidation — a second data structure to keep consistent with
+edits, with roughly the bug surface of the line index itself. Recomputing during glyph generation
+makes invalidation free (nothing is stored) and the bandwidth story clean: one pass over visible
+text, once per change.
+
+**Rejected:** VS Code-style stored token arrays — features we didn't schedule, cost we'd pay now.
+**Revisit when:** a stored-token consumer is actually scheduled.
+**Reversal cost:** medium — the lexer moves, the palette mapping doesn't.
+
+### D12 — Palette as a 16×1 texture
+
+**Why:** a root array would also fit, but the texture makes theme switching a descriptor write
+(no root/shader change), grows past 16 colors without format churn, and costs one bindless fetch
+in a fragment shader already doing one.
+
+**Revisit when:** never; the cost is one fetch.
+**Reversal cost:** trivial.
+
+### D13 — UTF-8 byte offsets without a unicode library
+
+**Why:** editing primitives need exactly two unicode facts: next/prev code-point boundaries
+(UTF-8's self-synchronizing prefixes — a 16-byte LUT) and eventually display width (only when
+IME/CJK lands). Vendoring utf8proc-class libraries now would pay for features we don't have. The
+byte-offset model also tolerates malformed bytes by construction — editors must not crash on
+them.
+
+**Rejected:** utf8proc/ICU now — dead weight until width tables are mandatory.
+**Revisit when:** IME/CJK support, where East Asian Width tables become required.
+**Reversal cost:** low — the LUT call sites are few and localized.
+
+### D14 — Input events queued with timestamps
+
+**Why:** timestamps make the latency budget (§12) measurable end-to-end instead of anecdotal —
+P50/P99 event→submit falls out of the same data for free. Fixed capacity + dropped-counter assert
+turns back-pressure into a loud bug instead of a silent design state.
+
+**Revisit when:** never.
+**Reversal cost:** trivial.
+
+### D15 — Reuse the renderer wholesale; no second Vulkan layer, no ImGui
+
+**Why:** `begin_pass`, pools, bindless, timeline, and `GpuProfiler` are the editor's entire
+graphics stack; a second abstraction would duplicate the sync/lifetime logic we just debugged,
+and ImGui would render text through a path we'd have to replace anyway — the editor UI (status
+line, scrollbar) is text + quads, which is what this project *is*.
+
+**Revisit when:** never.
+**Reversal cost:** —
+
+### D16 — Correctness by fuzz before pixels (M1)
+
+**Why:** the document layer is pure CPU logic with cheap invariants (line index ≡ buffer scan,
+positions always on UTF-8 boundaries); a `mu_pcg`-driven random edit/verify loop finds storage
+and index bugs in seconds, before any rendering can confuse the diagnosis. GPU-side milestones
+(M2+) then build on a foundation that is already known-good — the cheapest possible place to
+find a data-structure bug is before a shader is involved.
+
+**Rejected:** test-after-rendering — every bug report becomes "which of the 7 systems?".
+**Revisit when:** never.

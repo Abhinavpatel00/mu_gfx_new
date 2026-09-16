@@ -1,0 +1,4 @@
+ - may be replace imgui with nuklear and replace glfw with rgfw
+ - replace vulkan enums with our enums when it makes sense for readability mostly because i dont plan to support other apis anytime soon
+ - integrate with box3d and box2d
+ - in app video recorder so we get perfect frames recorded so they dont depend on screen recorder which rather records screen instead of image buffer which are true pixel values so we loose quality but the thing is we loose quality anyway because of video compression but atleast we have stable frame rate to post expensive shaders recorded at sixty fps 
