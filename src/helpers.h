@@ -86,6 +86,16 @@ FORCE_INLINE void vk_create_semaphores(VkDevice device, uint32_t count, VkSemaph
         vk_create_semaphore(device, &out_semaphores[i]);
 }
 
+FORCE_INLINE void vk_create_timeline_semaphore(VkDevice device, VkSemaphore* out_semaphore)
+{
+    VkSemaphoreTypeCreateInfo type = {.sType       = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
+                                      .semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE,
+                                      .initialValue  = 0};
+    VkSemaphoreCreateInfo  info = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, .pNext = &type};
+
+    VK_CHECK(vkCreateSemaphore(device, &info, NULL, out_semaphore));
+}
+
 
 FORCE_INLINE void vk_destroy_semaphores(VkDevice device, uint32_t count, VkSemaphore* semaphores)
 {
@@ -439,6 +449,11 @@ typedef struct
     bool enabled;
     bool enable_pipeline_stats;
 
+    // Timeline value of the submission carrying this frame's queries.
+    // 0 = nothing pending; collect() consumes results only once the timeline
+    // covers this value, instead of relying on frame-slot arithmetic.
+    uint64_t submit_value;
+
     GpuPass passes[GPU_PROF_MAX_SCOPES];
 
 } GpuProfiler;
@@ -555,9 +570,11 @@ FORCE_INLINE void gpu_profiler_end_pass(GpuProfiler* p, VkCommandBuffer cmd, VkP
     p->pass_count++;
 }
 
-FORCE_INLINE void gpu_profiler_collect(GpuProfiler* p, VkDevice device)
+FORCE_INLINE void gpu_profiler_collect(GpuProfiler* p, VkDevice device, uint64_t completed_value)
 {
     if (!p || !p->enabled || p->timestamp_pool == VK_NULL_HANDLE || p->query_count == 0) return;
+    if (p->submit_value == 0 || completed_value < p->submit_value) return; // results not on disk yet
+    p->submit_value = 0;
 
     uint64_t timestamps[MAX_GPU_PASSES * 2];
 

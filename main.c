@@ -202,9 +202,37 @@ typedef struct {
     VkCommandBuffer cmdbuf;
     VkCommandPool   cmdbufpool;
     VkSemaphore     image_available_semaphore;
-    VkFence         in_flight_fence;
+    VkFence         in_flight_fence; // legacy; frame reuse waits on the device timeline instead
+    uint64_t        timeline_value;  // timeline value signalled by this slot's last submission
     uint32_t        staging_tail;
 } FrameContext;
+
+// ---- Deferred destruction keyed on the submission timeline ----
+//
+// Resources destroyed while the GPU may still use them are retired with the
+// timeline value of the submission that last referenced them. tick() runs the
+// callbacks whose retire value is covered; drain() runs everything at shutdown.
+typedef struct Renderer Renderer;
+
+typedef void (*DeferredDestroyFn)(Renderer *r, void *user);
+
+// Defined with the delete queue, after the full Renderer type.
+void delete_queue_defer(Renderer *r, uint64_t retire_value, DeferredDestroyFn fn, void *user);
+
+typedef struct DeleteQueueEntry {
+    uint64_t          retire_value;
+    DeferredDestroyFn fn;
+    void             *user;
+} DeleteQueueEntry;
+
+#define DELETE_QUEUE_CAPACITY 256
+
+typedef struct DeleteQueue {
+    DeleteQueueEntry entries[DELETE_QUEUE_CAPACITY];
+    uint32_t         head;
+    uint32_t         tail;
+    uint32_t         count;
+} DeleteQueue;
 
 typedef struct Bindless {
     VkDescriptorSetLayout set_layout;
@@ -215,12 +243,15 @@ typedef struct Bindless {
 
 } Bindless;
 
+// Zero-value defaults: layers 0 -> 1, aspect 0 = inferred from format, mip_count
+// 0 = auto-computed from extent (1 = no mips). width/height/format/usage must be
+// set; call sites name only deltas.
 typedef struct RenderTargetSpec {
     uint32_t           width;
     uint32_t           height;
-    uint32_t           layers;
+    uint32_t           layers;    // 0 = single layer
     VkFormat           format;
-    VkImageUsageFlags  usage;
+    VkImageUsageFlags  usage;     // required, asserted non-zero
     VkImageAspectFlags aspect;    // 0 = infer from format
     uint32_t           mip_count; // 0 = auto-compute, 1 = no mips
     const char        *debug_name;
@@ -314,8 +345,8 @@ typedef struct ColorAttachmentBlend {
 typedef struct GraphicsPipelineConfig {
     // Rasterization
     //
-    const char     *vert_path;
-    const char     *frag_path;
+    const char     *vert_path; // NULL = invalid, must be set
+    const char     *frag_path; // NULL = invalid, must be set
     VkCullModeFlags cull_mode;
     VkFrontFace     front_face;
     VkPolygonMode   polygon_mode;
@@ -326,11 +357,12 @@ typedef struct GraphicsPipelineConfig {
     bool        depth_write_enable;
     VkCompareOp depth_compare_op;
 
-    uint32_t        color_attachment_count;
-    const VkFormat *color_formats;
-    VkFormat        depth_format;
+    uint32_t        color_attachment_count; // 0 = no color attachments
+    const VkFormat *color_formats;         // NULL when color_attachment_count == 0
+    VkFormat        depth_format;           // 0 (VK_FORMAT_UNDEFINED) = no depth attachment
 
-    // Per-attachment blend state
+    // Per-attachment blend state. Unset entries (zeroed write mask) default to
+    // no blending; opt in with blend_alpha() in the initializer.
     ColorAttachmentBlend blends[MAX_COLOR_ATTACHMENTS];
 
 } GraphicsPipelineConfig;
@@ -358,7 +390,7 @@ typedef struct RendererPipelines {
 } RendererPipelines;
 
 typedef struct BarrierBatch {
-    VkImageMemoryBarrier2 image_barriers[32];
+    VkImageMemoryBarrier2 image_barriers[64];
 
     uint32_t image_count;
     // Number of barriers silently dropped when the batch was full. Flushed as
@@ -367,12 +399,42 @@ typedef struct BarrierBatch {
     uint32_t overflow_count;
 } BarrierBatch;
 
+// ---- Pass API ----
+//
+// One call declares a pass: the backend resolves targets, derives transitions
+// from the ImageState tracker, flushes barriers, fills the Vulkan rendering
+// structs, sets viewport/scissor, and binds the PSO. Call sites name intent,
+// never layouts or stage masks.
+//
+// Zero-value defaults for PassAttachment: load = VK_ATTACHMENT_LOAD_OP_LOAD,
+// store = VK_ATTACHMENT_STORE_OP_STORE, clear = {0,0,0,0}. Name only deltas.
+// Set `swapchain_view` instead of `target` to render into a swapchain image;
+// the backend tracks swapchain state, so those attachments skip rt transitions.
+typedef struct PassAttachment {
+    RenderTarget       *target;
+    VkImageView         swapchain_view; // used when target == NULL
+    VkAttachmentLoadOp  load;  // VK_ATTACHMENT_LOAD_OP_CLEAR for clears, LOAD to keep contents
+    VkAttachmentStoreOp store;
+    float               clear[4]; // color rgba; depth clear value in clear[0]
+} PassAttachment;
+
+typedef struct PassDesc {
+    const PassAttachment *colors;            // NULL when compute-only
+    uint32_t              color_count;       // 0..MAX_COLOR_ATTACHMENTS
+    const PassAttachment *depth;             // NULL = no depth attachment
+    RenderTarget *const  *shader_reads;      // sampled reads (sampled-read layout)
+    uint32_t              shader_read_count;
+    RenderTarget *const  *shader_writes;     // storage image writes (GENERAL layout)
+    uint32_t              shader_write_count;
+    PipelineID            pipeline;          // 1-based; 0 = caller binds later (e.g. ImGui)
+} PassDesc;
+
 typedef struct CaptureState {
-    Buffer readback[CAPTURE_SLOTS];
-    bool   in_flight[CAPTURE_SLOTS];  // GPU copy recorded, not yet consumed
-    bool   shot_slot[CAPTURE_SLOTS];  // save a PNG when consumed
-    bool   video_slot[CAPTURE_SLOTS]; // feed ffmpeg when consumed
-    char   shot_path[CAPTURE_SLOTS][512];
+    Buffer   readback[CAPTURE_SLOTS];
+    uint64_t submit_value[CAPTURE_SLOTS]; // timeline value of the submission carrying the copy; 0 = idle
+    bool     shot_slot[CAPTURE_SLOTS];    // save a PNG when consumed
+    bool     video_slot[CAPTURE_SLOTS];   // feed ffmpeg when consumed
+    char     shot_path[CAPTURE_SLOTS][512];
 
     uint32_t     width;
     uint32_t     height;
@@ -393,7 +455,7 @@ typedef struct CaptureState {
 
     bool inited;
 } CaptureState;
-typedef struct {
+struct Renderer {
     // ---- CPU profiling ----
     double   cpu_frame_ns;      // total frame time (e.g., from glfwGetTime)
     double   cpu_active_ns;     // time spent in engine work
@@ -472,6 +534,12 @@ typedef struct {
 
     BarrierBatch barrierbatch;
 
+    // Submission timeline: monotonically increasing, signalled once per submit.
+    // Frame-slot reuse, deferred destruction, and recreate waits all key on it.
+    VkSemaphore timeline;
+    uint64_t    timeline_last_submitted;
+    DeleteQueue delete_queue;
+
     struct {
         uint32_t fullscreen;
         uint32_t postprocess;
@@ -485,7 +553,7 @@ typedef struct {
         uint32_t skinning;
     } EnginePipelines;
 
-} Renderer;
+};
 // renderer would be heap allocated   since we dont want to crash staack
 bool is_instance_extension_supported(const char *extension_name) {
     uint32_t extensionCount = 0;
@@ -1331,11 +1399,15 @@ void vk_swapchain_destroy(VkDevice device, FlowSwapchain *swapchain, mu_id_pool 
 }
 
 void vk_swapchain_recreate(VkDevice device, VkPhysicalDevice gpu, FlowSwapchain *sc, uint32_t new_w, uint32_t new_h,
-                           VkQueue graphics_queue, VkCommandPool one_time_pool, Renderer *r)
-
-{
+                           VkQueue graphics_queue, VkCommandPool one_time_pool, Renderer *r){
     if (new_w == 0 || new_h == 0)
         return;
+
+    // Device-wide wait is required here, not just a timeline wait: the old
+    // swapchain's render_finished semaphores are consumed by the PRESENT queue,
+    // which the submission timeline does not track. Only a device idle covers
+    // every submitted batch that references them. rt_resize below also needs
+    // quiescence (it recreates targets and rewrites bindless descriptors).
     vkDeviceWaitIdle(device);
 
     // Release the old swapchain's views AND its bindless texture slots by
@@ -1347,7 +1419,7 @@ void vk_swapchain_recreate(VkDevice device, VkPhysicalDevice gpu, FlowSwapchain 
     // Keep the old VkSwapchainKHR alive for oldSwapchain reuse below; only
     // destroy its views/semaphores/bindless slots here.
     old_state.swapchain = VK_NULL_HANDLE;
-    vk_swapchain_destroy(device, &old_state, &r->texture_system.id_pool);
+    vk_swapchain_destroy(device, &old_state, r ? &r->texture_system.id_pool : NULL);
 
     FlowSwapchainCreateInfo info = {0};
     info.surface                 = sc->surface;
@@ -1910,41 +1982,59 @@ void buffer_pool_free(BufferSlice slice) {
     }
 }
 
-bool renderer_upload_buffer_to_slice(Renderer *r, VkCommandBuffer cmd, BufferSlice dst_slice, const void *src_data,
-                                     VkDeviceSize size_bytes, VkDeviceSize staging_alignment) {
-    if (!r || !cmd || !src_data || !dst_slice.buffer || size_bytes == 0)
+// ---- Byte-span views ----
+//
+// Non-owning pointer+size passed by value; the pair ships in registers. The
+// macro form is a compound literal, so the referenced value only needs to live
+// through the call. (Promote to external/mu when a second span type is needed.)
+typedef struct ByteSpan {
+    const void *data;
+    uint32_t    size;
+} ByteSpan;
+
+#define BYTE_SPAN(value)                                                                                               \
+    (ByteSpan) {.data = &(value), .size = (uint32_t)sizeof(value)}
+
+// Staging-slot alignment is backend policy (256 covers noncoherent atom size and
+// keeps ring slots cache-line friendly); callers never pass it.
+#define STAGING_ALIGNMENT_DEFAULT 256
+
+bool renderer_upload_buffer_to_slice(Renderer *r, VkCommandBuffer cmd, BufferSlice dst_slice, ByteSpan data) {
+    if (!r || !cmd || !data.data || !dst_slice.buffer || data.size == 0)
         return false;
 
-    if (size_bytes > dst_slice.size)
+    if (data.size > dst_slice.size)
         return false;
 
-    BufferSlice staging_slice = buffer_pool_alloc(&r->staging_pool, size_bytes, staging_alignment);
+    BufferSlice staging_slice = buffer_pool_alloc(&r->staging_pool, data.size, STAGING_ALIGNMENT_DEFAULT);
     if (!staging_slice.buffer || !staging_slice.mapped)
         return false;
 
-    memcpy(staging_slice.mapped, src_data, (size_t)size_bytes);
+    memcpy(staging_slice.mapped, data.data, (size_t)data.size);
 
     VkBufferCopy copy = {
         .srcOffset = staging_slice.offset,
         .dstOffset = dst_slice.offset,
-        .size      = size_bytes,
+        .size      = data.size,
     };
     vkCmdCopyBuffer(cmd, staging_slice.buffer, dst_slice.buffer, 1, &copy);
 
     return true;
 }
 
-BufferSlice renderer_upload_buffer(Renderer *r, VkCommandBuffer cmd, const void *src_data, VkDeviceSize size_bytes,
-                                   VkDeviceSize staging_alignment, VkDeviceSize dst_alignment) {
+// One-call upload: allocates from the gpu pool at dst_alignment, stages, records
+// the copy. dst_alignment is the only knob left to the caller (vertex/SSBO data
+// often wants specific alignment for device-address fetch).
+BufferSlice renderer_upload_buffer(Renderer *r, VkCommandBuffer cmd, ByteSpan data, VkDeviceSize dst_alignment) {
     BufferSlice dst_slice = {0};
-    if (!r || !cmd || !src_data || size_bytes == 0)
+    if (!r || !cmd || !data.data || data.size == 0)
         return dst_slice;
 
-    dst_slice = buffer_pool_alloc(&r->gpu_pool, size_bytes, dst_alignment);
+    dst_slice = buffer_pool_alloc(&r->gpu_pool, data.size, dst_alignment);
     if (!dst_slice.buffer)
         return dst_slice;
 
-    if (!renderer_upload_buffer_to_slice(r, cmd, dst_slice, src_data, size_bytes, staging_alignment)) {
+    if (!renderer_upload_buffer_to_slice(r, cmd, dst_slice, data)) {
         buffer_pool_free(dst_slice);
         memset(&dst_slice, 0, sizeof(dst_slice));
     }
@@ -2027,10 +2117,17 @@ static void rt_destroy_internal(Renderer *r, RenderTarget *rt, bool release_id);
 
 static bool rt_create_internal(Renderer *r, RenderTarget *rt, const RenderTargetSpec *spec, uint32_t bindless_index) {
 
-    if (!r || !rt || !spec || spec->width == 0 || spec->height == 0)
+    if (!r || !rt || !spec || spec->width == 0 || spec->height == 0 || spec->usage == 0)
         return false;
 
     memset(rt, 0, sizeof(*rt));
+
+    rt->format = spec->format;
+    rt->width  = spec->width;
+    rt->height = spec->height;
+    rt->usage  = spec->usage;
+    rt->aspect = spec->aspect ? spec->aspect : get_image_aspect(spec->format);
+    rt->layers = spec->layers ? spec->layers : 1;
 
     rt->format = spec->format;
     rt->width  = spec->width;
@@ -2194,6 +2291,9 @@ static void rt_update_bindless_descriptors(Renderer *r, const RenderTarget *rt) 
 static void rt_destroy_internal(Renderer *r, RenderTarget *rt, bool release_id) {
     if (!r || !rt || !rt->image)
         return;
+    // Intentional stall: rt_destroy is the immediate-destruction policy. Callers
+    // on hot paths must ensure no in-flight submission uses the target (or defer
+    // via the delete queue); the stall here only covers the misuse case.
     vkDeviceWaitIdle(r->devc.device);
     uint32_t id = rt->bindless_index;
 
@@ -2272,13 +2372,55 @@ bool rt_resize(Renderer *r, RenderTarget *rt, uint32_t width, uint32_t height)
     rt_destroy_internal(r, rt, false);
     return rt_create_internal(r, rt, &spec, bindless_index);
 }
-bool sampler_create(Renderer *r, const VkSamplerCreateInfo *ci, uint32_t *out_sampler_id) {
-    if (!r || !ci || !out_sampler_id)
+// Zero-value defaults: linear min/mag/mip filtering, repeat addressing, lod clamp
+// [0, VK_LOD_CLAMP_NONE]. Name only deltas. Backend-only Vk fields (border color,
+// unnormalized coordinates, etc.) still go through the raw path.
+typedef struct SamplerDesc {
+    VkFilter   min_filter;
+    VkFilter   mag_filter;
+    bool       nearest_mips;
+    VkSamplerAddressMode address_u;
+    VkSamplerAddressMode address_v;
+    VkSamplerAddressMode address_w;
+    bool       anisotropic; // 16x; only meaningful with linear filtering
+    bool       compare_enabled;
+    VkCompareOp compare;
+    VkSamplerAddressMode clamp_mode_override; // 0 = none; shadow presets use clamp-to-border
+    VkBorderColor border_color;
+} SamplerDesc;
+
+static inline VkSamplerCreateInfo sampler_info_from_desc(const SamplerDesc *d) {
+    VkSamplerCreateInfo ci = {
+        .sType        = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+        .magFilter    = d->mag_filter ? d->mag_filter : VK_FILTER_LINEAR,
+        .minFilter    = d->min_filter ? d->min_filter : VK_FILTER_LINEAR,
+        .mipmapMode   = d->nearest_mips ? VK_SAMPLER_MIPMAP_MODE_NEAREST : VK_SAMPLER_MIPMAP_MODE_LINEAR,
+        .addressModeU = d->clamp_mode_override ? d->clamp_mode_override
+                                               : (d->address_u ? d->address_u : VK_SAMPLER_ADDRESS_MODE_REPEAT),
+        .addressModeV = d->clamp_mode_override ? d->clamp_mode_override
+                                               : (d->address_v ? d->address_v : VK_SAMPLER_ADDRESS_MODE_REPEAT),
+        .addressModeW = d->clamp_mode_override ? d->clamp_mode_override
+                                               : (d->address_w ? d->address_w : VK_SAMPLER_ADDRESS_MODE_REPEAT),
+        .anisotropyEnable = d->anisotropic ? VK_TRUE : VK_FALSE,
+        .maxAnisotropy    = d->anisotropic ? 16.0f : 1.0f,
+        .compareEnable    = d->compare_enabled ? VK_TRUE : VK_FALSE,
+        .compareOp        = d->compare_enabled ? (d->compare ? d->compare : VK_COMPARE_OP_LESS_OR_EQUAL)
+                                               : VK_COMPARE_OP_NEVER,
+        .minLod           = 0.0f,
+        .maxLod           = VK_LOD_CLAMP_NONE,
+        .borderColor      = d->border_color ? d->border_color : VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE,
+    };
+    return ci;
+}
+
+bool sampler_create(Renderer *r, const SamplerDesc *desc, uint32_t *out_sampler_id) {
+    if (!r || !desc || !out_sampler_id)
         return false;
 
     VkSampler sampler = VK_NULL_HANDLE;
 
-    VkResult res = vkCreateSampler(r->devc.device, ci, NULL, &sampler);
+    VkSamplerCreateInfo ci = sampler_info_from_desc(desc);
+    VkResult       res = vkCreateSampler(r->devc.device, &ci, NULL, &sampler);
     if (res != VK_SUCCESS)
         return false;
 
@@ -2308,77 +2450,33 @@ bool sampler_create(Renderer *r, const VkSamplerCreateInfo *ci, uint32_t *out_sa
     return true;
 }
 
-static ColorAttachmentBlend blend_alpha(void) {
+static inline ColorAttachmentBlend blend_disabled(void) {
     return (ColorAttachmentBlend){
-        .blend_enable = true,
-
-        .src_color = VK_BLEND_FACTOR_SRC_ALPHA,
-        .dst_color = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
-        .color_op  = VK_BLEND_OP_ADD,
-
-        .src_alpha = VK_BLEND_FACTOR_ONE,
-        .dst_alpha = VK_BLEND_FACTOR_ZERO,
-        .alpha_op  = VK_BLEND_OP_ADD,
-
-        .write_mask =
-            VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT,
-    };
-}
-
-static ColorAttachmentBlend blend_additive(void) {
-    return (ColorAttachmentBlend){
-        .blend_enable = true,
-
-        .src_color = VK_BLEND_FACTOR_ONE,
-        .dst_color = VK_BLEND_FACTOR_ONE,
-        .color_op  = VK_BLEND_OP_ADD,
-
-        .src_alpha = VK_BLEND_FACTOR_ONE,
-        .dst_alpha = VK_BLEND_FACTOR_ONE,
-        .alpha_op  = VK_BLEND_OP_ADD,
-
-        .write_mask =
-            VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT,
-    };
-}
-
-static ColorAttachmentBlend blend_disabled(void) {
-    return (ColorAttachmentBlend){
-        .blend_enable = false,
-
         .src_color = VK_BLEND_FACTOR_ONE,
         .dst_color = VK_BLEND_FACTOR_ZERO,
         .color_op  = VK_BLEND_OP_ADD,
-
         .src_alpha = VK_BLEND_FACTOR_ONE,
         .dst_alpha = VK_BLEND_FACTOR_ZERO,
         .alpha_op  = VK_BLEND_OP_ADD,
-
         .write_mask =
             VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT,
     };
 }
+
+// The zero-value config is the default state: unblended, no cull, counter-
+// clockwise-wound triangles, triangle list, depth-tested. Call sites name only what differs.
 static inline GraphicsPipelineConfig pipeline_config_default(void) {
-    GraphicsPipelineConfig cfg = {0};
-
-    cfg.cull_mode    = VK_CULL_MODE_NONE;
-    cfg.front_face   = VK_FRONT_FACE_COUNTER_CLOCKWISE;
-    cfg.polygon_mode = VK_POLYGON_MODE_FILL;
-
-    cfg.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-
-    cfg.depth_test_enable  = true;
-    cfg.depth_write_enable = true;
-    cfg.depth_compare_op   = VK_COMPARE_OP_GREATER;
-
-    cfg.color_attachment_count = 0;
-    cfg.color_formats          = NULL;
-    cfg.depth_format           = VK_FORMAT_UNDEFINED;
-
-    for (uint32_t i = 0; i < MAX_COLOR_ATTACHMENTS; i++)
-        cfg.blends[i] = blend_disabled();
-
-    return cfg;
+    return (GraphicsPipelineConfig){
+        .cull_mode          = VK_CULL_MODE_NONE,
+        .front_face         = VK_FRONT_FACE_COUNTER_CLOCKWISE,
+        .polygon_mode       = VK_POLYGON_MODE_FILL,
+        .topology           = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+        .depth_test_enable  = true,
+        .depth_write_enable = true,
+        .depth_compare_op   = VK_COMPARE_OP_GREATER,
+        .color_attachment_count = 0,
+        .depth_format       = VK_FORMAT_UNDEFINED,
+    };
 }
 
 static VkShaderModule create_shader_module(VkDevice device, const void *code, size_t size) {
@@ -2393,7 +2491,30 @@ static VkShaderModule create_shader_module(VkDevice device, const void *code, si
     return mod;
 }
 
+static inline ColorAttachmentBlend blend_alpha(void) {
+    return (ColorAttachmentBlend){
+        .blend_enable = true,
+        .src_color    = VK_BLEND_FACTOR_SRC_ALPHA,
+        .dst_color    = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+        .color_op     = VK_BLEND_OP_ADD,
+        .src_alpha    = VK_BLEND_FACTOR_ONE,
+        .dst_alpha    = VK_BLEND_FACTOR_ZERO,
+        .alpha_op     = VK_BLEND_OP_ADD,
+        .write_mask   = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT |
+                      VK_COLOR_COMPONENT_A_BIT,
+    };
+}
+
+static inline void pipeline_fill_blend_defaults(GraphicsPipelineConfig *cfg) {
+    forEach(i, cfg->color_attachment_count) {
+        if (cfg->blends[i].write_mask == 0) // unset: designated init leaves the rest zeroed
+            cfg->blends[i] = blend_disabled();
+    }
+}
+
 VkPipeline create_graphics_pipeline(Renderer *renderer, const GraphicsPipelineConfig *cfg) {
+
+    assert(cfg->vert_path && cfg->frag_path && "pipeline needs both shader paths");
 
     void  *vs_code = NULL;
     size_t vs_size = 0;
@@ -2682,7 +2803,7 @@ PipelineID pipeline_create_compute(Renderer *r, const char *path) {
     r->render_pipelines.pipelines[id] = p;
 
     r->render_pipelines.count++;
-    return id;
+    return id + 1; // public IDs are 1-based; 0 means "no pipeline"
 }
 PipelineID pipeline_create_graphics(Renderer *r, GraphicsPipelineConfig *cfg) {
     uint32_t id;
@@ -2691,6 +2812,7 @@ PipelineID pipeline_create_graphics(Renderer *r, GraphicsPipelineConfig *cfg) {
     PipelineEntry *e = &r->render_pipelines.entries[id];
 
     e->type     = PIPELINE_TYPE_GRAPHICS;
+    pipeline_fill_blend_defaults(cfg);
     e->graphics = *cfg;
     e->dirty    = false;
 
@@ -2698,8 +2820,12 @@ PipelineID pipeline_create_graphics(Renderer *r, GraphicsPipelineConfig *cfg) {
 
     r->render_pipelines.count++;
 
-    return id;
+    return id + 1; // public IDs are 1-based; 0 means "no pipeline"
 }
+static void deferred_destroy_pipeline(Renderer *r, void *user) {
+    vkDestroyPipeline(r->devc.device, (VkPipeline)(uintptr_t)user, NULL);
+}
+
 void pipeline_rebuild(Renderer *r) {
     bool any_dirty = false;
 
@@ -2710,7 +2836,9 @@ void pipeline_rebuild(Renderer *r) {
     if (!any_dirty)
         return;
 
-    vkDeviceWaitIdle(r->devc.device);
+    // In-flight frames keep using the old pipelines; retire them on the timeline
+    // instead of stalling the device on every shader hot reload.
+    uint64_t retire = r->timeline_last_submitted;
 
     for (int i = 0; i < r->render_pipelines.count; i++) {
         PipelineEntry *e = &r->render_pipelines.entries[i];
@@ -2720,7 +2848,7 @@ void pipeline_rebuild(Renderer *r) {
 
         e->dirty = false;
 
-        vkDestroyPipeline(r->devc.device, r->render_pipelines.pipelines[i], NULL);
+        delete_queue_defer(r, retire, deferred_destroy_pipeline, (void *)(uintptr_t)r->render_pipelines.pipelines[i]);
 
         if (e->type == PIPELINE_TYPE_GRAPHICS)
             r->render_pipelines.pipelines[i] = create_graphics_pipeline(r, &e->graphics);
@@ -2983,6 +3111,189 @@ MU_INLINE void rt_transition_all(Renderer *r, VkCommandBuffer cmd, RenderTarget 
     }
 }
 // ============================================================
+// Pass API implementation
+// ============================================================
+
+FORCE_INLINE void push_constants(Renderer *r, VkCommandBuffer cmd, ByteSpan data) {
+    vkCmdPushConstants(cmd, r->bindless_system.pipeline_layout, VK_SHADER_STAGE_ALL, 0, data.size, data.data);
+}
+
+// ---- Root-argument payload helpers ----
+//
+// The per-draw/per-dispatch argument block is a parameter of the work, in the
+// style of NoGraphicsAPI's root: a ByteSpan copied with the draw/dispatch call.
+// Payload structs are declared once via PUSH_CONSTANT and shared with Slang, so
+// the CPU and shader layouts cannot drift. Push constants do not reference the
+// caller's memory after the call, so a stack-local payload is fine.
+
+static void emit_root_data(Renderer *r, VkCommandBuffer cmd, ByteSpan root) {
+    assert(root.size % 4 == 0 && "root payload must be a multiple of 4 bytes");
+    assert(root.size <= 256 && "root payload exceeds the 256-byte push-constant range");
+    assert(root.size > 0 && "empty root payload; pass a real struct or drop the argument");
+    push_constants(r, cmd, root);
+}
+
+FORCE_INLINE void cmd_draw(Renderer *r, VkCommandBuffer cmd, ByteSpan root, uint32_t vertex_count,
+                           uint32_t instance_count) {
+    emit_root_data(r, cmd, root);
+    vkCmdDraw(cmd, vertex_count, instance_count, 0, 0);
+}
+
+FORCE_INLINE void dispatch_push(Renderer *r, VkCommandBuffer cmd, ByteSpan root, uint32_t group_count_x,
+                                uint32_t group_count_y, uint32_t group_count_z) {
+    emit_root_data(r, cmd, root);
+    vkCmdDispatch(cmd, group_count_x, group_count_y, group_count_z);
+}
+
+FORCE_INLINE void end_pass(VkCommandBuffer cmd) { vkCmdEndRendering(cmd); }
+
+static void pass_transition_attachment(Renderer *r, VkCommandBuffer cmd, const PassAttachment *a) {
+    if (!a->target) {
+        // Swapchain attachment: the backend owns swapchain image state.
+        image_transition_swapchain(r, cmd, &r->swapchain, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                                   VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                   VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+        return;
+    }
+
+    if (a->target->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) {
+        rt_transition_all(r, cmd, a->target, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+                          VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+                          VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT);
+    } else {
+        rt_transition_all(r, cmd, a->target, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                          VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+    }
+}
+
+void begin_pass(Renderer *r, VkCommandBuffer cmd, const PassDesc *desc) {
+    assert(r && cmd && desc);
+    assert(desc->color_count <= MAX_COLOR_ATTACHMENTS);
+    assert((desc->colors && desc->color_count) || desc->color_count == 0);
+
+    const RenderTarget *area = desc->color_count && desc->colors[0].target ? desc->colors[0].target
+                               : (desc->depth ? desc->depth->target : NULL);
+    if (!area && desc->shader_read_count)
+        area = desc->shader_reads[0];
+    if (!area && desc->shader_write_count)
+        area = desc->shader_writes[0];
+    VkExtent2D area_extent;
+    if (area) {
+        area_extent = (VkExtent2D){.width = area->width, .height = area->height};
+    } else {
+        // Swapchain-only pass: render area comes from the swapchain extent.
+        assert(desc->color_count && desc->colors[0].swapchain_view &&
+               "begin_pass needs a target or a swapchain view to derive the render area");
+        area_extent = r->swapchain.extent;
+    }
+
+    forEach(i, desc->color_count) pass_transition_attachment(r, cmd, &desc->colors[i]);
+    if (desc->depth)
+        pass_transition_attachment(r, cmd, desc->depth);
+
+    forEach(i, desc->shader_read_count) {
+        rt_transition_all(r, cmd, desc->shader_reads[i], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                          VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                          VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+    }
+    forEach(i, desc->shader_write_count) {
+        rt_transition_all(r, cmd, desc->shader_writes[i], VK_IMAGE_LAYOUT_GENERAL,
+                          VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+    }
+
+    flush_barriers(r, cmd);
+
+    if (desc->color_count == 0) {
+        // Compute pass: no rendering scope, just the pipeline bind.
+        if (desc->pipeline)
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, r->render_pipelines.pipelines[desc->pipeline - 1]);
+        return;
+    }
+
+    VkRenderingAttachmentInfo color_attachments[MAX_COLOR_ATTACHMENTS];
+    forEach(i, desc->color_count) {
+        const PassAttachment *a = &desc->colors[i];
+        color_attachments[i] = (VkRenderingAttachmentInfo){
+            .sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+            .imageView   = a->target ? a->target->view : a->swapchain_view,
+            .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            .loadOp      = a->load,
+            .storeOp     = a->store,
+            .clearValue  = {.color = {{a->clear[0], a->clear[1], a->clear[2], a->clear[3]}}},
+        };
+    }
+
+    VkRenderingAttachmentInfo depth_attachment = {0};
+    if (desc->depth) {
+        depth_attachment = (VkRenderingAttachmentInfo){
+            .sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+            .imageView   = desc->depth->target->view,
+            .imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+            .loadOp      = desc->depth->load,
+            .storeOp     = desc->depth->store,
+            .clearValue  = {.depthStencil = {.depth = desc->depth->clear[0]}},
+        };
+    }
+
+    const VkRenderingInfo rendering = {
+        .sType                = VK_STRUCTURE_TYPE_RENDERING_INFO,
+        .renderArea           = {.extent = area_extent},
+        .layerCount           = 1,
+        .colorAttachmentCount = desc->color_count,
+        .pColorAttachments    = color_attachments,
+        .pDepthAttachment     = desc->depth ? &depth_attachment : NULL,
+    };
+
+    vkCmdBeginRendering(cmd, &rendering);
+    vk_cmd_set_viewport_scissor(cmd, area_extent);
+    if (desc->pipeline)
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, r->render_pipelines.pipelines[desc->pipeline - 1]);
+}
+
+// ============================================================
+// Delete queue
+// ============================================================
+
+void delete_queue_defer(Renderer *r, uint64_t retire_value, DeferredDestroyFn fn, void *user) {
+    DeleteQueue *q = &r->delete_queue;
+    assert(fn && "deferred destroy needs a callback");
+    assert(q->count < DELETE_QUEUE_CAPACITY && "delete queue exhausted: raise DELETE_QUEUE_CAPACITY");
+    assert((q->count == 0 ||
+            q->entries[(q->tail + DELETE_QUEUE_CAPACITY - 1) % DELETE_QUEUE_CAPACITY].retire_value <= retire_value) &&
+           "retire values must be nondecreasing");
+
+    q->entries[q->tail] = (DeleteQueueEntry){.retire_value = retire_value, .fn = fn, .user = user};
+    q->tail             = (q->tail + 1) % DELETE_QUEUE_CAPACITY;
+    q->count++;
+}
+
+void delete_queue_tick(Renderer *r) {
+    DeleteQueue *q = &r->delete_queue;
+    if (q->count == 0)
+        return;
+
+    uint64_t completed = 0;
+    VK_CHECK(vkGetSemaphoreCounterValue(r->devc.device, r->timeline, &completed));
+
+    while (q->count && q->entries[q->head].retire_value <= completed) {
+        DeleteQueueEntry *e = &q->entries[q->head];
+        e->fn(r, e->user);
+        q->head = (q->head + 1) % DELETE_QUEUE_CAPACITY;
+        q->count--;
+    }
+}
+
+void delete_queue_drain(Renderer *r) {
+    DeleteQueue *q = &r->delete_queue;
+    while (q->count) {
+        DeleteQueueEntry *e = &q->entries[q->head];
+        e->fn(r, e->user);
+        q->head = (q->head + 1) % DELETE_QUEUE_CAPACITY;
+        q->count--;
+    }
+}
+
+// ============================================================
 // Capture implementation
 // ============================================================
 
@@ -3047,6 +3358,7 @@ void capture_shutdown(Renderer *r) {
         c->recording = false;
     }
 
+    // Intentional stall: shutdown has no frames left to overlap with.
     vkDeviceWaitIdle(r->devc.device);
     for (uint32_t i = 0; i < CAPTURE_SLOTS; i++)
         capture_free_slot(r, &c->readback[i]);
@@ -3067,6 +3379,8 @@ void capture_resize(Renderer *r, uint32_t w, uint32_t h) {
         c->recording = false;
     }
 
+    // Intentional stall: readback slots are recreated in place and are rare
+    // (window resize only); deferral would outlive the CaptureState bookkeeping.
     vkDeviceWaitIdle(r->devc.device);
     for (uint32_t i = 0; i < CAPTURE_SLOTS; i++) {
         capture_free_slot(r, &c->readback[i]);
@@ -3143,9 +3457,22 @@ static void capture_consume(Renderer *r) {
     if (!c->inited)
         return;
 
+    // Consume the slot recorded MAX_FRAMES_IN_FLIGHT - 1 submissions ago; the
+    // frame-slot timeline wait in frame_start already covered its submission.
+    // The submit_value check makes that coupling explicit and enforced: a slot
+    // is readable only when its covering timeline value has completed.
     uint32_t slot = (r->current_frame + CAPTURE_SLOTS - 1) % CAPTURE_SLOTS;
-    if (!c->in_flight[slot])
+    if (c->submit_value[slot] == 0)
         return;
+
+    uint64_t completed = 0;
+    VK_CHECK(vkGetSemaphoreCounterValue(r->devc.device, r->timeline, &completed));
+    if (completed < c->submit_value[slot]) {
+        if (c->shot_slot[slot])
+            log_warn("[capture] screenshot deferred: submission %llu still in flight",
+                     (unsigned long long)c->submit_value[slot]);
+        return;
+    }
 
     Buffer *b = &c->readback[slot];
     if (!b->mapping)
@@ -3161,11 +3488,15 @@ static void capture_consume(Renderer *r) {
                 c->png_scratch[i * 4 + 0] = src[i * 4 + 2];
                 c->png_scratch[i * 4 + 1] = src[i * 4 + 1];
                 c->png_scratch[i * 4 + 2] = src[i * 4 + 0];
-                c->png_scratch[i * 4 + 3] = src[i * 4 + 3];
+                c->png_scratch[i * 4 + 3] = 255; // swapchain alpha is undefined; screenshots must stay opaque
             }
             stbi_write_png(c->shot_path[slot], (int)c->width, (int)c->height, 4, c->png_scratch, (int)(c->width * 4));
         } else {
-            stbi_write_png(c->shot_path[slot], (int)c->width, (int)c->height, 4, src, (int)(c->width * 4));
+            size_t npix = (size_t)c->width * (size_t)c->height;
+            memcpy(c->png_scratch, src, npix * 4);
+            for (size_t i = 0; i < npix; i++)
+                c->png_scratch[i * 4 + 3] = 255; // swapchain alpha is undefined; screenshots must stay opaque
+            stbi_write_png(c->shot_path[slot], (int)c->width, (int)c->height, 4, c->png_scratch, (int)(c->width * 4));
         }
         log_info("[capture] screenshot: %s", c->shot_path[slot]);
         c->shot_slot[slot] = false;
@@ -3177,7 +3508,7 @@ static void capture_consume(Renderer *r) {
         c->video_slot[slot] = false;
     }
 
-    c->in_flight[slot] = false;
+    c->submit_value[slot] = 0;
 }
 
 // Call right after pass_imgui(), before the swapchain is transitioned
@@ -3188,13 +3519,20 @@ static void capture_record(Renderer *r, VkCommandBuffer cmd) {
         return;
 
     uint32_t slot = r->current_frame % CAPTURE_SLOTS;
-    if (c->in_flight[slot])
-        return;
 
     bool want_shot  = c->screenshot_pending;
     bool want_video = c->recording;
     if (!want_shot && !want_video)
         return;
+
+    if (c->submit_value[slot] != 0) {
+        // The slot's previous copy is not consumed yet; recording into it would
+        // overwrite data the GPU may still be writing. Requested work is not
+        // silently lost: a pending screenshot is logged when it is skipped.
+        if (want_shot)
+            log_warn("[capture] screenshot dropped: readback slot %u busy", slot);
+        return;
+    }
 
     if (c->width != r->swapchain.extent.width || c->height != r->swapchain.extent.height)
         return;
@@ -3259,9 +3597,11 @@ static void capture_record(Renderer *r, VkCommandBuffer cmd) {
     st->stage  = prev_stage;
     st->access = prev_access;
 
-    c->in_flight[slot]  = true;
-    c->shot_slot[slot]  = want_shot;
-    c->video_slot[slot] = want_video;
+    // capture_record runs before this frame's single submit, so the next
+    // timeline value is exactly the submission that will carry this copy.
+    c->submit_value[slot] = r->timeline_last_submitted + 1;
+    c->shot_slot[slot]    = want_shot;
+    c->video_slot[slot]   = want_video;
 
     if (want_shot) {
         strncpy(c->shot_path[slot], c->screenshot_path, sizeof(c->shot_path[slot]) - 1);
@@ -3560,6 +3900,12 @@ void renderer_create(Renderer *r, RendererDesc *desc) {
         vk_create_semaphore(r->devc.device, &f->image_available_semaphore);
         vk_create_fence(r->devc.device, true, &f->in_flight_fence);
     }
+
+    // Submission timeline: monotonically increasing, signalled by every submit.
+    // Requires the timelineSemaphore feature, which the renderer already enables.
+    assert(r->info.feature_chain.v12.timelineSemaphore);
+    vk_create_timeline_semaphore(r->devc.device, &r->timeline);
+    r->timeline_last_submitted = 0;
 
     log_info("[renderer] frame contexts created");
 
@@ -4022,60 +4368,30 @@ void renderer_create(Renderer *r, RendererDesc *desc) {
     {
         DefaultSamplerTable *table = &r->default_samplers;
 
-        VkSamplerCreateInfo ci = {
-            .sType        = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
-            .magFilter    = VK_FILTER_LINEAR,
-            .minFilter    = VK_FILTER_LINEAR,
-            .mipmapMode   = VK_SAMPLER_MIPMAP_MODE_LINEAR,
-            .addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT,
-            .addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT,
-            .addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT,
-            .minLod       = 0.0f,
-            .maxLod       = VK_LOD_CLAMP_NONE,
-        };
+        // Zero-value SamplerDesc = linear filtering, repeat addressing. Name only deltas.
+        const SamplerDesc linear_wrap  = {0};
+        const SamplerDesc linear_clamp = {.address_u = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+                                          .address_v = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+                                          .address_w = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE};
+        const SamplerDesc nearest_wrap = {.min_filter  = VK_FILTER_NEAREST,
+                                          .mag_filter  = VK_FILTER_NEAREST,
+                                          .nearest_mips = true};
+        const SamplerDesc nearest_clamp = {.min_filter = VK_FILTER_NEAREST,
+                                           .mag_filter  = VK_FILTER_NEAREST,
+                                           .nearest_mips = true,
+                                           .address_u    = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+                                           .address_v    = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+                                           .address_w    = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE};
+        const SamplerDesc aniso_wrap   = {.anisotropic = true};
+        const SamplerDesc shadow       = {.compare_enabled       = true,
+                                    .clamp_mode_override = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER};
 
-        // Linear wrap
-        sampler_create(r, &ci, &table->samplers[SAMPLER_LINEAR_WRAP]);
-
-        // Linear clamp
-        ci.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-        ci.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-        ci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-        sampler_create(r, &ci, &table->samplers[SAMPLER_LINEAR_CLAMP]);
-
-        // Nearest wrap
-        ci.magFilter    = VK_FILTER_NEAREST;
-        ci.minFilter    = VK_FILTER_NEAREST;
-        ci.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-        ci.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-        ci.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-        sampler_create(r, &ci, &table->samplers[SAMPLER_NEAREST_WRAP]);
-
-        // Nearest clamp
-        ci.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-        ci.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-        ci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-        sampler_create(r, &ci, &table->samplers[SAMPLER_NEAREST_CLAMP]);
-
-        // Anisotropic wrap
-        ci.magFilter        = VK_FILTER_LINEAR;
-        ci.minFilter        = VK_FILTER_LINEAR;
-        ci.addressModeU     = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-        ci.addressModeV     = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-        ci.addressModeW     = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-        ci.anisotropyEnable = VK_TRUE;
-        ci.maxAnisotropy    = 16.0f;
-        sampler_create(r, &ci, &table->samplers[SAMPLER_LINEAR_WRAP_ANISO]);
-
-        // Shadow sampler
-        ci.anisotropyEnable = VK_FALSE;
-        ci.compareEnable    = VK_TRUE;
-        ci.compareOp        = VK_COMPARE_OP_LESS_OR_EQUAL;
-        ci.addressModeU     = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
-        ci.addressModeV     = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
-        ci.addressModeW     = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
-        ci.borderColor      = VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE;
-        sampler_create(r, &ci, &table->samplers[SAMPLER_SHADOW]);
+        sampler_create(r, &linear_wrap, &table->samplers[SAMPLER_LINEAR_WRAP]);
+        sampler_create(r, &linear_clamp, &table->samplers[SAMPLER_LINEAR_CLAMP]);
+        sampler_create(r, &nearest_wrap, &table->samplers[SAMPLER_NEAREST_WRAP]);
+        sampler_create(r, &nearest_clamp, &table->samplers[SAMPLER_NEAREST_CLAMP]);
+        sampler_create(r, &aniso_wrap, &table->samplers[SAMPLER_LINEAR_WRAP_ANISO]);
+        sampler_create(r, &shadow, &table->samplers[SAMPLER_SHADOW]);
     }
     {
         VkDeviceSize size = r->swapchain.extent.width * r->swapchain.extent.height * 4; // RGBA8
@@ -4191,7 +4507,7 @@ void graphics_init(void) {
         .instance_extension_count    = glfw_ext_count,
         .device_extension_count      = 2,
         .enable_gpu_based_validation = false,
-        .enable_validation           = false,
+        .enable_validation           = true,
 
         .validation_severity =
             VK_DEBUG_UTILS_MESSAGE_SEVERITY_VERBOSE_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT |
@@ -4223,6 +4539,7 @@ void graphics_init(void) {
     };
 
     g_renderer = malloc(sizeof(*g_renderer));
+    memset(g_renderer, 0, sizeof(*g_renderer)); // zero-value = safe defaults everywhere
     MU_SCOPE_TIMER("Renderer Creation") { renderer_create(g_renderer, &desc); }
 
     // gfx_pipelines();
@@ -4396,8 +4713,9 @@ static MU_INLINE bool frame_start(Renderer *r) {
     // Recreate first, acquire after: if the swapchain is (re)created, the old
     // acquired image would be invalid. Skip the frame and acquire fresh next time.
     if (r->swapchain.needs_recreate) {
-        vkDeviceWaitIdle(r->devc.device);
-
+        // No device-wide stall: vk_swapchain_recreate waits on the submission
+        // timeline, covering exactly the in-flight work before it destroys
+        // anything the GPU may still reference.
         vk_swapchain_recreate(r->devc.device, r->devc.physical_device, &r->swapchain, fb_w, fb_h,
                               r->devc.graphics_queue, r->one_time_gfx_pool, r);
 
@@ -4420,12 +4738,30 @@ static MU_INLINE bool frame_start(Renderer *r) {
 
     FrameContext *f = &r->frames[r->current_frame];
 
+    // Frame-slot reuse keys on the submission timeline: the slot is free once
+    // its last submission completed. The fence stays armed as a submission-
+    // failure trap (signaled by every submit; reset here after the slot is free).
     uint64_t wait_start = mu_time_now();
-    VK_CHECK(vkWaitForFences(r->devc.device, 1, &f->in_flight_fence, VK_TRUE, UINT64_MAX));
+    if (f->timeline_value != 0) {
+        VkSemaphoreWaitInfo wait = {.sType          = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
+                                    .semaphoreCount = 1,
+                                    .pSemaphores    = &r->timeline,
+                                    .pValues        = &f->timeline_value};
+        VK_CHECK(vkWaitSemaphores(r->devc.device, &wait, UINT64_MAX));
+    } else {
+        // First runs, before the slot has ever been submitted.
+        VK_CHECK(vkWaitForFences(r->devc.device, 1, &f->in_flight_fence, VK_TRUE, UINT64_MAX));
+    }
     r->cpu_wait_ns       = (double)(mu_time_now() - wait_start);
     r->cpu_wait_accum_ns = r->cpu_wait_accum_ns * 0.95 + r->cpu_wait_ns * 0.05;
     r->cpu_active_ns     = MAX(r->cpu_frame_ns - r->cpu_wait_ns, 0.0);
 
+    { // TEMP: fence-reset instrumentation (unbuffered stderr)
+        uint64_t done = 0;
+        vkGetSemaphoreCounterValue(r->devc.device, r->timeline, &done);
+        fprintf(stderr, "[fence-reset] slot=%u tl_value=%llu completed=%llu fence=%p\n", r->current_frame,
+                (unsigned long long)f->timeline_value, (unsigned long long)done, (void *)f->in_flight_fence);
+    }
     VK_CHECK(vkResetFences(r->devc.device, 1, &f->in_flight_fence));
 
     capture_consume(g_renderer);
@@ -4434,7 +4770,9 @@ static MU_INLINE bool frame_start(Renderer *r) {
 
     GpuProfiler *frame_prof = &r->gpuprofiler[r->current_frame];
 
-    gpu_profiler_collect(frame_prof, r->devc.device);
+    uint64_t completed = 0;
+    VK_CHECK(vkGetSemaphoreCounterValue(r->devc.device, r->timeline, &completed));
+    gpu_profiler_collect(frame_prof, r->devc.device, completed);
     gpu_profiler_ui_update(frame_prof);
 
     vkResetCommandPool(r->devc.device, f->cmdbufpool, 0);
@@ -4489,6 +4827,7 @@ static void update_global_data(Renderer *r) {
 
 static MU_INLINE void submit_frame(Renderer *r) {
     TracyCZoneNC(ctx, "submit_frame", 0xFF0000, 1);
+
     FrameContext *f   = &r->frames[r->current_frame];
     uint32_t      img = r->swapchain.current_image;
 
@@ -4499,19 +4838,30 @@ static MU_INLINE void submit_frame(Renderer *r) {
 
     VkSemaphoreSubmitInfo wait = {.sType     = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
                                   .semaphore = f->image_available_semaphore,
-                                  .stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT};
+                                  .stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT};    VkSemaphoreSubmitInfo signal = {.sType     = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+                                  .semaphore = r->swapchain.render_finished[img],
+                                  .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};
 
-    VkSemaphoreSubmitInfo signal = {.sType     = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
-                                    .semaphore = r->swapchain.render_finished[img],
-                                    .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};
+    // The device-wide timeline advances on every submission; frame-slot reuse,
+    // deferred destruction, and readback waits all key on this value.
+    uint64_t retire_value              = r->timeline_last_submitted + 1;
+    r->timeline_last_submitted         = retire_value;
+    f->timeline_value                  = retire_value;
+
+    VkSemaphoreSubmitInfo timeline_signal = {.sType     = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+                                             .semaphore = r->timeline,
+                                             .value     = retire_value,
+                                             .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};
+
+    VkSemaphoreSubmitInfo signals[] = {signal, timeline_signal};
 
     VkSubmitInfo2 submit = {.sType                    = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
                             .waitSemaphoreInfoCount   = 1,
                             .pWaitSemaphoreInfos      = &wait,
                             .commandBufferInfoCount   = 1,
                             .pCommandBufferInfos      = &cmd,
-                            .signalSemaphoreInfoCount = 1,
-                            .pSignalSemaphoreInfos    = &signal};
+                            .signalSemaphoreInfoCount = 2,
+                            .pSignalSemaphoreInfos    = signals};
 
     VK_CHECK(vkQueueSubmit2(r->devc.graphics_queue, 1, &submit, f->in_flight_fence));
 
@@ -4764,15 +5114,16 @@ static void post_pass(Renderer *r, VkCommandBuffer cmd) {
 
     GpuProfiler *frame_prof = &r->gpuprofiler[r->current_frame];
     GPU_SCOPE(frame_prof, cmd, "Post Processing", VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT) {
-        rt_transition_all(r, cmd, &r->hdr_color[image], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                          VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
-        rt_transition_all(r, cmd, &r->ldr_color[image], VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                          VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+        RenderTarget *reads[]  = {&r->hdr_color[image]};
+        RenderTarget *writes[] = {&r->ldr_color[image]};
 
-        flush_barriers(r, cmd);
-
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                          r->render_pipelines.pipelines[r->EnginePipelines.postprocess]);
+        begin_pass(r, cmd, &(PassDesc){
+                         .shader_reads      = reads,
+                         .shader_read_count = 1,
+                         .shader_writes     = writes,
+                         .shader_write_count = 1,
+                         .pipeline          = r->EnginePipelines.postprocess,
+                     });
 
         PostPush push = {
             .src_texture_id  = r->hdr_color[image].bindless_index,
@@ -4784,12 +5135,7 @@ static void post_pass(Renderer *r, VkCommandBuffer cmd) {
             .exposure        = 1.2f,
         };
 
-        vkCmdPushConstants(cmd, r->bindless_system.pipeline_layout, VK_SHADER_STAGE_ALL, 0, sizeof(push), &push);
-
-        uint32_t gx = (push.width + 15) / 16;
-        uint32_t gy = (push.height + 15) / 16;
-
-        vkCmdDispatch(cmd, gx, gy, 1);
+        dispatch_push(r, cmd, BYTE_SPAN(push), (push.width + 15) / 16, (push.height + 15) / 16, 1);
     }
 }
 
@@ -4805,26 +5151,13 @@ static void pass_fire(Renderer *r, VkCommandBuffer cmd) {
     GPU_SCOPE(frame_prof, cmd, "Fire Pass", VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT) {
         uint32_t image = r->swapchain.current_image;
 
-        rt_transition_all(r, cmd, &r->hdr_color[image], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                          VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
-        flush_barriers(r, cmd);
-
-        VkRenderingAttachmentInfo color = {
-            .sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
-            .imageView   = r->hdr_color[image].view,
-            .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-            .loadOp      = VK_ATTACHMENT_LOAD_OP_CLEAR,
-            .storeOp     = VK_ATTACHMENT_STORE_OP_STORE,
-            .clearValue  = {.color = {{0.02f, 0.025f, 0.03f, 1.0f}}},
+        PassAttachment color = {
+            .target = &r->hdr_color[image],
+            .load   = VK_ATTACHMENT_LOAD_OP_CLEAR,
+            .clear  = {0.02f, 0.025f, 0.03f, 1.0f},
         };
 
-        VkRenderingInfo rendering = {
-            .sType                = VK_STRUCTURE_TYPE_RENDERING_INFO,
-            .renderArea.extent    = r->swapchain.extent,
-            .layerCount           = 1,
-            .colorAttachmentCount = 1,
-            .pColorAttachments    = &color,
-        };
+        begin_pass(r, cmd, &(PassDesc){.colors = &color, .color_count = 1, .pipeline = r->EnginePipelines.fire});
 
         FirePush push = {
             .width  = r->swapchain.extent.width,
@@ -4833,12 +5166,8 @@ static void pass_fire(Renderer *r, VkCommandBuffer cmd) {
             .pad    = 0.0f,
         };
 
-        vkCmdBeginRendering(cmd, &rendering);
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, r->render_pipelines.pipelines[r->EnginePipelines.fire]);
-        vk_cmd_set_viewport_scissor(cmd, r->swapchain.extent);
-        vkCmdPushConstants(cmd, r->bindless_system.pipeline_layout, VK_SHADER_STAGE_ALL, 0, sizeof(push), &push);
-        vkCmdDraw(cmd, 3, 1, 0, 0);
-        vkCmdEndRendering(cmd);
+        cmd_draw(r, cmd, BYTE_SPAN(push), 3, 1);
+        end_pass(cmd);
     }
 }
 
@@ -4849,75 +5178,39 @@ static void pass_smaa(Renderer *r, VkCommandBuffer cmd) {
     {
         /* 1. Edge detection */
         GPU_SCOPE(frame_prof, cmd, "SMAA Edge", VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT) {
-            rt_transition_all(r, cmd, &r->smaa_edges[image], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                              VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
-            rt_transition_all(r, cmd, &r->ldr_color[image], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                              VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
-            flush_barriers(r, cmd);
+            PassAttachment color = {.target = &r->smaa_edges[image], .load = VK_ATTACHMENT_LOAD_OP_CLEAR};
+            RenderTarget  *reads[] = {&r->ldr_color[image]};
 
-            VkRenderingAttachmentInfo edge_color = {
-                .sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
-                .imageView   = r->smaa_edges[image].view,
-                .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                .loadOp      = VK_ATTACHMENT_LOAD_OP_CLEAR,
-                .storeOp     = VK_ATTACHMENT_STORE_OP_STORE,
-                .clearValue  = {.color = {{0, 0, 0, 0}}},
-            };
-
-            VkRenderingInfo edge_rendering = {
-                .sType                = VK_STRUCTURE_TYPE_RENDERING_INFO,
-                .renderArea.extent    = r->swapchain.extent,
-                .layerCount           = 1,
-                .colorAttachmentCount = 1,
-                .pColorAttachments    = &edge_color,
-            };
-
-            vkCmdBeginRendering(cmd, &edge_rendering);
-            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                              r->render_pipelines.pipelines[r->smaa_pipelines.smaa_edge]);
-            vk_cmd_set_viewport_scissor(cmd, r->swapchain.extent);
+            begin_pass(r, cmd, &(PassDesc){
+                             .colors            = &color,
+                             .color_count       = 1,
+                             .shader_reads      = reads,
+                             .shader_read_count = 1,
+                             .pipeline          = r->smaa_pipelines.smaa_edge,
+                         });
 
             EdgePush edge_push = {
                 .texture_id = r->ldr_color[image].bindless_index,
                 .sampler_id = r->default_samplers.samplers[SAMPLER_LINEAR_CLAMP],
             };
 
-            vkCmdPushConstants(cmd, r->bindless_system.pipeline_layout, VK_SHADER_STAGE_ALL, 0, sizeof(edge_push),
-                               &edge_push);
-            vkCmdDraw(cmd, 3, 1, 0, 0);
-            vkCmdEndRendering(cmd);
+            cmd_draw(r, cmd, BYTE_SPAN(edge_push), 3, 1);
+            end_pass(cmd);
         }
     }
     {
         /* 2. Weight calculation */
         GPU_SCOPE(frame_prof, cmd, "SMAA Weight", VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT) {
-            rt_transition_all(r, cmd, &r->smaa_weights[image], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                              VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
-            rt_transition_all(r, cmd, &r->smaa_edges[image], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                              VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
-            flush_barriers(r, cmd);
+            PassAttachment color      = {.target = &r->smaa_weights[image], .load = VK_ATTACHMENT_LOAD_OP_CLEAR};
+            RenderTarget  *reads[]    = {&r->smaa_edges[image]};
 
-            VkRenderingAttachmentInfo weight_color = {
-                .sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
-                .imageView   = r->smaa_weights[image].view,
-                .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                .loadOp      = VK_ATTACHMENT_LOAD_OP_CLEAR,
-                .storeOp     = VK_ATTACHMENT_STORE_OP_STORE,
-                .clearValue  = {.color = {{0, 0, 0, 0}}},
-            };
-
-            VkRenderingInfo weight_rendering = {
-                .sType                = VK_STRUCTURE_TYPE_RENDERING_INFO,
-                .renderArea.extent    = r->swapchain.extent,
-                .layerCount           = 1,
-                .colorAttachmentCount = 1,
-                .pColorAttachments    = &weight_color,
-            };
-
-            vkCmdBeginRendering(cmd, &weight_rendering);
-            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                              r->render_pipelines.pipelines[r->smaa_pipelines.smaa_weight]);
-            vk_cmd_set_viewport_scissor(cmd, r->swapchain.extent);
+            begin_pass(r, cmd, &(PassDesc){
+                             .colors            = &color,
+                             .color_count       = 1,
+                             .shader_reads      = reads,
+                             .shader_read_count = 1,
+                             .pipeline          = r->smaa_pipelines.smaa_weight,
+                         });
 
             WeightPush weight_push = {
                 .edge_tex   = r->smaa_edges[image].bindless_index,
@@ -4926,43 +5219,23 @@ static void pass_smaa(Renderer *r, VkCommandBuffer cmd) {
                 .sampler_id = r->default_samplers.samplers[SAMPLER_LINEAR_CLAMP],
             };
 
-            vkCmdPushConstants(cmd, r->bindless_system.pipeline_layout, VK_SHADER_STAGE_ALL, 0, sizeof(weight_push),
-                               &weight_push);
-            vkCmdDraw(cmd, 3, 1, 0, 0);
-            vkCmdEndRendering(cmd);
+            cmd_draw(r, cmd, BYTE_SPAN(weight_push), 3, 1);
+            end_pass(cmd);
         }
     }
     {
         /* 3. Blend LDR + SMAA into FINAL */
         GPU_SCOPE(frame_prof, cmd, "SMAA Blend", VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT) {
-            rt_transition_all(r, cmd, &r->smaa_final[image], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                              VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
-            rt_transition_all(r, cmd, &r->ldr_color[image], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                              VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
-            rt_transition_all(r, cmd, &r->smaa_weights[image], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                              VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
-            flush_barriers(r, cmd);
+            PassAttachment color   = {.target = &r->smaa_final[image], .load = VK_ATTACHMENT_LOAD_OP_CLEAR};
+            RenderTarget  *reads[] = {&r->ldr_color[image], &r->smaa_weights[image]};
 
-            VkRenderingAttachmentInfo final_color = {
-                .sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
-                .imageView   = r->smaa_final[image].view,
-                .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                .loadOp      = VK_ATTACHMENT_LOAD_OP_CLEAR,
-                .storeOp     = VK_ATTACHMENT_STORE_OP_STORE,
-            };
-
-            VkRenderingInfo final_rendering = {
-                .sType                = VK_STRUCTURE_TYPE_RENDERING_INFO,
-                .renderArea.extent    = r->swapchain.extent,
-                .layerCount           = 1,
-                .colorAttachmentCount = 1,
-                .pColorAttachments    = &final_color,
-            };
-
-            vkCmdBeginRendering(cmd, &final_rendering);
-            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                              r->render_pipelines.pipelines[r->smaa_pipelines.smaa_blend]);
-            vk_cmd_set_viewport_scissor(cmd, r->swapchain.extent);
+            begin_pass(r, cmd, &(PassDesc){
+                             .colors            = &color,
+                             .color_count       = 1,
+                             .shader_reads      = reads,
+                             .shader_read_count = 2,
+                             .pipeline          = r->smaa_pipelines.smaa_blend,
+                         });
 
             BlendPush blend_push = {
                 .color_tex  = r->ldr_color[image].bindless_index,
@@ -4970,10 +5243,8 @@ static void pass_smaa(Renderer *r, VkCommandBuffer cmd) {
                 .sampler_id = r->default_samplers.samplers[SAMPLER_LINEAR_CLAMP],
             };
 
-            vkCmdPushConstants(cmd, r->bindless_system.pipeline_layout, VK_SHADER_STAGE_ALL, 0, sizeof(blend_push),
-                               &blend_push);
-            vkCmdDraw(cmd, 3, 1, 0, 0);
-            vkCmdEndRendering(cmd);
+            cmd_draw(r, cmd, BYTE_SPAN(blend_push), 3, 1);
+            end_pass(cmd);
         }
     }
 }
@@ -5031,35 +5302,13 @@ static void pass_imgui(Renderer *r, VkCommandBuffer cmd) {
     GPU_SCOPE(frame_prof, cmd, "ImGui Render", VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT) {
         uint32_t image = r->swapchain.current_image;
 
-        image_transition_swapchain(r, cmd, &r->swapchain, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                                   VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
-                                   VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+        PassAttachment color = {.target = NULL, .swapchain_view = r->swapchain.image_views[image]};
 
-        flush_barriers(r, cmd);
+        begin_pass(r, cmd, &(PassDesc){.colors = &color, .color_count = 1});
 
-        VkRenderingAttachmentInfo color = {
-            .sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
-            .imageView   = r->swapchain.image_views[image],
-            .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-            .loadOp      = VK_ATTACHMENT_LOAD_OP_LOAD,
-            .storeOp     = VK_ATTACHMENT_STORE_OP_STORE,
-        };
+        ImGui_ImplVulkan_RenderDrawData(igGetDrawData(), cmd, VK_NULL_HANDLE);
 
-        VkRenderingInfo rendering = {
-            .sType                = VK_STRUCTURE_TYPE_RENDERING_INFO,
-            .renderArea.extent    = r->swapchain.extent,
-            .layerCount           = 1,
-            .colorAttachmentCount = 1,
-            .pColorAttachments    = &color,
-        };
-
-        vkCmdBeginRendering(cmd, &rendering);
-
-        ImDrawData *draw_data = igGetDrawData();
-
-        ImGui_ImplVulkan_RenderDrawData(draw_data, cmd, VK_NULL_HANDLE);
-
-        vkCmdEndRendering(cmd);
+        end_pass(cmd);
     }
 }
 
@@ -5171,6 +5420,7 @@ int main() {
             rec_held = false;
 
         pipeline_rebuild(g_renderer);
+        delete_queue_tick(g_renderer);
         if (!frame_start(g_renderer))
             continue; // swapchain out-of-date / minimized: nothing to record
         update_global_data(g_renderer);
@@ -5183,6 +5433,10 @@ int main() {
         GpuProfiler    *frame_prof = &renderer->gpuprofiler[renderer->current_frame];
 
         vk_cmd_begin(cmd, false);
+        // This frame's queries complete with this frame's submission value; the
+        // slot is consumed once the timeline covers it. Same value the capture
+        // slot records.
+        frame_prof->submit_value = r->timeline_last_submitted + 1;
         gpu_profiler_begin_frame(frame_prof, cmd);
 
         {
@@ -5221,6 +5475,10 @@ int main() {
 
         submit_frame(renderer);
     }
+    // Intentional stall: shutdown has no frames left to overlap with.
+    vkDeviceWaitIdle(g_renderer->devc.device);
+    delete_queue_drain(g_renderer);
+
     capture_shutdown(g_renderer);
     dmon_deinit();
     pipeline_cache_save(g_renderer->devc.device, g_renderer->devc.physical_device, g_renderer->devc.pipeline_cache,
