@@ -44,8 +44,30 @@ PUSH_CONSTANT(MyPassPush,
 );
 ```
 
+The payload is a parameter of the work itself: `cmd_draw(r, cmd, BYTE_SPAN(push), vertex_count, instance_count)` and `dispatch_push(r, cmd, BYTE_SPAN(push), gx, gy, gz)` copy the root data with the draw/dispatch and validate size/alignment in one place. Raw `vkCmdPushConstants` is backend-only.
+
 ### 4. Synchronization2 & Explicit Barrier Batching
 State tracking (`ImageState`) tracks layout, stage, access flags, and queue family per image/mip. Barriers are queued into a `BarrierBatch` and flushed in batch (`flush_barriers()`) before pipeline execution to minimize synchronization overhead.
+
+### 5. Declarative Pass API (`begin_pass` / `end_pass`)
+Passes are declared, not hand-assembled. A pass describes *intent* — color/depth attachments (with load/store/clear), shader reads, storage writes, and the pipeline — through a `PassDesc`, and `begin_pass()` does everything else:
+
+* Resolves `RenderTarget`s and derives transitions from the `ImageState` tracker (attachment layouts, sampled-read, GENERAL for storage) — call sites never name layouts or stage masks.
+* Flushes the barrier batch once.
+* Fills `VkRenderingInfo` internally and derives the render area from the first color attachment (depth fallback; swapchain attachments take the swapchain extent).
+* Sets full-area viewport/scissor (negative-height convention stays hidden inside).
+* Binds the PSO when `desc.pipeline` is set (0 = caller binds later, e.g. ImGui).
+* Compute passes set `color_count = 0`; no rendering scope is begun.
+
+`PassAttachment` uses zero-value defaults (`LOAD`/`STORE`), so call sites name only deltas. Setting `swapchain_view` instead of `target` renders into a swapchain image; the backend tracks swapchain state itself (`pass_imgui` uses this).
+
+### 6. Submission Timeline & Deferred Destruction
+A device-wide **timeline semaphore** advances monotonically on every submission (`timeline_last_submitted`). All reuse and lifetime decisions key on it:
+
+* **Frame-slot reuse**: `frame_start` waits on the slot's `FrameContext::timeline_value` via `vkWaitSemaphores` instead of fences. The per-frame fence stays armed purely as a submission-failure trap (re-armed every frame).
+* **DeleteQueue**: fixed-capacity ring of `{retire_value, callback, user}` entries. Resources destroyed while the GPU may still use them are retired with the covering timeline value; `delete_queue_tick()` runs due callbacks each frame, `delete_queue_drain()` runs everything after `wait_idle` at shutdown.
+* **Shader hot reload** (`pipeline_rebuild`) defers old `VkPipeline` destruction on the timeline — no `vkDeviceWaitIdle` stall on reload.
+* **Swapchain recreate** does a targeted `vkWaitSemaphores(timeline_last_submitted)` instead of a device-wide idle (required: resize destroys/recreates render targets and rewrites bindless descriptors).
 
 ---
 
@@ -82,13 +104,13 @@ State tracking (`ImageState`) tracks layout, stage, access flags, and queue fami
 The primary engine state lives inside the global heap-allocated `Renderer` struct (`g_renderer`):
 
 ```c
-typedef struct {
+typedef struct Renderer {
     // Timings
     double cpu_frame_ns, cpu_active_ns, cpu_wait_ns, cpu_wait_accum_ns;
     uint32_t current_frame; // 0..MAX_FRAMES_IN_FLIGHT - 1
     float dt;
 
-    // Per-frame contexts
+    // Per-frame contexts (each carries its last timeline_value for reuse waits)
     FrameContext frames[MAX_FRAMES_IN_FLIGHT];
 
     // Swapchain & Device
@@ -125,6 +147,11 @@ typedef struct {
 
     // Pipeline handles
     struct { ... } EnginePipelines;
+
+    // Submission timeline & deferred destruction
+    VkSemaphore timeline;              // signalled once per submit, monotonic
+    uint64_t    timeline_last_submitted;
+    DeleteQueue delete_queue;          // {retire_value, callback} ring
 } Renderer;
 ```
 
@@ -155,32 +182,33 @@ The engine uses three specialized memory allocation strategies built on top of `
 Each frame executes through a strictly ordered pipeline in `main.c`:
 
 ```mermaid
+classDef pass fill:#2d4a2d,stroke:#7fbf7f,color:#fff;
 graph TD
-    A[glfwPollEvents] --> B[pipeline_rebuild]
-    B --> C[frame_start]
-    C --> D[Acquire Swapchain Image & Wait Fence]
-    D --> E[imgui_begin_frame]
-    E --> F[Bind Set 0 Bindless Descriptors]
-    F --> G[pass_fire: HDR Procedural Render]
-    G --> H[post_pass: Compute Tonemapping HDR -> LDR]
-    H --> I[pass_smaa: Edge -> Weight -> Blend]
-    I --> J[pass_ldr_to_swapchain: Blit to Swapchain Image]
-    J --> K[render_gpu_profiler_ui & pass_imgui]
-    K --> L[Transition Swapchain to PRESENT_SRC_KHR]
-    L --> M[submit_frame & vkQueuePresentKHR]
+    A[glfwPollEvents] --> B[pipeline_rebuild + delete_queue_tick]
+    B --> C[frame_start: wait frame-slot timeline value]
+    C --> D[Acquire Swapchain Image]
+    D --> E[imgui_begin_frame + bind Set 0]
+    E --> G[pass_fire: begin_pass HDR render]
+    G --> H[post_pass: begin_pass compute tonemap]
+    H --> I[pass_smaa: 3x begin_pass sub-passes]
+    I --> J[pass_ldr_to_swapchain: blit]
+    J --> K[UI + pass_imgui: begin_pass swapchain attachment]
+    K --> L[Present transition]
+    L --> M[submit_frame: signal timeline N+1 + present]
 ```
 
 ### Detailed Pass Descriptions
 
 1. **`pass_fire` (Graphics Pass)**:
-   * Transitions `hdr_color` to `COLOR_ATTACHMENT_OPTIMAL`.
+   * `begin_pass` with one clear color attachment (`hdr_color`); transitions, rendering scope, viewport/scissor, and pipeline bind are all derived.
    * Executes procedural rasterization shader (`fire.slang`) outputting HDR floating-point color.
 
 2. **`post_pass` (Compute Pass)**:
-   * Transitions `hdr_color` to `SHADER_READ_ONLY_OPTIMAL` and `ldr_color` to `GENERAL`.
+   * `begin_pass` with `shader_reads = {hdr_color}` and `shader_writes = {ldr_color}`; transitions to `SHADER_READ_ONLY_OPTIMAL` / `GENERAL` are derived, no rendering scope.
    * Dispatches compute shader (`postprocess.slang`) performing exposure tone mapping and color grading from HDR sampled image to LDR storage image.
 
 3. **`pass_smaa` (3-Stage Anti-Aliasing Pass)**:
+   * Each stage is one `begin_pass` with a clear color attachment plus declared shader reads.
    * **Stage 1 (`smaa_edge`)**: Renders LDR color into edge target `smaa_edges`.
    * **Stage 2 (`smaa_weight`)**: Evaluates edges alongside precalculated `smaa_area_tex` and `smaa_search_tex` LUTs to write blending weights into `smaa_weights`.
    * **Stage 3 (`smaa_blend`)**: Blends original LDR image with neighbor pixels based on calculated weights, outputting to `smaa_final`.
@@ -189,6 +217,7 @@ graph TD
    * Uses `vkCmdBlitImage` to copy `smaa_final` into the acquired swapchain image.
 
 5. **`pass_imgui` (Overlay Pass)**:
+   * `begin_pass` with a swapchain attachment (`swapchain_view`, load op `LOAD`), pipeline 0 — ImGui binds its own pipeline.
    * Uses ImGui Vulkan backend (`ImGui_ImplVulkan_RenderDrawData`) to render profiler windows, UI controls, and text directly onto the swapchain image before presentation.
 
 ---
@@ -219,7 +248,7 @@ The profiler (`GpuProfiler` in `src/helpers.h`) tracks nanosecond-accurate GPU p
 2. **Compilation Trigger**: Editing a `.slang` file triggers `watch_callback()`, which invokes `compileslang.sh` via `trigger_shader_compilation()`.
 3. **Slang Compilation**: `slangc` parses entry points (`vs_main`, `fs_main`, `cs_main`) and compiles updated SPIR-V targets to `compiledshaders/`.
 4. **Dirty Flag Marking**: `pipeline_mark_dirty()` scans active pipeline entries and flags matches.
-5. **Runtime Pipeline Rebuild**: At the start of the next frame, `pipeline_rebuild()` reconstructs `VkPipeline` objects seamlessly without interrupting execution.
+5. **Runtime Pipeline Rebuild**: At the start of the next frame, `pipeline_rebuild()` reconstructs `VkPipeline` objects seamlessly without interrupting execution. Old pipelines are retired on the submission timeline via the `DeleteQueue` — no device-wide stall.
 6. **Pipeline Caching**: `pipeline_cache_save()` serializes `VkPipelineCache` to `pipeline_cache.bin` on application exit.
 
 ---
@@ -255,36 +284,56 @@ uint32_t my_pass_pipeline;
 
 // In graphics_init() or pipeline creation section:
 r->EnginePipelines.my_pass_pipeline = pipeline_create_compute(r, "compiledshaders/my_pass.comp.spv");
-```
+```### Step 3: Implement Pass Function
+Declare intent through `PassDesc`; transitions, barriers, rendering scope, viewport/scissor, and pipeline bind are all derived. `pipeline` is the `PipelineID` (0 = bind yourself). Colors take zero-value defaults (`LOAD`/`STORE`) — name only deltas.
 
-### Step 3: Implement Pass Function
+Compute pass:
 ```c
 static void pass_my_custom(Renderer *r, VkCommandBuffer cmd) {
     uint32_t image = r->swapchain.current_image;
     GpuProfiler *frame_prof = &r->gpuprofiler[r->current_frame];
 
     GPU_SCOPE(frame_prof, cmd, "My Custom Pass", VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT) {
-        // 1. Transition resources
-        rt_transition_all(r, cmd, &r->hdr_color[image], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                          VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
-        flush_barriers(r, cmd);
+        RenderTarget *reads[]  = {&r->hdr_color[image]};
+        RenderTarget *writes[] = {&r->ldr_color[image]};
 
-        // 2. Bind pipeline & push constants
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                          r->render_pipelines.pipelines[r->EnginePipelines.my_pass_pipeline]);
+        begin_pass(r, cmd, &(PassDesc){
+            .shader_reads       = reads,
+            .shader_read_count  = 1,
+            .shader_writes      = writes,
+            .shader_write_count = 1,
+            .pipeline           = r->EnginePipelines.my_pass_pipeline,
+        });
 
         MyPush push = {
-            .src_tex = r->hdr_color[image].bindless_index,
-            .out_img = r->ldr_color[image].bindless_index,
+            .src_tex   = r->hdr_color[image].bindless_index,
+            .out_img   = r->ldr_color[image].bindless_index,
             .intensity = 1.0f,
         };
-        vkCmdPushConstants(cmd, r->bindless_system.pipeline_layout, VK_SHADER_STAGE_ALL, 0, sizeof(push), &push);
-
-        // 3. Dispatch compute or draw raster primitives
-        uint32_t gx = (r->swapchain.extent.width + 15) / 16;
-        uint32_t gy = (r->swapchain.extent.height + 15) / 16;
-        vkCmdDispatch(cmd, gx, gy, 1);
+        dispatch_push(r, cmd, BYTE_SPAN(push), (r->swapchain.extent.width + 15) / 16,
+                      (r->swapchain.extent.height + 15) / 16, 1);
     }
+}
+```
+
+Graphics pass with a clear color attachment (and optional depth):
+```c
+static void pass_my_draw(Renderer *r, VkCommandBuffer cmd) {
+    PassAttachment color = {.target = &r->hdr_color[r->swapchain.current_image],
+                            .load   = VK_ATTACHMENT_LOAD_OP_CLEAR};
+    PassAttachment depth = {.target = &r->depth[r->swapchain.current_image],
+                            .load   = VK_ATTACHMENT_LOAD_OP_CLEAR,
+                            .clear  = {0.0f}}; // clear[0] = depth clear value
+
+    begin_pass(r, cmd, &(PassDesc){
+        .colors       = &color,
+        .color_count  = 1,
+        .depth        = &depth,
+        .pipeline     = r->EnginePipelines.my_draw_pipeline,
+    });
+
+    cmd_draw(r, cmd, BYTE_SPAN(draw_push), 3, 1);
+    end_pass(cmd);
 }
 ```
 
@@ -322,4 +371,5 @@ make clean
 1. **Vulkan Coordinate System**: Maintain Vulkan NDC conventions ($Y$ points downwards, depth range $[0.0, 1.0]$).
 2. **Push Constant Alignment**: Always use `PUSH_CONSTANT(Name, BODY)` and verify standard 256-byte alignment (`_Static_assert`).
 3. **Explicit Memory Allocation**: Allocation of temporary buffers in passes must use `cpu_pool` (`BUFFER_POOL_LINEAR`). Do not call `malloc()` or `vkAllocateMemory()` in frame loops.
-4. **State Transition Integrity**: Every image accessed in a pass **must** be explicitly transitioned using `rt_transition_all()` or `image_transition_swapchain()` followed by `flush_barriers()`.
+4. **State Transition Integrity**: Images touched outside `begin_pass` (blits, captures, present transitions) are transitioned explicitly with `rt_transition_all()` / `image_transition_swapchain()` followed by `flush_barriers()`. Inside a pass, declare attachments/reads/writes in the `PassDesc` and let `begin_pass` derive them.
+5. **Resource Lifetimes**: Destroy GPU resources only when no in-flight submission uses them: wait on the covering timeline value, or defer with `delete_queue_defer(r, r->timeline_last_submitted, fn, user)`. Shutdown order: `vkDeviceWaitIdle` → `delete_queue_drain` → destroy resources → device.

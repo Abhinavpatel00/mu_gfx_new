@@ -218,7 +218,6 @@ float3 color = bgColor
 */
 
 /*
-
  float2 C = input.position.xy;
 
 
@@ -240,7 +239,7 @@ float3 rd = normalize(float3(
     const float STEP_SCALE = 1.0 / 9.0;
 
     [loop]
-    for (int i = 0; i < 48; ++i)
+    for (int i = 0; i < 75; ++i)
     {
         float3 p = ray_origin + z * rd;
 
@@ -278,6 +277,7 @@ float3 rd = normalize(float3(
     }
 
     col = tanh(col * 0.001);   // default ~0.001
+
 */
 /*
 
