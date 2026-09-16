@@ -7,6 +7,7 @@
 #include "src/slangtypes.h"
 #include <stdbool.h>
 #include <stdint.h>
+#include <vulkan/vulkan_core.h>
 // ids
 
 typedef uint32_t TextureID;
@@ -4756,12 +4757,6 @@ static MU_INLINE bool frame_start(Renderer *r) {
     r->cpu_wait_accum_ns = r->cpu_wait_accum_ns * 0.95 + r->cpu_wait_ns * 0.05;
     r->cpu_active_ns     = MAX(r->cpu_frame_ns - r->cpu_wait_ns, 0.0);
 
-    { // TEMP: fence-reset instrumentation (unbuffered stderr)
-        uint64_t done = 0;
-        vkGetSemaphoreCounterValue(r->devc.device, r->timeline, &done);
-        fprintf(stderr, "[fence-reset] slot=%u tl_value=%llu completed=%llu fence=%p\n", r->current_frame,
-                (unsigned long long)f->timeline_value, (unsigned long long)done, (void *)f->in_flight_fence);
-    }
     VK_CHECK(vkResetFences(r->devc.device, 1, &f->in_flight_fence));
 
     capture_consume(g_renderer);
@@ -4863,7 +4858,7 @@ static MU_INLINE void submit_frame(Renderer *r) {
                             .signalSemaphoreInfoCount = 2,
                             .pSignalSemaphoreInfos    = signals};
 
-    VK_CHECK(vkQueueSubmit2(r->devc.graphics_queue, 1, &submit, f->in_flight_fence));
+    VK_CHECK(vkQueueSubmit2(r->devc.graphics_queue, 1, &submit, VK_NULL_HANDLE));
 
     vk_swapchain_present(r->devc.present_queue, &r->swapchain,
                          &r->swapchain.render_finished[r->swapchain.current_image], 1);
