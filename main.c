@@ -14,11 +14,6 @@
 typedef uint32_t TextureID;
 typedef uint32_t SamplerID;
 typedef uint32_t PipelineID;
-
-
-
-
-
 typedef struct Texture {
     VkImage       image;
     VkImageView   view;
