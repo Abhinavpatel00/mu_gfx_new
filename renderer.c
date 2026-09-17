@@ -1,6 +1,6 @@
 #include "renderer.h"
 #include "src/platform.h"
-#include "vk.h"
+#include "renderer3d.h"
 #include "src/input_rgfw.h"
 #include "src/nuklear_ui.h"
 #include "src/slangtypes.h"
@@ -55,6 +55,7 @@ typedef struct NuklearUi {
 
 struct Renderer {
     VkBackend vk;
+    Renderer3D scene;
     double   cpu_frame_ns;
     uint64_t start_time;
     double   cpu_active_ns;
@@ -857,6 +858,8 @@ Renderer *renderer_create(bool use_wayland) {
     desc.height = (uint32_t)height;
     vk_backend_create(&r->vk, &desc);
     renderer_resources_create(r, &desc);
+    if (!renderer3d_create(&r->vk, &r->scene, r->hdr_color[0].format, r->depth[0].format))
+        exit(EXIT_FAILURE);
     r->start_time = r->cpu_prev_frame = mu_time_now();
     nuklear_init(r);
 
@@ -1419,7 +1422,10 @@ bool renderer_frame(Renderer *r) {
             }
         }
 
-        pass_fire(r, cmd);
+        GPU_SCOPE(frame_prof, cmd, "3D cull and draw", VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT) {
+            renderer3d_record(&r->vk, &r->scene, cmd, &r->hdr_color[r->vk.swapchain.current_image],
+                               &r->depth[r->vk.swapchain.current_image]);
+        }
         post_pass(r, cmd);
         pass_smaa(r, cmd);
         pass_ldr_to_swapchain(r, cmd);
@@ -1448,6 +1454,7 @@ void renderer_destroy(Renderer *r) {
         capture_consume(r);
     }
     nuklear_shutdown(r);
+    renderer3d_destroy(&r->vk, &r->scene);
     capture_shutdown(r);
     forEach(i, MAX_SWAPCHAIN_IMAGES) {
         rt_destroy(&r->vk, &r->depth[i]);
