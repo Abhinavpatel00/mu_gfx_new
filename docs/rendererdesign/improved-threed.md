@@ -1,6 +1,43 @@
 # Improved 3D Renderer: Performance and Memory Design
 
-Status: **proposed design, not implemented or GPU-benchmarked**.
+Status: **GPU-driven static core implemented; full design and performance gates incomplete**.
+
+Implementation (GPU-only scope selected by the application author):
+- Generation-bearing mesh/material/instance handles and swap-remove dense instances.
+- Mesh-local half positions/UVs, octahedral SNORM16 normals, 16-byte GPU vertices;
+  native 16-bit indices when eligible, otherwise native 32-bit indices.
+- Stable geometry suballocations in the backend GPU pool; publication uploads are
+  owned until preparation records them. No per-mesh Vulkan buffer or upload wait.
+- 64-byte shading records (48-byte affine + vertex address/material/tint), separate
+  16-byte conservative spheres, 8-byte candidate references, 4-byte visible IDs.
+- Positive-determinant affine transforms including shear; cofactor normal transform.
+- Frame-slot resident tables, deduplicated dirty instance ranges and material masks;
+  unchanged scene records are not re-uploaded once all replicas are current.
+- Membership changes rebuild mesh/material/index-type batches. GPU frustum culling
+  atomically appends into candidate-sized batch ranges. Fixed 20-byte indirect
+  commands are reset each frame; empty batches retain zero instance counts.
+- One multi-draw per index-type group, split only at the device's indirect limit.
+  No CPU visibility or direct-rendering fallback. Camera and sun are application data.
+
+The application and shaders build, shared SPIR-V offsets/strides were inspected,
+SPIR-V validation passes, and the application completed timed eight-second launches,
+including an externally enabled Vulkan/synchronization validation run without a
+reported Vulkan error. These launches do not establish image correctness, retirement
+stress coverage, shutdown coverage, or performance. No new tests or benchmarks were
+run for this implementation; the old internal-layout readback test needs migration.
+
+Limits: bounded scene budgets allocated at creation, one shared geometry pool,
+one opaque color-only material pipeline, and one mesh section per mesh ID. Uploads
+currently use chunked vkCmdUpdateBuffer (driver-owned command-buffer upload storage),
+not a large-upload staging path. CPU sorting occurs only for topology/dirty changes,
+but library qsort scratch allocation is implementation-dependent. Meshoptimizer
+publication ordering, texture materials, shadows, LOD, occlusion, streaming, and
+renderer-managed final-use retirement are not implemented. Mesh range destruction
+is immediate and requires the caller to detach instances and complete all recorded
+and submitted uses; instance/material snapshots are frame-slot owned. The application
+integration is a small procedural example, not a production workload. The staged
+baseline comparisons below remain design history, not shipped fallback paths.
+
 
 This document reviews fukuna's existing 3D path and proposes a replacement for
 mu_gfx optimized for predictable CPU work, low memory use, and reduced data

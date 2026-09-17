@@ -571,6 +571,9 @@ void buffer_pool_free(BufferSlice slice);
 bool renderer_upload_buffer_to_slice(VkBackend *r, VkCommandBuffer cmd, BufferSlice dst_slice, ByteSpan data);
 BufferSlice renderer_upload_buffer(VkBackend *r, VkCommandBuffer cmd, ByteSpan data, VkDeviceSize dst_alignment);
 bool create_buffer(VkBackend *r, VkDeviceSize size, VkBufferUsageFlags usage, VmaMemoryUsage memory_usage, Buffer *out);
+/* Unmapped, device-preferred storage. Upload through transfer commands;
+   host visibility is not required. Uses the same destroy_buffer lifetime policy. */
+bool create_device_buffer(VkBackend *r, VkDeviceSize size, VkBufferUsageFlags usage, Buffer *out);
 void destroy_buffer(VkBackend *r, Buffer *buffer);
 bool rt_create(VkBackend *r, RenderTarget *rt, const RenderTargetSpec *spec);
 void rt_destroy(VkBackend *r, RenderTarget *rt);
