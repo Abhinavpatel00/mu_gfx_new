@@ -16,6 +16,8 @@ typedef uint32_t PipelineID;
 
 
 
+
+
 typedef struct Texture {
     VkImage       image;
     VkImageView   view;
@@ -427,7 +429,7 @@ typedef struct PassDesc {
     uint32_t              shader_read_count;
     RenderTarget *const  *shader_writes;     // storage image writes (GENERAL layout)
     uint32_t              shader_write_count;
-    PipelineID            pipeline;          // 1-based; 0 = caller binds later (e.g. ImGui)
+    PipelineID            pipeline;          // 1-based; 0 = caller binds later (e.g. Nuklear)
 } PassDesc;
 
 typedef struct CaptureState {
@@ -456,9 +458,27 @@ typedef struct CaptureState {
 
     bool inited;
 } CaptureState;
+typedef struct NuklearUi {
+    struct nk_context           context;
+    struct nk_font_atlas        atlas;
+    struct nk_draw_null_texture null_texture;
+    struct nk_buffer            commands;
+    struct nk_buffer            vertices;
+    struct nk_buffer            indices;
+    RenderTarget                font;
+    Buffer                      uploads[MAX_FRAMES_IN_FLIGHT];
+    VkPipeline                  pipeline;
+    uint32_t                    vertex_count;
+    uint32_t                    index_count;
+    uint32_t                    draw_count;
+    float                       width;
+    float                       height;
+} NuklearUi;
+
 struct Renderer {
     // ---- CPU profiling ----
-    double   cpu_frame_ns;      // total frame time (e.g., from glfwGetTime)
+    double   cpu_frame_ns;      // total frame time
+    uint64_t start_time;
     double   cpu_active_ns;     // time spent in engine work
     double   cpu_wait_ns;       // time waiting for GPU
     double   cpu_wait_accum_ns; // accumulated wait over several frames
@@ -484,7 +504,7 @@ struct Renderer {
     DeviceContext   devc;
 
     // window
-    GLFWwindow            *window;
+    RGFW_window           *window;
     VkSurfaceKHR           surface;
     VkAllocationCallbacks *vk_allocator_callbacks;
     DeviceInfo             info;
@@ -492,7 +512,7 @@ struct Renderer {
     TextureSystem texture_system;
 
     Bindless         bindless_system;
-    VkDescriptorPool imgui_descriptor_pool;
+    NuklearUi        ui;
     mu_id_pool       sampler_pool;
 
     // render targets (BIG = cold)
@@ -1434,52 +1454,6 @@ void vk_swapchain_recreate(VkDevice device, VkPhysicalDevice gpu, FlowSwapchain 
 
     if (old)
         vkDestroySwapchainKHR(device, old, NULL);
-}
-
-static PFN_vkVoidFunction imgui_vk_loader(const char *function_name, void *user_data) {
-    VkInstance instance = (VkInstance)user_data;
-    return vkGetInstanceProcAddr(instance, function_name);
-}
-
-void imgui_init(GLFWwindow *window, VkInstance instance, VkPhysicalDevice gpu, VkDevice device, uint32_t queue_family,
-                VkQueue queue, VkDescriptorPool imgui_pool, uint32_t min_image_count, uint32_t image_count,
-                VkFormat swapchain_format, VkFormat depth_format, VkImageUsageFlags swapchain_usage) {
-
-    igCreateContext(NULL);
-
-    ImGuiIO *io     = igGetIO_Nil();
-    io->IniFilename = NULL;
-    io->LogFilename = NULL;
-
-    igStyleColorsDark(NULL);
-
-    ImGui_ImplGlfw_InitForVulkan(window, true);
-
-    ImGui_ImplVulkan_LoadFunctions(VK_API_VERSION_1_3, imgui_vk_loader, instance);
-
-    ImGui_ImplVulkan_InitInfo info    = {0};
-    info.ApiVersion                   = VK_API_VERSION_1_3;
-    info.Instance                     = instance;
-    info.PhysicalDevice               = gpu;
-    info.Device                       = device;
-    info.QueueFamily                  = queue_family;
-    info.Queue                        = queue;
-    info.DescriptorPool               = imgui_pool;
-    info.MinImageCount                = min_image_count;
-    info.ImageCount                   = image_count;
-    info.UseDynamicRendering          = true;
-    info.PipelineInfoMain.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
-
-    info.PipelineInfoMain.PipelineRenderingCreateInfo = (VkPipelineRenderingCreateInfoKHR){
-        .sType                   = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO_KHR,
-        .colorAttachmentCount    = 1,
-        .pColorAttachmentFormats = &swapchain_format,
-        .depthAttachmentFormat   = depth_format,
-    };
-
-    info.PipelineInfoMain.SwapChainImageUsage = swapchain_usage;
-
-    ImGui_ImplVulkan_Init(&info);
 }
 
 static MU_INLINE VkImageAspectFlags get_image_aspect(VkFormat format) {
@@ -3509,7 +3483,7 @@ static void capture_consume(Renderer *r) {
     c->submit_value[slot] = 0;
 }
 
-// Call right after pass_imgui(), before the swapchain is transitioned
+// Call right after pass_nuklear(), before the swapchain is transitioned
 // to PRESENT_SRC. Handles the temporary TRANSFER_SRC layout ourselves.
 static void capture_record(Renderer *r, VkCommandBuffer cmd) {
     CaptureState *c = &r->capture;
@@ -3607,6 +3581,8 @@ static void capture_record(Renderer *r, VkCommandBuffer cmd) {
         c->screenshot_pending                              = false;
     }
 }
+#include "src/nuklear_renderer.inl"
+
 void renderer_create(Renderer *r, RendererDesc *desc) {
     TracyCZoneN(ctx, "renderer_create", 1);
     // Instance
@@ -3730,10 +3706,14 @@ void renderer_create(Renderer *r, RendererDesc *desc) {
         }
     }
 
-    glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
-    r->window = glfwCreateWindow(desc->width, desc->height, "Vulkan", NULL, NULL);
+    r->window = RGFW_createWindow("Vulkan", 0, 0, desc->width, desc->height, RGFW_windowCenter);
+    if (!r->window) {
+        log_error("[renderer] RGFW window creation failed");
+        exit(EXIT_FAILURE);
+    }
+    RGFW_window_setExitKey(r->window, RGFW_keyNULL);
 
-    VK_CHECK(glfwCreateWindowSurface(r->instance.instance, r->window, NULL, &r->surface));
+    VK_CHECK(RGFW_window_createSurface_Vulkan(r->window, r->instance.instance, &r->surface));
     //
     // 3. Pick Physical Device
     //
@@ -3742,7 +3722,7 @@ void renderer_create(Renderer *r, RendererDesc *desc) {
 
         if (r->devc.physical_device == VK_NULL_HANDLE) {
             log_error("No GPU found");
-            return;
+            exit(EXIT_FAILURE);
         }
 
         vkGetPhysicalDeviceProperties(r->devc.physical_device, &r->info.properties);
@@ -3909,6 +3889,7 @@ void renderer_create(Renderer *r, RendererDesc *desc) {
 
     r->current_frame     = 0;
     r->cpu_prev_frame    = mu_time_now();
+    r->start_time        = r->cpu_prev_frame;
     r->cpu_frame_ns      = 0.0;
     r->cpu_active_ns     = 0.0;
     r->cpu_wait_ns       = 0.0;
@@ -3924,7 +3905,7 @@ void renderer_create(Renderer *r, RendererDesc *desc) {
     vk_cmd_create_pool(r->devc.device, r->devc.graphics_queue_index, true, false, &r->one_time_gfx_pool);
 
     int fb_w, fb_h;
-    glfwGetFramebufferSize(r->window, &fb_w, &fb_h);
+    RGFW_window_getSizeInPixels(r->window, &fb_w, &fb_h);
     //  descriptor_layout_cache_init(&r->descriptor_layout_cache);
     // pipeline_layout_cache_init(&r->pipeline_layout_cache);
     r->devc.pipeline_cache =
@@ -4064,22 +4045,6 @@ void renderer_create(Renderer *r, RendererDesc *desc) {
     allocatorInfo.pVulkanFunctions = &vulkanFunctions;
 
     vmaCreateAllocator(&allocatorInfo, &r->devc.vmaallocator);
-    VkDescriptorPoolSize pool_sizes[] = {
-        {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, IMGUI_COMBINED_IMAGE_COUNT},
-        {VK_DESCRIPTOR_TYPE_SAMPLER, IMGUI_SAMPLER_COUNT},
-        {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, IMGUI_UBO_COUNT},
-        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, IMGUI_SSBO_COUNT},
-        {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, IMGUI_SAMPLED_IMAGE_COUNT},
-    };
-    VkDescriptorPoolCreateInfo pool_info = {
-        .sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-        .flags         = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,
-        .maxSets       = 1000,
-        .poolSizeCount = ARRAY_COUNT(pool_sizes),
-        .pPoolSizes    = pool_sizes,
-    };
-
-    vkCreateDescriptorPool(r->devc.device, &pool_info, NULL, &r->imgui_descriptor_pool);
     VkFormat                depth_format = pick_depth_format(r->devc.physical_device);
     VkFormat                hdr_format   = VK_FORMAT_R16G16B16A16_SFLOAT;
     FlowSwapchainCreateInfo sci          = {.surface         = r->surface,
@@ -4170,9 +4135,7 @@ void renderer_create(Renderer *r, RendererDesc *desc) {
 
                                          .mip_count  = 1,
                                          .debug_name = "smaa_weights"};
-    imgui_init(r->window, r->instance.instance, r->devc.physical_device, r->devc.device, r->devc.graphics_queue_index,
-               r->devc.graphics_queue, r->imgui_descriptor_pool, r->swapchain.image_count, r->swapchain.image_count,
-               VK_FORMAT_B8G8R8A8_SRGB, depth_format, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+
 
 #include "external/smaa/Textures/AreaTex.h"
 
@@ -4483,26 +4446,41 @@ void renderer_create(Renderer *r, RendererDesc *desc) {
 
 static Renderer *g_renderer = NULL;
 
-void graphics_init(void) {
+bool graphics_init(bool use_wayland) {
+#ifndef RGFW_WAYLAND
+    if (use_wayland) {
+        log_error("[renderer] Wayland support is not enabled in this build");
+        return false;
+    }
+#endif
     VK_CHECK(volkInitialize());
-    if (!is_instance_extension_supported("VK_KHR_wayland_surface"))
-        glfwInitHint(GLFW_PLATFORM, GLFW_PLATFORM_X11);
-    else
-        glfwInitHint(GLFW_PLATFORM, GLFW_PLATFORM_WAYLAND);
-    glfwInit();
+    if (RGFW_init("mu_gfx", RGFW_initVulkan | (use_wayland ? 0 : RGFW_initX11)) != 0) {
+        log_error("[renderer] RGFW initialization failed");
+        return false;
+    }
+    if (use_wayland && !RGFW_usingWayland()) {
+        log_error("[renderer] Could not connect to the requested Wayland display");
+        RGFW_deinit();
+        return false;
+    }
     const char *dev_exts[] = {VK_KHR_SWAPCHAIN_EXTENSION_NAME, VK_EXT_ROBUSTNESS_2_EXTENSION_NAME};
 
-    uint32_t     glfw_ext_count = 0;
-    const char **glfw_exts      = glfwGetRequiredInstanceExtensions(&glfw_ext_count);
+    size_t       platform_ext_count = 0;
+    const char **platform_exts = RGFW_getRequiredInstanceExtensions_Vulkan(&platform_ext_count);
+    if (!platform_exts || !platform_ext_count) {
+        log_error("[renderer] RGFW Vulkan instance extensions unavailable");
+        RGFW_deinit();
+        return false;
+    }
 
     RendererDesc desc = {
         .app_name            = "My Renderer",
         .instance_layers     = NULL,
-        .instance_extensions = glfw_exts,
+        .instance_extensions = platform_exts,
         .device_extensions   = dev_exts,
 
         .instance_layer_count        = 0,
-        .instance_extension_count    = glfw_ext_count,
+        .instance_extension_count    = (uint32_t)platform_ext_count,
         .device_extension_count      = 2,
         .enable_gpu_based_validation = false,
         .enable_validation           = true,
@@ -4539,8 +4517,10 @@ void graphics_init(void) {
     g_renderer = malloc(sizeof(*g_renderer));
     memset(g_renderer, 0, sizeof(*g_renderer)); // zero-value = safe defaults everywhere
     MU_SCOPE_TIMER("Renderer Creation") { renderer_create(g_renderer, &desc); }
+    nuklear_init(g_renderer);
 
     // gfx_pipelines();
+    return true;
 }
 FORCE_INLINE bool vk_swapchain_acquire(VkDevice device, FlowSwapchain *sc, VkSemaphore image_available, VkFence fence,
                                        uint64_t timeout) {
@@ -4698,12 +4678,13 @@ static MU_INLINE bool frame_start(Renderer *r) {
     r->current_frame   = (r->current_frame + 1) % MAX_FRAMES_IN_FLIGHT;
 
     int fb_w, fb_h;
-    glfwGetFramebufferSize(r->window, &fb_w, &fb_h);
+    RGFW_window_getSizeInPixels(r->window, &fb_w, &fb_h);
 
-    if (fb_w == 0 || fb_h == 0) {
+    if (fb_w == 0 || fb_h == 0 || RGFW_window_isMinimized(r->window)) {
         uint64_t wait_start = mu_time_now();
-        glfwWaitEvents();
+        RGFW_waitForEvent(100);
         r->cpu_wait_accum_ns += (double)(mu_time_now() - wait_start);
+        TracyCZoneEnd(ctx);
         return false;
     }
     r->swapchain.needs_recreate |= fb_w != (int)r->swapchain.extent.width || fb_h != (int)r->swapchain.extent.height;
@@ -4789,7 +4770,7 @@ static void update_global_data(Renderer *r) {
     glm_mat4_identity(data.inv_projection);
     glm_mat4_identity(data.inv_viewproj);
 
-    data.time             = (float)glfwGetTime();
+    data.time             = (float)((double)(mu_time_now() - r->start_time) / mu_time_freq());
     data.delta_time       = (float)((double)r->cpu_frame_ns / 1000000000.0);
     data.frame_count      = r->frame_count++;
     data.screen_params[0] = (float)r->swapchain.extent.width;
@@ -4873,233 +4854,7 @@ PUSH_CONSTANT(BlendPush, uint32_t color_tex; uint32_t weight_tex; uint32_t sampl
 
 PUSH_CONSTANT(WeightPush, uint32_t edge_tex; uint32_t area_tex; uint32_t search_tex; uint32_t sampler_id;);
 
-static void render_gpu_profiler_ui(Renderer *r) {
-    if (!r->enable_graphics_profiler)
-        return;
-
-    ImGuiIO *io = igGetIO_Nil();
-    if (!g_gpu_profiler_ui.open) {
-        ImGuiIO *io = igGetIO_Nil();
-        if (igBegin("GPU Profiler (Hidden)", NULL,
-                    ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoMove)) {
-            igTextColored((ImVec4_c){0.3f, 0.8f, 1.0f, 1.0f}, "Profiler");
-            igSameLine(0.0f, 10.0f);
-            if (igButton("Show", (ImVec2_c){40, 20})) {
-                g_gpu_profiler_ui.open = true;
-            }
-        }
-        igEnd();
-        return;
-    }
-
-    if (!g_gpu_profiler_ui.open)
-        return;
-    igSetNextWindowSize((ImVec2_c){720.0f, 520.0f}, ImGuiCond_FirstUseEver);
-    if (!igBegin("GPU Profiler", &g_gpu_profiler_ui.open, ImGuiWindowFlags_None)) {
-        igEnd();
-        return;
-    }
-
-    igTextColored((ImVec4_c){0.3f, 0.9f, 0.5f, 1.0f}, "GPU Timing Profiler");
-    igSameLine(0.0f, 20.0f);
-    igCheckbox("Pause", &g_gpu_profiler_ui.paused);
-    if (igButton("CLOSE", (ImVec2_c){40, 20})) {
-        g_gpu_profiler_ui.open = false;
-    }
-
-    igSameLine(0.0f, 15.0f);
-    igCheckbox("Pipeline Stats", &g_gpu_profiler_ui.show_pipeline_stats);
-    igSameLine(0.0f, 15.0f);
-    if (igButton("Reset Min/Max", (ImVec2_c){0, 0})) {
-        for (uint32_t i = 0; i < MAX_RECORDED_PASSES; i++) {
-            g_gpu_profiler_ui.pass_stats[i].min_ms = g_gpu_profiler_ui.pass_stats[i].time_ms;
-            g_gpu_profiler_ui.pass_stats[i].max_ms = g_gpu_profiler_ui.pass_stats[i].time_ms;
-        }
-    }
-
-    igSeparator();
-
-    double frame_ms         = ns_to_ms(r->cpu_frame_ns);
-    double active_ms        = ns_to_ms(r->cpu_active_ns);
-    double wait_ms          = ns_to_ms(r->cpu_wait_ns);
-    double wait_avg_ms      = ns_to_ms(r->cpu_wait_accum_ns);
-    double gpu_ms           = g_gpu_profiler_ui.total_gpu_time_ms;
-    double frame_budget_pct = frame_ms > 0.0 ? gpu_ms / frame_ms * 100.0 : 0.0;
-    if (frame_budget_pct > 100.0)
-        frame_budget_pct = 100.0;
-
-    igTextColored((ImVec4_c){0.3f, 0.8f, 1.0f, 1.0f}, "Frame Metrics");
-    if (igBeginTable("FrameMetrics", 3, ImGuiTableFlags_SizingStretchProp, (ImVec2_c){0.0f, 0.0f}, 0.0f)) {
-        igTableSetupColumn("Metric", ImGuiTableColumnFlags_WidthStretch, 1.0f, 0);
-        igTableSetupColumn("Current", ImGuiTableColumnFlags_WidthFixed, 105.0f, 0);
-        igTableSetupColumn("Details", ImGuiTableColumnFlags_WidthStretch, 1.0f, 0);
-        igTableHeadersRow();
-
-        igTableNextRow(0, 0.0f);
-        igTableSetColumnIndex(0);
-        igText("Frame time");
-        igTableSetColumnIndex(1);
-        igText("%.3f ms", frame_ms);
-        igTableSetColumnIndex(2);
-        igText("%.1f FPS", io ? io->Framerate : 0.0f);
-
-        igTableNextRow(0, 0.0f);
-        igTableSetColumnIndex(0);
-        igText("CPU active time");
-        igTableSetColumnIndex(1);
-        igText("%.3f ms", active_ms);
-        igTableSetColumnIndex(2);
-        igText("%.1f%% of frame", frame_ms > 0.0 ? active_ms / frame_ms * 100.0 : 0.0);
-
-        igTableNextRow(0, 0.0f);
-        igTableSetColumnIndex(0);
-        igText("CPU waiting time");
-        igTableSetColumnIndex(1);
-        igText("%.3f ms", wait_ms);
-        igTableSetColumnIndex(2);
-        igText("EMA %.3f ms", wait_avg_ms);
-
-        igTableNextRow(0, 0.0f);
-        igTableSetColumnIndex(0);
-        igText("GPU frame time");
-        igTableSetColumnIndex(1);
-        igText("%.3f ms", gpu_ms);
-        igTableSetColumnIndex(2);
-        igText("%.1f%% of CPU frame", frame_budget_pct);
-
-        igTableNextRow(0, 0.0f);
-        igTableSetColumnIndex(0);
-        igText("ImGui workload");
-        igTableSetColumnIndex(1);
-        igText("%d windows", io ? io->MetricsActiveWindows : 0);
-        igTableSetColumnIndex(2);
-        igText("%d vertices | %d indices", io ? io->MetricsRenderVertices : 0, io ? io->MetricsRenderIndices : 0);
-        igEndTable();
-    }
-
-    igSpacing();
-
-    if (g_gpu_profiler_ui.show_pipeline_stats) {
-        uint64_t total_vs         = 0;
-        uint64_t total_fs         = 0;
-        uint64_t total_primitives = 0;
-        for (uint32_t i = 0; i < g_gpu_profiler_ui.pass_count; i++) {
-            total_vs += g_gpu_profiler_ui.pass_stats[i].vs_invocations;
-            total_fs += g_gpu_profiler_ui.pass_stats[i].fs_invocations;
-            total_primitives += g_gpu_profiler_ui.pass_stats[i].primitives;
-        }
-
-        char vs_buf[32];
-        char fs_buf[32];
-        char primitives_buf[32];
-        profiler_format_count(vs_buf, sizeof(vs_buf), total_vs);
-        profiler_format_count(fs_buf, sizeof(fs_buf), total_fs);
-        profiler_format_count(primitives_buf, sizeof(primitives_buf), total_primitives);
-        igText("Pipeline statistics");
-        igSameLine(0.0f, 15.0f);
-        igText("Vertices: %s | Fragments: %s | Clipping primitives: %s", vs_buf, fs_buf, primitives_buf);
-        igSpacing();
-    }
-
-    igText("Total GPU Time: ");
-    igSameLine(0.0f, 0.0f);
-    igTextColored((ImVec4_c){1.0f, 0.85f, 0.3f, 1.0f}, "%.3f ms", g_gpu_profiler_ui.total_gpu_time_ms);
-    igSameLine(0.0f, 15.0f);
-    igText("(Avg: %.3f ms)", g_gpu_profiler_ui.avg_total_gpu_time_ms);
-    igSameLine(0.0f, 25.0f);
-    igText("FPS: ");
-    igSameLine(0.0f, 0.0f);
-    igTextColored((ImVec4_c){0.4f, 0.8f, 1.0f, 1.0f}, "%.1f", io ? io->Framerate : 0.0f);
-
-    char overlay_buf[64];
-    snprintf(overlay_buf, sizeof(overlay_buf), "Total: %.3f ms", g_gpu_profiler_ui.total_gpu_time_ms);
-    float max_graph_val = (float)g_gpu_profiler_ui.avg_total_gpu_time_ms * 1.5f;
-    if (max_graph_val < 1.0f)
-        max_graph_val = 1.0f;
-
-    igPlotLines_FloatPtr("##GpuTotalTimeGraph", g_gpu_profiler_ui.total_history, GPU_PROF_HISTORY_SIZE,
-                         (int)g_gpu_profiler_ui.total_history_idx, overlay_buf, 0.0f, max_graph_val,
-                         (ImVec2_c){-1.0f, 55.0f}, sizeof(float));
-
-    igSpacing();
-
-    int             table_cols = g_gpu_profiler_ui.show_pipeline_stats ? 8 : 5;
-    ImGuiTableFlags table_flags =
-        ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchProp;
-
-    if (igBeginTable("GpuPassTable", table_cols, table_flags, (ImVec2_c){0.0f, 0.0f}, 0.0f)) {
-        igTableSetupColumn("Pass Name", ImGuiTableColumnFlags_WidthStretch, 2.0f, 0);
-        igTableSetupColumn("Time (ms)", ImGuiTableColumnFlags_WidthFixed, 80.0f, 0);
-        igTableSetupColumn("Avg (ms)", ImGuiTableColumnFlags_WidthFixed, 80.0f, 0);
-        igTableSetupColumn("Min / Max (ms)", ImGuiTableColumnFlags_WidthFixed, 115.0f, 0);
-        igTableSetupColumn("% Total", ImGuiTableColumnFlags_WidthStretch, 2.5f, 0);
-        if (g_gpu_profiler_ui.show_pipeline_stats) {
-            igTableSetupColumn("Vert Shaders", ImGuiTableColumnFlags_WidthFixed, 95.0f, 0);
-            igTableSetupColumn("Frag Shaders", ImGuiTableColumnFlags_WidthFixed, 95.0f, 0);
-            igTableSetupColumn("Clip Primitives", ImGuiTableColumnFlags_WidthFixed, 105.0f, 0);
-        }
-        igTableHeadersRow();
-
-        for (uint32_t i = 0; i < g_gpu_profiler_ui.pass_count; i++) {
-            GpuPassStats *ps = &g_gpu_profiler_ui.pass_stats[i];
-            igTableNextRow(0, 0.0f);
-
-            igTableSetColumnIndex(0);
-            igText("%s", ps->name);
-
-            igTableSetColumnIndex(1);
-            if (ps->time_ms < 0.1) {
-                igText("%.1f us", ps->time_ms * 1000.0);
-            } else {
-                igText("%.3f ms", ps->time_ms);
-            }
-
-            igTableSetColumnIndex(2);
-            igText("%.3f", ps->avg_ms);
-
-            igTableSetColumnIndex(3);
-            igText("%.3f / %.3f", ps->min_ms, ps->max_ms);
-
-            igTableSetColumnIndex(4);
-            float pct = (g_gpu_profiler_ui.total_gpu_time_ms > 0.0)
-                            ? (float)(ps->time_ms / g_gpu_profiler_ui.total_gpu_time_ms)
-                            : 0.0f;
-            if (pct > 1.0f)
-                pct = 1.0f;
-            char pct_buf[32];
-            snprintf(pct_buf, sizeof(pct_buf), "%.1f%%", pct * 100.0f);
-            igProgressBar(pct, (ImVec2_c){-1.0f, 0.0f}, pct_buf);
-
-            if (g_gpu_profiler_ui.show_pipeline_stats) {
-                igTableSetColumnIndex(5);
-                if (ps->vs_invocations >= 1000000) {
-                    igText("%.2f M", (double)ps->vs_invocations / 1000000.0);
-                } else if (ps->vs_invocations >= 1000) {
-                    igText("%.1f k", (double)ps->vs_invocations / 1000.0);
-                } else {
-                    igText("%llu", (unsigned long long)ps->vs_invocations);
-                }
-
-                igTableSetColumnIndex(6);
-                char fs_buf[32];
-                profiler_format_count(fs_buf, sizeof(fs_buf), ps->fs_invocations);
-                igText("%s", fs_buf);
-
-                igTableSetColumnIndex(7);
-                char primitives_buf[32];
-                profiler_format_count(primitives_buf, sizeof(primitives_buf), ps->primitives);
-                igText("%s", primitives_buf);
-            }
-        }
-        igEndTable();
-    }
-
-    igSeparator();
-    igTextDisabled("Timestamp Period: %.2f ns | Query Pool Size: %d passes",
-                   (double)r->info.properties.limits.timestampPeriod, MAX_GPU_PASSES);
-
-    igEnd();
-}
+#include "src/nuklear_profiler.inl"
 
 static void post_pass(Renderer *r, VkCommandBuffer cmd) {
     uint32_t image = r->swapchain.current_image;
@@ -5154,7 +4909,7 @@ static void pass_fire(Renderer *r, VkCommandBuffer cmd) {
         FirePush push = {
             .width  = r->swapchain.extent.width,
             .height = r->swapchain.extent.height,
-            .time   = (float)glfwGetTime(),
+            .time   = (float)((double)(mu_time_now() - r->start_time) / mu_time_freq()),
             .pad    = 0.0f,
         };
 
@@ -5289,127 +5044,141 @@ static void pass_ldr_to_swapchain(Renderer *r, VkCommandBuffer cmd) {
     }
 }
 
-static void pass_imgui(Renderer *r, VkCommandBuffer cmd) {
-    GpuProfiler *frame_prof = &r->gpuprofiler[r->current_frame];
-    GPU_SCOPE(frame_prof, cmd, "ImGui Render", VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT) {
-        uint32_t image = r->swapchain.current_image;
+#include "src/nuklear_pass.inl"
 
-        PassAttachment color = {.target = NULL, .swapchain_view = r->swapchain.image_views[image]};
-
-        begin_pass(r, cmd, &(PassDesc){.colors = &color, .color_count = 1});
-
-        ImGui_ImplVulkan_RenderDrawData(igGetDrawData(), cmd, VK_NULL_HANDLE);
-
-        end_pass(cmd);
-    }
-}
-
-FORCE_INLINE void imgui_shutdown(void) {
-    ImGui_ImplVulkan_Shutdown();
-    ImGui_ImplGlfw_Shutdown();
-    igDestroyContext(NULL);
-}
-
-FORCE_INLINE void imgui_begin_frame(void) {
-    ImGui_ImplVulkan_NewFrame();
-    ImGui_ImplGlfw_NewFrame();
-    igNewFrame();
-}
-static void render_capture_ui(Renderer *r) {
-    CaptureState *c = &r->capture;
-    if (!c->inited)
-        return;
-
-    static bool show = true;
-
-    // Small floating window bottom-right-ish; user can move it.
-    igSetNextWindowPos((ImVec2_c){10.0f, 10.0f}, ImGuiCond_FirstUseEver, (ImVec2_c){0, 0});
-    igSetNextWindowSize((ImVec2_c){260.0f, 0.0f}, ImGuiCond_FirstUseEver);
-
-    if (!igBegin("Capture", &show, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoCollapse)) {
-        igEnd();
-        return;
-    }
-
-    // ---- Screenshot ----
-    if (igButton("Screenshot", (ImVec2_c){-1.0f, 0.0f})) {
-        char path[256];
-        snprintf(path, sizeof(path), "screenshot_%llu.png", (unsigned long long)(glfwGetTime() * 1000.0));
-        if (capture_take_screenshot(r, path)) {
-            log_info("[ui] screenshot queued: %s", path);
-        } else {
-            log_warn("[ui] screenshot request rejected");
-        }
-    }
-
-    igSeparator();
-
-    // ---- Recording ----
-    if (!c->recording) {
-        if (igButton("Start Recording", (ImVec2_c){-1.0f, 0.0f})) {
-            char path[256];
-            snprintf(path, sizeof(path), "recording_%llu.mp4", (unsigned long long)glfwGetTime());
-            if (!capture_start_video(r, path, 60)) {
-                log_error("[ui] failed to start recording");
+static void platform_poll_events(Renderer *r) {
+    struct nk_context *ctx = &r->ui.context;
+    RGFW_event event;
+    nk_input_begin(ctx);
+    while (RGFW_checkEvent(&event)) {
+        if (event.common.win != r->window)
+            continue;
+        switch (event.type) {
+        case RGFW_windowClose:
+            break;
+        case RGFW_mouseMotion:
+            nk_input_motion(ctx, event.mouse.x, event.mouse.y);
+            break;
+        case RGFW_mouseButtonPressed:
+        case RGFW_mouseButtonReleased: {
+            enum nk_buttons button;
+            switch (event.button.value) {
+            case RGFW_mouseLeft: button = NK_BUTTON_LEFT; break;
+            case RGFW_mouseMiddle: button = NK_BUTTON_MIDDLE; break;
+            case RGFW_mouseRight: button = NK_BUTTON_RIGHT; break;
+            default: continue;
             }
+            nk_input_button(ctx, button, (int)ctx->input.mouse.pos.x, (int)ctx->input.mouse.pos.y,
+                            event.type == RGFW_mouseButtonPressed);
+            break;
         }
-    } else {
-        ImVec4_c rec_col = {1.0f, 0.3f, 0.3f, 1.0f};
-        igTextColored(rec_col, "● REC  %llu frames", (unsigned long long)c->frames_written);
-
-        if (igButton("Stop Recording", (ImVec2_c){-1.0f, 0.0f})) {
-            capture_stop_video(r);
+        case RGFW_mouseScroll:
+            nk_input_scroll(ctx, nk_vec2(event.delta.x, event.delta.y));
+            break;
+        case RGFW_keyChar:
+            nk_input_unicode(ctx, event.keyChar.value);
+            break;
+        case RGFW_windowFocusOut:
+            for (int key = 0; key < NK_KEY_MAX; ++key)
+                nk_input_key(ctx, (enum nk_keys)key, nk_false);
+            for (int button = 0; button < NK_BUTTON_MAX; ++button)
+                nk_input_button(ctx, (enum nk_buttons)button, (int)ctx->input.mouse.pos.x,
+                                (int)ctx->input.mouse.pos.y, nk_false);
+            break;
+        case RGFW_keyPressed:
+        case RGFW_keyReleased: {
+            bool down = event.type == RGFW_keyPressed;
+            bool ctrl = (event.key.mod & RGFW_modControl) != 0;
+            nk_input_key(ctx, NK_KEY_SHIFT, (event.key.mod & RGFW_modShift) != 0);
+            nk_input_key(ctx, NK_KEY_CTRL, ctrl);
+            switch (event.key.value) {
+            case RGFW_keyDelete: nk_input_key(ctx, NK_KEY_DEL, down); break;
+            case RGFW_keyReturn: nk_input_key(ctx, NK_KEY_ENTER, down); break;
+            case RGFW_keyTab: nk_input_key(ctx, NK_KEY_TAB, down); break;
+            case RGFW_keyBackSpace: nk_input_key(ctx, NK_KEY_BACKSPACE, down); break;
+            case RGFW_keyUp: nk_input_key(ctx, NK_KEY_UP, down); break;
+            case RGFW_keyDown: nk_input_key(ctx, NK_KEY_DOWN, down); break;
+            case RGFW_keyLeft:
+                nk_input_key(ctx, NK_KEY_LEFT, down && !ctrl);
+                nk_input_key(ctx, NK_KEY_TEXT_WORD_LEFT, down && ctrl);
+                break;
+            case RGFW_keyRight:
+                nk_input_key(ctx, NK_KEY_RIGHT, down && !ctrl);
+                nk_input_key(ctx, NK_KEY_TEXT_WORD_RIGHT, down && ctrl);
+                break;
+            case RGFW_keyHome:
+                nk_input_key(ctx, NK_KEY_TEXT_START, down);
+                nk_input_key(ctx, NK_KEY_SCROLL_START, down);
+                break;
+            case RGFW_keyEnd:
+                nk_input_key(ctx, NK_KEY_TEXT_END, down);
+                nk_input_key(ctx, NK_KEY_SCROLL_END, down);
+                break;
+            case RGFW_keyPageUp: nk_input_key(ctx, NK_KEY_SCROLL_UP, down); break;
+            case RGFW_keyPageDown: nk_input_key(ctx, NK_KEY_SCROLL_DOWN, down); break;
+            case RGFW_keyC: nk_input_key(ctx, NK_KEY_COPY, down && ctrl); break;
+            case RGFW_keyV: nk_input_key(ctx, NK_KEY_PASTE, down && ctrl); break;
+            case RGFW_keyX: nk_input_key(ctx, NK_KEY_CUT, down && ctrl); break;
+            case RGFW_keyZ: nk_input_key(ctx, NK_KEY_TEXT_UNDO, down && ctrl); break;
+            case RGFW_keyY: nk_input_key(ctx, NK_KEY_TEXT_REDO, down && ctrl); break;
+            case RGFW_keyA: nk_input_key(ctx, NK_KEY_TEXT_SELECT_ALL, down && ctrl); break;
+            default: break;
+            }
+            if (!down || event.key.repeat || ctrl || ctx->text_edit.active)
+                break;
+            if (event.key.value == RGFW_keyR) {
+                char path[256];
+                snprintf(path, sizeof(path), "screenshot_%llu.png",
+                         (unsigned long long)(mu_time_now() * 1000.0 / mu_time_freq()));
+                capture_take_screenshot(r, path);
+            } else if (event.key.value == RGFW_keyF9) {
+                if (r->capture.recording) {
+                    capture_stop_video(r);
+                } else {
+                    char path[256];
+                    snprintf(path, sizeof(path), "recording_%llu.mp4",
+                             (unsigned long long)(mu_time_now() / mu_time_freq()));
+                    capture_start_video(r, path, 60);
+                }
+            }
+            break;
+        }
+        default: break;
         }
     }
-
-    igSeparator();
-    igTextDisabled("%ux%u | %d slots | bgra=%d", c->width, c->height, CAPTURE_SLOTS, (int)c->src_is_bgra);
-    igTextDisabled("F = shot   F9 = record");
-
-    igEnd();
+    nk_input_end(ctx);
+    int width, height;
+    RGFW_window_getSize(r->window, &width, &height);
+    r->ui.width  = (float)width;
+    r->ui.height = (float)height;
 }
-int main() {
 
-
-
-    graphics_init();
+int main(int argc, char **argv) {
+    bool use_wayland = false;
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "wayland") == 0 || strcmp(argv[i], "--wayland") == 0)
+            use_wayland = true;
+        else if (strcmp(argv[i], "x11") == 0 || strcmp(argv[i], "--x11") == 0)
+            use_wayland = false;
+        else {
+            fprintf(stderr, "Usage: %s [x11|wayland]\n", argv[0]);
+            return EXIT_FAILURE;
+        }
+    }
+    if (!graphics_init(use_wayland))
+        return EXIT_FAILURE;
     dmon_init();
 
     g_source_watch_id = dmon_watch("shaders", watch_callback, DMON_WATCHFLAGS_RECURSIVE, g_renderer);
 
     dmon_watch("compiledshaders", watch_callback, DMON_WATCHFLAGS_RECURSIVE, g_renderer);
     // Specify your shader directory here
-    while (!glfwWindowShouldClose(g_renderer->window)) {
+    while (!RGFW_window_shouldClose(g_renderer->window)) {
 
         TracyCFrameMark;
-        glfwPollEvents();
-        // R → screenshot
-        static bool shot_held = false;
-        if (glfwGetKey(g_renderer->window, GLFW_KEY_R) == GLFW_PRESS) {
-            if (!shot_held) {
-                char path[256];
-                snprintf(path, sizeof(path), "screenshot_%llu.png", (unsigned long long)(glfwGetTime() * 1000.0));
-                capture_take_screenshot(g_renderer, path);
-                shot_held = true;
-            }
-        } else
-            shot_held = false;
-
-        // F9 → toggle recording
-        static bool rec_held = false;
-        if (glfwGetKey(g_renderer->window, GLFW_KEY_F9) == GLFW_PRESS) {
-            if (!rec_held) {
-                if (!g_renderer->capture.recording) {
-                    char path[256];
-                    snprintf(path, sizeof(path), "recording_%llu.mp4", (unsigned long long)glfwGetTime());
-                    capture_start_video(g_renderer, path, 60);
-                } else {
-                    capture_stop_video(g_renderer);
-                }
-                rec_held = true;
-            }
-        } else
-            rec_held = false;
+        platform_poll_events(g_renderer);
+        if (RGFW_window_shouldClose(g_renderer->window))
+            break;
 
         pipeline_rebuild(g_renderer);
         delete_queue_tick(g_renderer);
@@ -5417,7 +5186,6 @@ int main() {
             continue; // swapchain out-of-date / minimized: nothing to record
         update_global_data(g_renderer);
 
-        imgui_begin_frame();
         Renderer *renderer = g_renderer;
 
         Renderer       *r          = g_renderer;
@@ -5455,8 +5223,7 @@ int main() {
         pass_ldr_to_swapchain(r, cmd);
         render_gpu_profiler_ui(r);
         render_capture_ui(r);
-        igRender();
-        pass_imgui(r, cmd);
+        pass_nuklear(r, cmd);
         capture_record(r, cmd);
         image_transition_swapchain(r, cmd, &r->swapchain, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
                                    VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, 0);
@@ -5471,9 +5238,14 @@ int main() {
     vkDeviceWaitIdle(g_renderer->devc.device);
     delete_queue_drain(g_renderer);
 
+    nuklear_shutdown(g_renderer);
     capture_shutdown(g_renderer);
     dmon_deinit();
     pipeline_cache_save(g_renderer->devc.device, g_renderer->devc.physical_device, g_renderer->devc.pipeline_cache,
                         "pipeline_cache.bin");
+    vk_swapchain_destroy(g_renderer->devc.device, &g_renderer->swapchain, &g_renderer->texture_system.id_pool);
+    vkDestroySurfaceKHR(g_renderer->instance.instance, g_renderer->surface, NULL);
+    RGFW_window_close(g_renderer->window);
+    RGFW_deinit();
     return 0;
 }
