@@ -245,3 +245,85 @@ Proposed modules, created incrementally rather than as empty scaffolding:
 
 No general scene hierarchy is required initially: the game computes world
 transforms; imported models retain immutable internal node transforms.
+
+## 6. Resource and scene API
+
+**Specification only.** These types/functions do not exist yet. Tables describe
+signatures and contracts, not a compilable header. Implement only the milestone
+subset with full definitions and tests; do not add empty implementations.
+
+### 6.1 Common representation and defaults
+
+All array views use custom mu spans, passed by value. Typed span names below
+mean read-only element views generated through the shared mu primitive. The
+current renderer has a local `ByteSpan`, not a confirmed shared typed-span API.
+Promote/consolidate it in external/mu when introducing typed spans; never add a
+competing local span definition. `ByteSpan` counts bytes; typed spans count
+elements. If `GpuRange` is introduced later, pass it by value too; do not expose
+allocator ownership as a render-API parameter.
+
+| Proposed type | Fields/meaning |
+|---|---|
+| `MeshId`, `MaterialId`, `InstanceId`, `ModelId` | Distinct generation-bearing handle types, zero invalid |
+| `Transform3D` | cglm-compatible position, quaternion `(x,y,z,w)`, positive three-axis scale |
+| `Bounds3D` | Minimum/maximum corners; descriptor bounds are mesh-local |
+| `MeshVertex` | Float position, normal, UV initially; establish a tested packing boundary later |
+| `MeshSection` | First index, index count, material slot; no GPU address |
+| `MeshDesc` | Read-only vertex/index/section spans and local bounds |
+| `MaterialDesc` | Linear base-color factor, roughness, metallic, emissive factor, texture IDs, alpha mode/cutoff, double-sided flag |
+| `InstanceDesc` | Mesh, transform, material-binding span, linear tint, visibility/shadow flags |
+| `InstanceSnapshot` | Copied mesh/transform/tint/flags, not a mutable storage pointer |
+| `TransformUpdate` | Instance ID plus transform for batched updates |
+
+Initial indices are `uint32_t`; one vertex layout and triangle topology keep the
+API narrow. Mesh sections identify material slots, not owning material objects.
+An instance supplies one valid material per referenced slot. Mesh data is copied
+at creation; later mutation of caller arrays has no effect. Empty geometry emits
+no instance rather than a partially valid mesh resource.
+
+`transform3d_identity()` returns zero position, identity quaternion, unit scale.
+`material_desc_default()` returns white, rough nonmetallic opaque material,
+no emission, and documented fallback texture references. Choose and document a
+single missing-texture sentinel at integration; do not assume existing zero and
+`UINT32_MAX` conventions are interchangeable. `instance_desc_default()` supplies
+identity transform, white tint, visible/casts-shadow flags; mesh and material
+bindings remain mandatory. Zero-initialized transforms are not identity.
+
+Geometry-generated normals must be finite and normalized. Initially reject
+nonpositive instance scales at the scene boundary; mirrored imports are baked
+with corrected winding or explicitly rejected. Normal matrices use inverse
+transpose for nonuniform scale. Mesh bounds and material-slot invariants are
+checked at preparation/creation boundaries, not reconstructed inside draw loops.
+
+### 6.2 Shared resource lifetime policy
+
+Application ownership is explicit. Scene membership does not retain resources.
+Resources must outlive attached instances, prepared packets, recorded commands,
+and submitted GPU uses. Destruction is immediate. Detach future scene uses, then
+wait for final use or enqueue destruction through the optional deletion queue.
+Do not hide GPU waits/refcounts in setters. See section 12 for publication order.
+
+| Proposed signature | Result and contract |
+|---|---|
+| `bool render_resources_init(RenderResources *resources, Renderer *backend, const ResourceLimits *limits)` | Initialization failure checked immediately; caller owns system |
+| `void render_resources_shutdown(RenderResources *resources)` | All scene/prepared/GPU uses ended; destroys remaining owned resources |
+| `MeshId mesh_create(RenderResources *resources, const MeshDesc *desc)` | Copies CPU inputs into owned pending-upload storage; invalid ID for resource-creation failure |
+| `void mesh_destroy(RenderResources *resources, MeshId mesh)` | Immediate; shared lifetime preconditions apply |
+| `MaterialId material_create(RenderResources *resources, const MaterialDesc *desc)` | Copies descriptor and resolves texture references; invalid ID for creation failure |
+| `void material_destroy(RenderResources *resources, MaterialId material)` | Immediate; does not destroy borrowed textures |
+| `bool model_load(ModelLibrary *library, const ModelLoadDesc *desc, ModelId *out_model, LoadError *error)` | Optional static import; on failure output is invalid and no asset is published |
+| `void model_unload(ModelLibrary *library, ModelId model)` | Releases library-owned bundle after scene/GPU use ends |
+
+`ModelLibrary` borrows the backend/resource systems established at its own paired
+init/shutdown boundary. A model owns its mesh/material/texture bundle; users borrow
+resource IDs and remove their instances before unloading. Introduce model deduplication
+only with an explicit ownership protocol, not the old implicit cache refcount.
+
+Created meshes become GPU-readable only after `renderer3d_prepare` records their
+pending uploads and visibility dependencies on the recording command buffer.
+An ID denotes owned storage, not completed GPU work. CPU source views expire at
+creation return; pending upload storage survives until consumed and retired.
+
+No public in-place `mesh_update` initially. Create a replacement and retire the
+old one. Material edits similarly publish replacements, while per-instance tint
+is a frame parameter. Add fixed-topology subrange updates only after measurement.
