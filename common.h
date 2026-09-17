@@ -1,17 +1,20 @@
+#ifndef MU_GFX_COMMON_H
+#define MU_GFX_COMMON_H
 #define CGLM_ALL_UNALIGNED
 #include "external/cglm/include/cglm/cglm.h"
 #include "external/cglm/include/cglm/types.h"
 #include "external/cglm/include/cglm/vec3.h"
 
-#include "src/platform.h"
-#include "src/input_rgfw.h"
+
+
+#include "external/volk/volk.h"
 #define VMA_STATIC_VULKAN_FUNCTIONS  0
 #define VMA_DYNAMIC_VULKAN_FUNCTIONS 0
 #include "external/VulkanMemoryAllocator/include/vk_mem_alloc.h"
 #include "external/logger-c/logger/logger.h"
 #include "external/volk/volk.h"
 
-#include "src/nuklear_ui.h"
+
 
 #include "external/debugbreak/debugbreak.h"
 #include "src/tracy.h"
@@ -84,3 +87,5 @@
     #define FORCE_INLINE static inline
 #endif
 
+
+#endif

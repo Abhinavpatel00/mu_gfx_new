@@ -11,7 +11,7 @@ Optimize for simple, data-oriented, predictable code.
 5. Compile-time knowledge
 6. Measurable performance
 7. Simplicity over abstraction
-
+8. keep gpu and cpu cache locality in mind 
 ## Data-Oriented Design
 
 Data layout is a primary design decision. Design around access patterns, iteration, and lifetime.

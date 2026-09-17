@@ -1,3 +1,5 @@
+#ifndef MU_GFX_HELPERS_H
+#define MU_GFX_HELPERS_H
 #include "../common.h"
 #include "../external/xxHash/xxhash.h"
 #include <errno.h>
@@ -648,19 +650,5 @@ FORCE_INLINE void gpu_profiler_collect(GpuProfiler* p, VkDevice device, uint64_t
 
 
 
-static bool trigger_shader_compilation(void) {
-    // Use system() to run the bash script
-    // Note: system() blocks until the process finishes. 
-    // For a quick compilation script, this is acceptable, 
-    // but for better UX, consider using popen() or a thread.
-    // Since dmon callback is already on a thread, blocking there is okay.
-    // But if the script is slow, it might queue up. We'll use system() for simplicity.
-    printf("[HotReload] Triggering shader compilation...\n");
-    int result = system("bash compileslang.sh"); // Adjust path if needed
-    if (result != 0) {
-        fprintf(stderr, "[HotReload] compileslang.sh failed with code %d\n", result);
-        return false;
-    }
-    return true;
-}
 
+#endif

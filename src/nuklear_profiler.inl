@@ -1,5 +1,5 @@
 static void render_gpu_profiler_ui(Renderer *r) {
-    if (!r->enable_graphics_profiler)
+    if (!r->vk.enable_graphics_profiler)
         return;
     struct nk_context *ctx = &r->ui.context;
     if (!g_gpu_profiler_ui.open) {
@@ -103,6 +103,6 @@ static void render_gpu_profiler_ui(Renderer *r) {
     }
     nk_layout_row_dynamic(ctx, 22, 1);
     nk_labelf(ctx, NK_TEXT_LEFT, "Timestamp Period: %.2f ns | Query Pool Size: %d passes",
-              (double)r->info.properties.limits.timestampPeriod, MAX_GPU_PASSES);
+              (double)r->vk.info.properties.limits.timestampPeriod, MAX_GPU_PASSES);
     nk_end(ctx);
 }
