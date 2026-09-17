@@ -11,7 +11,6 @@ For the proposed static 3D API, legacy renderer review, GPU lifetime requirement
 and game roadmap, see the [Cozy Builder plan](../cozy-builder-plan.md). That plan
 is a specification, not an implemented game API.
 
-
 This document provides a comprehensive architectural breakdown of the Vulkan rendering engine. It is designed to quickly familiarize new developers and AI assistants with the design principles, codebase structure, memory layout, frame flow, bindless resource model, shader hot-reloading system, and extension patterns.
 
 ---

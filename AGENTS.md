@@ -221,6 +221,14 @@ Prefer changes that improve memory behavior, locality, and data movement before 
 - Avoid copying large user data structures. Prefer references to structures, and use spans for array data in structures and function parameters.
 
 use custom span from mu library 
-- Always pass `Span`, `ByteSpan`, and `GpuRange` function parameters by value. This allows the compiler to pass their pointer-and-size fields in registers instead of forcing a memory store/load round trip. Review all code against this rule after every change.
+- Always pass `Span`, `ByteSpan`, and `GpuRange` function parameters by value. This allows the compiler to pass their pointer-and-size fields in registers instead of forcing a memory store/load round trip. 
 - prefer to use designated initializer 
 - Always review code for performance issues before considering work complete.
+- ask question about decisions rather than assuming this and that user is a programmer not a novice 
+
+- this is very intelligenth way to avoid switch cases to to avoid branches in code
+ typedef enum LoadOp {
+   NEW_API     = OLD_API,
+
+ } SOMETHING;
+
