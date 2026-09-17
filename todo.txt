@@ -6,4 +6,6 @@
 - make network system
 - make virtual compressed file system inspired by the-forge
 - add twod and threed renderer which is moduler threed renderer inspired by fukuna
- 
+- make a proc gen game like tiny glade
+- experiment with different proc gen techniques
+- experiment with sdf deformable engine 

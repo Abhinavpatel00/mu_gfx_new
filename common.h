@@ -1,32 +1,16 @@
-#define IMGUI_IMPL_VULKAN_MINIMUM_IMAGE_SAMPLER_POOL_SIZE (1)
-#define IMGUI_IMPL_VULKAN_USE_VOLK
-#define CIMGUI_USE_GLFW
-#define CIMGUI_DEFINE_ENUMS_AND_STRUCTS
-#define CIMGUI_USE_VULKAN
 #define CGLM_ALL_UNALIGNED
 #include "external/cglm/include/cglm/cglm.h"
 #include "external/cglm/include/cglm/types.h"
 #include "external/cglm/include/cglm/vec3.h"
 
-#define VK_NO_PROTOTYPES
-#define GLFW_INCLUDE_VULKAN
-#include <GLFW/glfw3.h>
-#define GLFW_EXPOSE_NATIVE_X11
-#define GLFW_EXPOSE_NATIVE_WAYLAND
-
-
-#include <GLFW/glfw3native.h>
-#ifdef Status
-#undef Status
-#endif
+#include "src/platform.h"
 #define VMA_STATIC_VULKAN_FUNCTIONS  0
 #define VMA_DYNAMIC_VULKAN_FUNCTIONS 0
 #include "external/VulkanMemoryAllocator/include/vk_mem_alloc.h"
 #include "external/logger-c/logger/logger.h"
 #include "external/volk/volk.h"
 
-#include "external/cimgui/cimgui.h"
-#include "external/cimgui/cimgui_impl.h"
+#include "src/nuklear_ui.h"
 
 #include "external/debugbreak/debugbreak.h"
 #include "src/tracy.h"

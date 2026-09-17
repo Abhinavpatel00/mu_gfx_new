@@ -10,21 +10,12 @@ CXX := clang++
 # Sources
 # =========================================================
 
-SRC_C := main.c  ext.c  \
+SRC_C := main.c ext.c src/platform.c src/nuklear.c \
          external/mu/offset_allocator.c  \
          external/mu/mu.c
 
 SRC_CPP := vma.cpp \
-           $(wildcard external/meshoptimizer/src/*.cpp) \
-           external/cimgui/cimgui.cpp \
-           external/cimgui/cimgui_impl.cpp \
-           external/cimgui/imgui/imgui.cpp \
-           external/cimgui/imgui/imgui_draw.cpp \
-           external/cimgui/imgui/imgui_demo.cpp \
-           external/cimgui/imgui/imgui_tables.cpp \
-           external/cimgui/imgui/imgui_widgets.cpp \
-           external/cimgui/imgui/backends/imgui_impl_glfw.cpp \
-           external/cimgui/imgui/backends/imgui_impl_vulkan.cpp
+           $(wildcard external/meshoptimizer/src/*.cpp)
 
 # =========================================================
 # Optional Tracy Profiler
@@ -54,11 +45,7 @@ OBJ := $(addprefix $(BUILD_DIR)/, \
 # Includes
 # =========================================================
 
-INCLUDES := \
-    -Iexternal/vulkan/include \
-    -Iexternal/cimgui \
-    -Iexternal/cimgui/imgui \
-    -Iexternal/cimgui/imgui/backends
+INCLUDES := -Iexternal/vulkan/include
 
 # =========================================================
 # Common Warnings
@@ -87,10 +74,7 @@ BASE_CXXFLAGS := \
     -std=c++17 \
     -w \
     -fno-common \
-    $(INCLUDES) \
-    -DIMGUI_IMPL_VULKAN_NO_PROTOTYPES \
-    -DIMGUI_DISABLE_OBSOLETE_FUNCTIONS \
-    -DIMGUI_IMPL_API='extern "C"'
+    $(INCLUDES)
 
 # =========================================================
 # Debug Build
@@ -146,7 +130,6 @@ RELEASE_FLAGS := \
 LIBS := \
     -lvulkan \
     -lm \
-    -lglfw \
     -lX11 \
     -lXi \
     -lXrandr \
