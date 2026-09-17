@@ -858,8 +858,27 @@ Renderer *renderer_create(bool use_wayland) {
     desc.height = (uint32_t)height;
     vk_backend_create(&r->vk, &desc);
     renderer_resources_create(r, &desc);
-    if (!renderer3d_create(&r->vk, &r->scene, r->hdr_color[0].format, r->depth[0].format))
+    if (!renderer3d_create(&r->vk, &r->scene, &(Renderer3DDesc){.max_instances = 16384,
+            .max_materials = 256, .color_format = r->hdr_color[0].format, .depth_format = r->depth[0].format}))
         exit(EXIT_FAILURE);
+    const SceneVertex vertices[] = {
+        {.position={-1,-1,0}, .normal={0,0,1}, .uv={0,0}},
+        {.position={ 1,-1,0}, .normal={0,0,1}, .uv={1,0}},
+        {.position={ 1, 1,0}, .normal={0,0,1}, .uv={1,1}},
+        {.position={-1, 1,0}, .normal={0,0,1}, .uv={0,1}},
+    };
+    const uint32_t indices[] = {0,1,2,0,2,3};
+    MeshId mesh = renderer3d_mesh_create(&r->vk, &r->scene,
+        &(MeshDesc){.vertices = {.data=vertices, .size=sizeof(vertices)},
+                    .indices = {.data=indices, .size=sizeof(indices)}});
+    if (!mesh.handle.id) exit(EXIT_FAILURE);
+    MaterialId material = renderer3d_material_create(&r->scene, (SceneVector){0.3f,0.7f,0.4f,1});
+    if (!material.handle.id) exit(EXIT_FAILURE);
+    forEach(i, 3) {
+        InstanceId instance = renderer3d_instance_create(&r->scene, &(InstanceDesc){.mesh=mesh, .material=material,
+            .rows={{0.7f,0,0,(float)i*2.5f-2.5f},{0,0.7f,0,0},{0,0,0.7f,0}}, .tint={1,1,1,1}});
+        if (!instance.handle.id) exit(EXIT_FAILURE);
+    }
     r->start_time = r->cpu_prev_frame = mu_time_now();
     nuklear_init(r);
 
@@ -1423,6 +1442,18 @@ bool renderer_frame(Renderer *r) {
         }
 
         GPU_SCOPE(frame_prof, cmd, "3D cull and draw", VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT) {
+            mat4 camera, projection, clip;
+            glm_lookat((vec3){4,3,7}, (vec3){0,0,0}, (vec3){0,1,0}, camera);
+            glm_mat4_zero(projection);
+            projection[0][0] = 1.7320508f * (float)r->vk.swapchain.extent.height / (float)r->vk.swapchain.extent.width;
+            projection[1][1] = 1.7320508f;
+            projection[2][2] = 100.0f / (0.1f - 100.0f);
+            projection[2][3] = -1;
+            projection[3][2] = 0.1f * projection[2][2];
+            glm_mat4_mul(projection, camera, clip);
+            SceneView view = {.sun={1,2,3,0.25f}};
+            forEach(i, 4) view.clip_rows[i] = (SceneVector){clip[0][i],clip[1][i],clip[2][i],clip[3][i]};
+            renderer3d_prepare(&r->vk, &r->scene, cmd, &view);
             renderer3d_record(&r->vk, &r->scene, cmd, &r->hdr_color[r->vk.swapchain.current_image],
                                &r->depth[r->vk.swapchain.current_image]);
         }

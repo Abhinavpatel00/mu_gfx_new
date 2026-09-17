@@ -72,8 +72,7 @@ int main(void) {
         return 1;
     uint8_t *reference = malloc(256 * 256 * 4);
     bool passed = true;
-    // One CPU-written draw first, then two as a reference, then the GPU-generated
-    // list.
+    // One instance, two-instance reference, GPU-compacted batch, then empty visibility.
     for (uint32_t test = 0; test < 4; ++test) {
         if (test == 3) {
             SceneGeometry *geometry = (SceneGeometry *)scene.geometry.mapping;
@@ -84,8 +83,10 @@ int main(void) {
         VkCommandBuffer cmd = vk_begin_one_time_cmd(vk->devc.device, vk->one_time_gfx_pool);
         if (test < 2) {
             push.instance_count = test + 1;
-            SceneDraw draws[2] = {{36, 1, 0, 0, 0}, {36, 1, 0, 0, 1}};
-            memcpy(scene.commands[0].mapping, draws, sizeof(draws));
+            SceneDraw draw = {.index_count = 36, .instance_count = test + 1};
+            uint32_t visible[SCENE_INSTANCE_COUNT] = {0, 1, 2};
+            memcpy(scene.commands[0].mapping, &draw, sizeof(draw));
+            memcpy((uint8_t *)scene.commands[0].mapping + sizeof(draw), visible, sizeof(visible));
             vmaFlushAllocation(vk->devc.vmaallocator, scene.commands[0].allocation, 0, VK_WHOLE_SIZE);
             scene_draw(vk, &scene, cmd, &color, &depth, &push);
         } else {
@@ -99,14 +100,17 @@ int main(void) {
         vkCmdCopyImageToBuffer(cmd, color.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback.buffer, 1, &copy);
         if (test >= 2) {
             VkMemoryBarrier2 barrier = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
-                                        .srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                                        .srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                                        .srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
+                                                        VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+                                        .srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT |
+                                                         VK_ACCESS_2_TRANSFER_WRITE_BIT,
                                         .dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT,
                                         .dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT};
             vkCmdPipelineBarrier2(cmd, &(VkDependencyInfo){.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
                                                            .memoryBarrierCount = 1,
                                                            .pMemoryBarriers = &barrier});
-            VkBufferCopy region = {.dstOffset = 256 * 256 * 4, .size = 3 * sizeof(SceneDraw)};
+            VkBufferCopy region = {.dstOffset = 256 * 256 * 4,
+                                   .size = sizeof(SceneDraw) + SCENE_INSTANCE_COUNT * sizeof(uint32_t)};
             vkCmdCopyBuffer(cmd, scene.commands[0].buffer, readback.buffer, 1, &region);
         }
 
@@ -132,10 +136,12 @@ int main(void) {
         if (test >= 2) {
             if (test == 2)
                 passed &= memcmp(reference, pixels, 256 * 256 * 4) == 0;
-            SceneDraw *draws = (SceneDraw *)(pixels + 256 * 256 * 4);
-            forEach(i, 3) {
-                passed &= draws[i].index_count == 36 && draws[i].instance_count == (test == 2 && i < 2) &&
-                          draws[i].first_index == 0 && draws[i].vertex_offset == 0 && draws[i].first_instance == i;
+            SceneDraw *draw = (SceneDraw *)(pixels + 256 * 256 * 4);
+            passed &= draw->index_count == 36 && draw->instance_count == (test == 2 ? 2u : 0u) &&
+                      draw->first_index == 0 && draw->vertex_offset == 0 && draw->first_instance == 0;
+            if (test == 2) {
+                uint32_t *visible = (uint32_t *)(draw + 1);
+                passed &= (visible[0] == 0 && visible[1] == 1) || (visible[0] == 1 && visible[1] == 0);
             }
         }
         printf("case %u: red=%u blue=%u, %s\n", test, red, blue, passed ? "PASS" : "FAIL");
