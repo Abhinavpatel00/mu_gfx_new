@@ -1,5 +1,17 @@
 # Vulkan Renderer Design & Architecture Reference
 
+Status: maintained renderer reference, but not fully synchronized with source.
+The application now uses RGFW and Nuklear; GLFW/cimgui/ImGui names in older
+sections and diagrams below are historical. The shared CPU-pool reset described
+below is not a guarantee that new GPU-readable frame data is safe across frames
+in flight. Audit upload ownership before adding consumers. The old sibling
+[rendererdesign.md](../rendererdesign.md) is a historical snapshot.
+
+For the proposed static 3D API, legacy renderer review, GPU lifetime requirements,
+and game roadmap, see the [Cozy Builder plan](../cozy-builder-plan.md). That plan
+is a specification, not an implemented game API.
+
+
 This document provides a comprehensive architectural breakdown of the Vulkan rendering engine. It is designed to quickly familiarize new developers and AI assistants with the design principles, codebase structure, memory layout, frame flow, bindless resource model, shader hot-reloading system, and extension patterns.
 
 ---
@@ -320,9 +332,9 @@ Graphics pass with a clear color attachment (and optional depth):
 ```c
 static void pass_my_draw(Renderer *r, VkCommandBuffer cmd) {
     PassAttachment color = {.target = &r->hdr_color[r->swapchain.current_image],
-                            .load   = VK_ATTACHMENT_LOAD_OP_CLEAR};
+                            .load   = LOAD_CLEAR};
     PassAttachment depth = {.target = &r->depth[r->swapchain.current_image],
-                            .load   = VK_ATTACHMENT_LOAD_OP_CLEAR,
+                            .load   = LOAD_CLEAR,
                             .clear  = {0.0f}}; // clear[0] = depth clear value
 
     begin_pass(r, cmd, &(PassDesc){

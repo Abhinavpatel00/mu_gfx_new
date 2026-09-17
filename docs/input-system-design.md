@@ -1,6 +1,6 @@
 # Data-oriented input system
 
-Status: proposed subsystem. The RGFW/Nuklear migration supplies a platform/UI adapter, not the complete action, replay, and fixed-tick system described here.
+Status: advanced design reference, not a mandatory core API. The scope and layering decisions in input-api-layers.md supersede the monolithic subsystem proposal below. The RGFW/Nuklear migration supplies a platform/UI adapter, not the complete action, replay, and fixed-tick system described here.
 
 ## 1. Boundaries
 

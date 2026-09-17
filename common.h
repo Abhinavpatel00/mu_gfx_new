@@ -4,6 +4,7 @@
 #include "external/cglm/include/cglm/vec3.h"
 
 #include "src/platform.h"
+#include "src/input_rgfw.h"
 #define VMA_STATIC_VULKAN_FUNCTIONS  0
 #define VMA_DYNAMIC_VULKAN_FUNCTIONS 0
 #include "external/VulkanMemoryAllocator/include/vk_mem_alloc.h"

@@ -1,5 +1,12 @@
 # Vulkan Renderer Design & Architecture Reference
 
+Status: historical snapshot, retained for background only. API examples and
+platform/UI descriptions are outdated. Use the
+[current renderer reference](rendererdesign/README.md) with its status caveats,
+and the [Cozy Builder game and 3D API plan](cozy-builder-plan.md) for proposed game
+work. Neither design document substitutes for checking the current source.
+
+
 This document provides a comprehensive architectural breakdown of the Vulkan rendering engine. It is designed to quickly familiarize new developers and AI assistants with the design principles, codebase structure, memory layout, frame flow, bindless resource model, shader hot-reloading system, and extension patterns.
 
 ---

@@ -44,7 +44,7 @@ static void pass_nuklear(Renderer *r, VkCommandBuffer cmd) {
         GpuProfiler *frame_prof = &r->gpuprofiler[r->current_frame];
         GPU_SCOPE(frame_prof, cmd, "Nuklear Render", VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT) {
             PassAttachment color = {.swapchain_view = r->swapchain.image_views[r->swapchain.current_image],
-                                     .load = VK_ATTACHMENT_LOAD_OP_LOAD, .store = VK_ATTACHMENT_STORE_OP_STORE};
+                                     .load = LOAD_KEEP, .store = STORE_KEEP};
             begin_pass(r, cmd, &(PassDesc){.colors = &color, .color_count = 1});
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, ui->pipeline);
             vkCmdBindIndexBuffer(cmd, upload->buffer, index_offset, VK_INDEX_TYPE_UINT32);
