@@ -10,7 +10,7 @@ CXX := clang++
 # Sources
 # =========================================================
 
-SRC_C := main.c vk.c renderer.c ext.c src/platform.c src/nuklear.c src/input.c \
+SRC_C := main.c vk.c renderer.c renderer3d.c ext.c src/platform.c src/nuklear.c src/input.c \
          external/mu/offset_allocator.c  \
          external/mu/mu.c
 
@@ -236,9 +236,32 @@ $(TEST_RENDERER): $(BUILD_DIR)/tests/renderer_test.o $(filter-out $(BUILD_DIR)/m
 $(TEST_INPUT): $(BUILD_DIR)/tests/input_test.o $(BUILD_DIR)/src/input.o $(BUILD_DIR)/src/platform.o
 	$(CC) $(LDFLAGS) $^ -o $@ $(LIBS)
 
-test: $(TEST_INPUT) $(TEST_RENDERER)
+SCENE_SHADERS := compiledshaders/scene3d.vert.spv compiledshaders/scene3d.frag.spv compiledshaders/scene3d.comp.spv
+SLANGC ?= /opt/shader-slang-bin/bin/slangc
+
+compiledshaders/scene3d.vert.spv: shaders/scene3d.slang src/scene3d_shared.h
+	@mkdir -p $(@D)
+	$(SLANGC) $< -target spirv -entry vs_main -stage vertex -O3 -o $@
+compiledshaders/scene3d.frag.spv: shaders/scene3d.slang src/scene3d_shared.h
+	@mkdir -p $(@D)
+	$(SLANGC) $< -target spirv -entry fs_main -stage fragment -O3 -o $@
+compiledshaders/scene3d.comp.spv: shaders/scene3d.slang src/scene3d_shared.h
+	@mkdir -p $(@D)
+	$(SLANGC) $< -target spirv -entry cs_main -stage compute -O3 -o $@
+
+$(TARGET) $(TEST_RENDERER): | $(SCENE_SHADERS)
+
+TEST_3D := $(BUILD_DIR)/renderer3d_test
+$(TEST_3D): $(BUILD_DIR)/tests/renderer3d_test.o $(filter-out $(BUILD_DIR)/main.o $(BUILD_DIR)/renderer.o $(BUILD_DIR)/renderer3d.o,$(OBJ)) | $(SCENE_SHADERS)
+	$(CXX) $(LDFLAGS) $^ -o $@ $(LIBS)
+
+test-3d: $(TEST_3D)
+	$(TEST_3D)
+
+test: $(TEST_INPUT) $(TEST_RENDERER) $(TEST_3D)
 	$(TEST_INPUT)
+	$(TEST_3D)
 	$(TEST_RENDERER)
 
-.PHONY: test
--include $(OBJ:.o=.d) $(BUILD_DIR)/tests/renderer_test.d $(BUILD_DIR)/tests/input_test.d
+.PHONY: test test-3d
+-include $(OBJ:.o=.d) $(BUILD_DIR)/tests/renderer_test.d $(BUILD_DIR)/tests/input_test.d $(BUILD_DIR)/tests/renderer3d_test.d
