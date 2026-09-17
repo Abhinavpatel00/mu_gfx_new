@@ -1,9 +1,6 @@
 [submodule "external/cglm"]
 	path = external/cglm
 	url = https://github.com/recp/cglm.git
-[submodule "external/cimgui"]
-	path = external/cimgui
-	url = https://github.com/cimgui/cimgui.git
 [submodule "external/debugbreak"]
 	path = external/debugbreak
 	url = https://github.com/scottt/debugbreak.git
@@ -37,3 +34,6 @@
 [submodule "external/RGFW"]
 	path = external/RGFW
 	url = https://github.com/ColleagueRiley/RGFW.git
+[submodule "external/nuklear"]
+	path = external/nuklear
+	url = https://github.com/Immediate-Mode-UI/Nuklear
