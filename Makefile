@@ -10,7 +10,7 @@ CXX := clang++
 # Sources
 # =========================================================
 
-SRC_C := main.c ext.c src/platform.c src/nuklear.c src/input.c \
+SRC_C := main.c vk.c renderer.c ext.c src/platform.c src/nuklear.c src/input.c \
          external/mu/offset_allocator.c  \
          external/mu/mu.c
 
@@ -163,12 +163,12 @@ $(TARGET): $(OBJ)
 $(BUILD_DIR)/%.o: %.c
 	@mkdir -p $(dir $@)
 	@echo Compiling C $<
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
 
 $(BUILD_DIR)/%.o: %.cpp
 	@mkdir -p $(dir $@)
 	@echo Compiling C++ $<
-	$(CXX) $(CXXFLAGS) -c $< -o $@
+	$(CXX) $(CXXFLAGS) -MMD -MP -c $< -o $@
 
 # =========================================================
 # Release
@@ -226,3 +226,19 @@ clean:
 .PHONY: all clean release asan run_asan
 
 
+
+TEST_RENDERER := $(BUILD_DIR)/renderer_test
+TEST_INPUT := $(BUILD_DIR)/input_test
+
+$(TEST_RENDERER): $(BUILD_DIR)/tests/renderer_test.o $(filter-out $(BUILD_DIR)/main.o,$(OBJ))
+	$(CXX) $(LDFLAGS) $^ -o $@ $(LIBS)
+
+$(TEST_INPUT): $(BUILD_DIR)/tests/input_test.o $(BUILD_DIR)/src/input.o $(BUILD_DIR)/src/platform.o
+	$(CC) $(LDFLAGS) $^ -o $@ $(LIBS)
+
+test: $(TEST_INPUT) $(TEST_RENDERER)
+	$(TEST_INPUT)
+	$(TEST_RENDERER)
+
+.PHONY: test
+-include $(OBJ:.o=.d) $(BUILD_DIR)/tests/renderer_test.d $(BUILD_DIR)/tests/input_test.d
