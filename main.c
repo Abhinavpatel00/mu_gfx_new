@@ -1,3 +1,4 @@
+#include "external/debugbreak/debugbreak.h"
 #include "external/dmon/dmon.h"
 #include "external/mu/mu/mu_perf.h"
 #include "external/mu/offset_allocator.h"
@@ -409,16 +410,27 @@ typedef struct BarrierBatch {
 // structs, sets viewport/scissor, and binds the PSO. Call sites name intent,
 // never layouts or stage masks.
 //
-// Zero-value defaults for PassAttachment: load = VK_ATTACHMENT_LOAD_OP_LOAD,
-// store = VK_ATTACHMENT_STORE_OP_STORE, clear = {0,0,0,0}. Name only deltas.
+typedef enum LoadOp {
+    LOAD_KEEP    = VK_ATTACHMENT_LOAD_OP_LOAD,
+    LOAD_CLEAR   = VK_ATTACHMENT_LOAD_OP_CLEAR,
+    LOAD_DISCARD = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+} LoadOp;
+
+typedef enum StoreOp {
+    STORE_KEEP    = VK_ATTACHMENT_STORE_OP_STORE,
+    STORE_DISCARD = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+} StoreOp;
+
+// Zero-value defaults: load = LOAD_KEEP, store = STORE_KEEP, clear = {0,0,0,0}.
+// DISCARD makes contents irrelevant; it does not clear them or mean Vulkan NONE.
 // Set `swapchain_view` instead of `target` to render into a swapchain image;
 // the backend tracks swapchain state, so those attachments skip rt transitions.
 typedef struct PassAttachment {
-    RenderTarget       *target;
-    VkImageView         swapchain_view; // used when target == NULL
-    VkAttachmentLoadOp  load;  // VK_ATTACHMENT_LOAD_OP_CLEAR for clears, LOAD to keep contents
-    VkAttachmentStoreOp store;
-    float               clear[4]; // color rgba; depth clear value in clear[0]
+    RenderTarget *target;
+    VkImageView   swapchain_view; // used when target == NULL
+    LoadOp        load;
+    StoreOp       store;
+    float         clear[4]; // color rgba; depth clear value in clear[0]
 } PassAttachment;
 
 typedef struct PassDesc {
@@ -505,6 +517,7 @@ struct Renderer {
 
     // window
     RGFW_window           *window;
+    Input                  input;
     VkSurfaceKHR           surface;
     VkAllocationCallbacks *vk_allocator_callbacks;
     DeviceInfo             info;
@@ -2451,6 +2464,14 @@ static inline GraphicsPipelineConfig pipeline_config_default(void) {
     };
 }
 
+static inline GraphicsPipelineConfig pipeline_config_fullscreen(void) {
+    GraphicsPipelineConfig cfg = pipeline_config_default();
+    cfg.depth_test_enable      = false;
+    cfg.depth_write_enable     = false;
+    cfg.color_attachment_count = 1;
+    return cfg;
+}
+
 static VkShaderModule create_shader_module(VkDevice device, const void *code, size_t size) {
     VkShaderModuleCreateInfo ci = {
         .sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
@@ -3189,8 +3210,8 @@ void begin_pass(Renderer *r, VkCommandBuffer cmd, const PassDesc *desc) {
             .sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
             .imageView   = a->target ? a->target->view : a->swapchain_view,
             .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-            .loadOp      = a->load,
-            .storeOp     = a->store,
+            .loadOp      = (VkAttachmentLoadOp)a->load,
+            .storeOp     = (VkAttachmentStoreOp)a->store,
             .clearValue  = {.color = {{a->clear[0], a->clear[1], a->clear[2], a->clear[3]}}},
         };
     }
@@ -3201,8 +3222,8 @@ void begin_pass(Renderer *r, VkCommandBuffer cmd, const PassDesc *desc) {
             .sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
             .imageView   = desc->depth->target->view,
             .imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
-            .loadOp      = desc->depth->load,
-            .storeOp     = desc->depth->store,
+            .loadOp      = (VkAttachmentLoadOp)desc->depth->load,
+            .storeOp     = (VkAttachmentStoreOp)desc->depth->store,
             .clearValue  = {.depthStencil = {.depth = desc->depth->clear[0]}},
         };
     }
@@ -4391,12 +4412,9 @@ void renderer_create(Renderer *r, RendererDesc *desc) {
     {
 
         {
-            GraphicsPipelineConfig cfg = pipeline_config_default();
+            GraphicsPipelineConfig cfg = pipeline_config_fullscreen();
             cfg.vert_path              = "compiledshaders/fire.vert.spv";
             cfg.frag_path              = "compiledshaders/fire.frag.spv";
-            cfg.depth_test_enable      = false;
-            cfg.depth_write_enable     = false;
-            cfg.color_attachment_count = 1;
             cfg.color_formats          = &r->hdr_color[0].format;
 
             r->EnginePipelines.fire = pipeline_create_graphics(r, &cfg);
@@ -4407,36 +4425,27 @@ void renderer_create(Renderer *r, RendererDesc *desc) {
         }
 
         {
-            GraphicsPipelineConfig cfg = pipeline_config_default();
+            GraphicsPipelineConfig cfg = pipeline_config_fullscreen();
             cfg.vert_path              = "compiledshaders/smaa_edge.vert.spv";
             cfg.frag_path              = "compiledshaders/smaa_edge.frag.spv";
-            cfg.depth_test_enable      = false;
-            cfg.depth_write_enable     = false;
-            cfg.color_attachment_count = 1;
             cfg.color_formats          = &r->smaa_edges[0].format;
 
             r->smaa_pipelines.smaa_edge = pipeline_create_graphics(r, &cfg);
         }
 
         {
-            GraphicsPipelineConfig cfg = pipeline_config_default();
+            GraphicsPipelineConfig cfg = pipeline_config_fullscreen();
             cfg.vert_path              = "compiledshaders/smaa_weight.vert.spv";
             cfg.frag_path              = "compiledshaders/smaa_weight.frag.spv";
-            cfg.depth_test_enable      = false;
-            cfg.depth_write_enable     = false;
-            cfg.color_attachment_count = 1;
             cfg.color_formats          = &r->smaa_weights[0].format;
 
             r->smaa_pipelines.smaa_weight = pipeline_create_graphics(r, &cfg);
         }
 
         {
-            GraphicsPipelineConfig cfg = pipeline_config_default();
+            GraphicsPipelineConfig cfg = pipeline_config_fullscreen();
             cfg.vert_path              = "compiledshaders/smaa_blend.vert.spv";
             cfg.frag_path              = "compiledshaders/smaa_blend.frag.spv";
-            cfg.depth_test_enable      = false;
-            cfg.depth_write_enable     = false;
-            cfg.color_attachment_count = 1;
             cfg.color_formats          = &r->smaa_final[0].format;
 
             r->smaa_pipelines.smaa_blend = pipeline_create_graphics(r, &cfg);
@@ -4483,7 +4492,7 @@ bool graphics_init(bool use_wayland) {
         .instance_extension_count    = (uint32_t)platform_ext_count,
         .device_extension_count      = 2,
         .enable_gpu_based_validation = false,
-        .enable_validation           = true,
+        .enable_validation           = VALIDATION,
 
         .validation_severity =
             VK_DEBUG_UTILS_MESSAGE_SEVERITY_VERBOSE_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT |
@@ -4900,7 +4909,7 @@ static void pass_fire(Renderer *r, VkCommandBuffer cmd) {
 
         PassAttachment color = {
             .target = &r->hdr_color[image],
-            .load   = VK_ATTACHMENT_LOAD_OP_CLEAR,
+            .load   = LOAD_CLEAR,
             .clear  = {0.02f, 0.025f, 0.03f, 1.0f},
         };
 
@@ -4925,7 +4934,7 @@ static void pass_smaa(Renderer *r, VkCommandBuffer cmd) {
     {
         /* 1. Edge detection */
         GPU_SCOPE(frame_prof, cmd, "SMAA Edge", VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT) {
-            PassAttachment color = {.target = &r->smaa_edges[image], .load = VK_ATTACHMENT_LOAD_OP_CLEAR};
+            PassAttachment color = {.target = &r->smaa_edges[image], .load = LOAD_CLEAR};
             RenderTarget  *reads[] = {&r->ldr_color[image]};
 
             begin_pass(r, cmd, &(PassDesc){
@@ -4948,7 +4957,7 @@ static void pass_smaa(Renderer *r, VkCommandBuffer cmd) {
     {
         /* 2. Weight calculation */
         GPU_SCOPE(frame_prof, cmd, "SMAA Weight", VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT) {
-            PassAttachment color      = {.target = &r->smaa_weights[image], .load = VK_ATTACHMENT_LOAD_OP_CLEAR};
+            PassAttachment color      = {.target = &r->smaa_weights[image], .load = LOAD_CLEAR};
             RenderTarget  *reads[]    = {&r->smaa_edges[image]};
 
             begin_pass(r, cmd, &(PassDesc){
@@ -4973,7 +4982,7 @@ static void pass_smaa(Renderer *r, VkCommandBuffer cmd) {
     {
         /* 3. Blend LDR + SMAA into FINAL */
         GPU_SCOPE(frame_prof, cmd, "SMAA Blend", VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT) {
-            PassAttachment color   = {.target = &r->smaa_final[image], .load = VK_ATTACHMENT_LOAD_OP_CLEAR};
+            PassAttachment color   = {.target = &r->smaa_final[image], .load = LOAD_CLEAR};
             RenderTarget  *reads[] = {&r->ldr_color[image], &r->smaa_weights[image]};
 
             begin_pass(r, cmd, &(PassDesc){
@@ -5049,8 +5058,10 @@ static void pass_ldr_to_swapchain(Renderer *r, VkCommandBuffer cmd) {
 static void platform_poll_events(Renderer *r) {
     struct nk_context *ctx = &r->ui.context;
     RGFW_event event;
+    input_begin(&r->input);
     nk_input_begin(ctx);
     while (RGFW_checkEvent(&event)) {
+        input_feed_rgfw(&r->input, &event);
         if (event.common.win != r->window)
             continue;
         switch (event.type) {
@@ -5166,7 +5177,9 @@ int main(int argc, char **argv) {
         }
     }
     if (!graphics_init(use_wayland))
-        return EXIT_FAILURE;
+        return EXIT_FAILURE; 
+
+    input_init(&g_renderer->input, g_renderer->window);
     dmon_init();
 
     g_source_watch_id = dmon_watch("shaders", watch_callback, DMON_WATCHFLAGS_RECURSIVE, g_renderer);
@@ -5179,9 +5192,12 @@ int main(int argc, char **argv) {
         platform_poll_events(g_renderer);
         if (RGFW_window_shouldClose(g_renderer->window))
             break;
-
         pipeline_rebuild(g_renderer);
+   
+
         delete_queue_tick(g_renderer);
+        
+
         if (!frame_start(g_renderer))
             continue; // swapchain out-of-date / minimized: nothing to record
         update_global_data(g_renderer);
@@ -5233,6 +5249,8 @@ int main(int argc, char **argv) {
         vk_cmd_end(cmd);
 
         submit_frame(renderer);
+
+
     }
     // Intentional stall: shutdown has no frames left to overlap with.
     vkDeviceWaitIdle(g_renderer->devc.device);
