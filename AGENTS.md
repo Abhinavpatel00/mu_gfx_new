@@ -12,6 +12,7 @@ Optimize for simple, data-oriented, predictable code.
 6. Measurable performance
 7. Simplicity over abstraction
 8. keep gpu and cpu cache locality in mind 
+9. use pointers when they increase performance 
 ## Data-Oriented Design
 
 Data layout is a primary design decision. Design around access patterns, iteration, and lifetime.
