@@ -2,3 +2,7 @@
 /build
 /pipeline_cache.bin
 /compiledshaders
+*.o
+*.rdi
+*.mp4
+.gdb_history
