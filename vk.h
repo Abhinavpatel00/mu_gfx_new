@@ -1,9 +1,9 @@
 #ifndef MU_GFX_VK_H
 #define MU_GFX_VK_H
 
-#include "src/helpers.h"
-#include "external/mu/offset_allocator.h"
 #include "external/mu/mu/mu_span.h"
+#include "external/mu/offset_allocator.h"
+#include "src/helpers.h"
 
 typedef uint32_t TextureID;
 typedef uint32_t SamplerID;
@@ -179,7 +179,6 @@ typedef enum SwapchainResult {
     SWAPCHAIN_OUT_OF_DATE,
 } SwapchainResult;
 
-
 typedef struct {
     VkPhysicalDevice physical;
 
@@ -195,7 +194,7 @@ typedef struct {
     VkCommandBuffer cmdbuf;
     VkCommandPool   cmdbufpool;
     VkSemaphore     image_available_semaphore;
-    uint64_t        timeline_value;  // timeline value signalled by this slot's last submission
+    uint64_t        timeline_value; // timeline value signalled by this slot's last submission
     uint32_t        staging_tail;
 } FrameContext;
 
@@ -207,8 +206,6 @@ typedef struct {
 typedef struct VkBackend VkBackend;
 
 typedef void (*DeferredDestroyFn)(VkBackend *r, void *user);
-
-
 
 typedef struct DeleteQueueEntry {
     uint64_t          retire_value;
@@ -240,7 +237,7 @@ typedef struct Bindless {
 typedef struct RenderTargetSpec {
     uint32_t           width;
     uint32_t           height;
-    uint32_t           layers;    // 0 = single layer
+    uint32_t           layers; // 0 = single layer
     VkFormat           format;
     VkImageUsageFlags  usage;     // required, asserted non-zero
     VkImageAspectFlags aspect;    // 0 = infer from format
@@ -349,7 +346,7 @@ typedef struct GraphicsPipelineConfig {
     VkCompareOp depth_compare_op;
 
     uint32_t        color_attachment_count; // 0 = no color attachments
-    const VkFormat *color_formats;         // NULL when color_attachment_count == 0
+    const VkFormat *color_formats;          // NULL when color_attachment_count == 0
     VkFormat        depth_format;           // 0 (VK_FORMAT_UNDEFINED) = no depth attachment
 
     // Per-attachment blend state. Unset entries (zeroed write mask) default to
@@ -421,16 +418,15 @@ typedef struct PassAttachment {
 } PassAttachment;
 
 typedef struct PassDesc {
-    const PassAttachment *colors;            // NULL when compute-only
-    uint32_t              color_count;       // 0..MAX_COLOR_ATTACHMENTS
-    const PassAttachment *depth;             // NULL = no depth attachment
-    RenderTarget *const  *shader_reads;      // sampled reads (sampled-read layout)
+    const PassAttachment *colors;       // NULL when compute-only
+    uint32_t              color_count;  // 0..MAX_COLOR_ATTACHMENTS
+    const PassAttachment *depth;        // NULL = no depth attachment
+    RenderTarget *const  *shader_reads; // sampled reads (sampled-read layout)
     uint32_t              shader_read_count;
-    RenderTarget *const  *shader_writes;     // storage image writes (GENERAL layout)
+    RenderTarget *const  *shader_writes; // storage image writes (GENERAL layout)
     uint32_t              shader_write_count;
-    PipelineID            pipeline;          // 1-based; 0 = caller binds later (e.g. Nuklear)
+    PipelineID            pipeline; // 1-based; 0 = caller binds later (e.g. Nuklear)
 } PassDesc;
-
 
 typedef struct BufferSlice {
     BufferPool   *pool;
@@ -441,46 +437,46 @@ typedef struct BufferSlice {
     OA_Allocation allocation;
 } BufferSlice;
 typedef struct SamplerDesc {
-    VkFilter   min_filter;
-    VkFilter   mag_filter;
-    bool       nearest_mips;
+    VkFilter             min_filter;
+    VkFilter             mag_filter;
+    bool                 nearest_mips;
     VkSamplerAddressMode address_u;
     VkSamplerAddressMode address_v;
     VkSamplerAddressMode address_w;
-    bool       anisotropic; // 16x; only meaningful with linear filtering
-    bool       compare_enabled;
-    VkCompareOp compare;
+    bool                 anisotropic; // 16x; only meaningful with linear filtering
+    bool                 compare_enabled;
+    VkCompareOp          compare;
     VkSamplerAddressMode clamp_mode_override; // 0 = none; shadow presets use clamp-to-border
-    VkBorderColor border_color;
+    VkBorderColor        border_color;
 } SamplerDesc;
 
 struct VkBackend {
-    uint32_t current_frame;
-    FrameContext frames[MAX_FRAMES_IN_FLIGHT];
-    FlowSwapchain swapchain;
-    VkCommandPool one_time_gfx_pool;
-    VkCommandPool transfer_pool;
-    InstanceContext instance;
-    DeviceContext   devc;
+    uint32_t               current_frame;
+    FrameContext           frames[MAX_FRAMES_IN_FLIGHT];
+    FlowSwapchain          swapchain;
+    VkCommandPool          one_time_gfx_pool;
+    VkCommandPool          transfer_pool;
+    InstanceContext        instance;
+    DeviceContext          devc;
     VkSurfaceKHR           surface;
     VkAllocationCallbacks *vk_allocator_callbacks;
     DeviceInfo             info;
-    TextureSystem texture_system;
-    Bindless         bindless_system;
-    mu_id_pool       sampler_pool;
-    GpuProfiler gpuprofiler[MAX_FRAMES_IN_FLIGHT];
-    bool        enable_graphics_profiler;
-    DefaultSamplerTable default_samplers;
-    BufferPool cpu_pool;
-    BufferPool gpu_pool;
-    BufferPool staging_pool;
-    VkBackendPipelines render_pipelines;
-    DeleteQueue delete_queue;
-    VkDeviceAddress   gpu_base_addr;
-    VkSampler         samplers[MAX_BINDLESS_SAMPLERS];
-    BarrierBatch barrierbatch;
-    VkSemaphore timeline;
-    uint64_t    timeline_last_submitted;
+    TextureSystem          texture_system;
+    Bindless               bindless_system;
+    mu_id_pool             sampler_pool;
+    GpuProfiler            gpuprofiler[MAX_FRAMES_IN_FLIGHT];
+    bool                   enable_graphics_profiler;
+    DefaultSamplerTable    default_samplers;
+    BufferPool             cpu_pool;
+    BufferPool             gpu_pool;
+    BufferPool             staging_pool;
+    VkBackendPipelines     render_pipelines;
+    DeleteQueue            delete_queue;
+    VkDeviceAddress        gpu_base_addr;
+    VkSampler              samplers[MAX_BINDLESS_SAMPLERS];
+    BarrierBatch           barrierbatch;
+    VkSemaphore            timeline;
+    uint64_t               timeline_last_submitted;
 };
 
 static inline ColorAttachmentBlend blend_disabled(void) {
@@ -498,15 +494,15 @@ static inline ColorAttachmentBlend blend_disabled(void) {
 
 static inline GraphicsPipelineConfig pipeline_config_default(void) {
     return (GraphicsPipelineConfig){
-        .cull_mode          = VK_CULL_MODE_NONE,
-        .front_face         = VK_FRONT_FACE_COUNTER_CLOCKWISE,
-        .polygon_mode       = VK_POLYGON_MODE_FILL,
-        .topology           = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
-        .depth_test_enable  = true,
-        .depth_write_enable = true,
-        .depth_compare_op   = VK_COMPARE_OP_GREATER,
+        .cull_mode              = VK_CULL_MODE_NONE,
+        .front_face             = VK_FRONT_FACE_COUNTER_CLOCKWISE,
+        .polygon_mode           = VK_POLYGON_MODE_FILL,
+        .topology               = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+        .depth_test_enable      = true,
+        .depth_write_enable     = true,
+        .depth_compare_op       = VK_COMPARE_OP_GREATER,
         .color_attachment_count = 0,
-        .depth_format       = VK_FORMAT_UNDEFINED,
+        .depth_format           = VK_FORMAT_UNDEFINED,
     };
 }
 
@@ -527,8 +523,8 @@ static inline ColorAttachmentBlend blend_alpha(void) {
         .src_alpha    = VK_BLEND_FACTOR_ONE,
         .dst_alpha    = VK_BLEND_FACTOR_ZERO,
         .alpha_op     = VK_BLEND_OP_ADD,
-        .write_mask   = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT |
-                      VK_COLOR_COMPONENT_A_BIT,
+        .write_mask =
+            VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT,
     };
 }
 
@@ -543,8 +539,8 @@ void vk_backend_create(VkBackend *r, VkBackendDesc *desc);
 void vk_backend_destroy(VkBackend *r);
 void wait_idle(VkBackend *r);
 
-void pipeline_cache_save(VkDevice device, VkPhysicalDevice phys, VkPipelineCache cache, const char *path);
-VkFormat pick_depth_format(VkPhysicalDevice gpu);
+void             pipeline_cache_save(VkDevice device, VkPhysicalDevice phys, VkPipelineCache cache, const char *path);
+VkFormat         pick_depth_format(VkPhysicalDevice gpu);
 VkPresentModeKHR vk_swapchain_select_present_mode(VkPhysicalDevice physical_device, VkSurfaceKHR surface, bool vsync);
 void vk_create_swapchain(VkDevice device, VkPhysicalDevice gpu, FlowSwapchain *out_swapchain,
                          const FlowSwapchainCreateInfo *info, VkQueue graphics_queue, VkCommandPool one_time_pool,
@@ -553,61 +549,59 @@ void vk_swapchain_destroy(VkDevice device, FlowSwapchain *swapchain, mu_id_pool 
 void vk_swapchain_recreate(VkDevice device, VkPhysicalDevice gpu, FlowSwapchain *sc, uint32_t new_w, uint32_t new_h,
                            VkQueue graphics_queue, VkCommandPool one_time_pool, VkBackend *r);
 bool vk_swapchain_acquire(VkDevice device, FlowSwapchain *sc, VkSemaphore image_available, VkFence fence,
-                                       uint64_t timeout);
-bool vk_swapchain_present(VkQueue present_queue, FlowSwapchain *sc, const VkSemaphore *waits,
-                                       uint32_t wait_count);
+                          uint64_t timeout);
+bool vk_swapchain_present(VkQueue present_queue, FlowSwapchain *sc, const VkSemaphore *waits, uint32_t wait_count);
 
-TextureID create_texture(VkBackend *r, const TextureCreateDesc *desc);
-void destroy_texture(VkBackend *r, TextureID id);
-bool buffer_pool_init(VkBackend *r,
+TextureID   create_texture(VkBackend *r, const TextureCreateDesc *desc);
+void        destroy_texture(VkBackend *r, TextureID id);
+bool        buffer_pool_init(VkBackend *r,
 
-                      BufferPoolType type, BufferPool *pool, VkDeviceSize size_bytes, VkBufferUsageFlags usage,
-                      VmaMemoryUsage memory_usage, VmaAllocationCreateFlags alloc_flags, oa_uint32 max_allocs);
-void buffer_pool_destroy(VkBackend *r, BufferPool *pool);
-void buffer_pool_linear_reset(BufferPool *pool);
-void buffer_pool_ring_free_to(BufferPool *pool, uint32_t offset);
+                             BufferPoolType type, BufferPool *pool, VkDeviceSize size_bytes, VkBufferUsageFlags usage,
+                             VmaMemoryUsage memory_usage, VmaAllocationCreateFlags alloc_flags, oa_uint32 max_allocs);
+void        buffer_pool_destroy(VkBackend *r, BufferPool *pool);
+void        buffer_pool_linear_reset(BufferPool *pool);
+void        buffer_pool_ring_free_to(BufferPool *pool, uint32_t offset);
 BufferSlice buffer_pool_alloc(BufferPool *pool, VkDeviceSize size_bytes, VkDeviceSize alignment);
-void buffer_pool_free(BufferSlice slice);
-bool renderer_upload_buffer_to_slice(VkBackend *r, VkCommandBuffer cmd, BufferSlice dst_slice, ByteSpan data);
+void        buffer_pool_free(BufferSlice slice);
+bool        renderer_upload_buffer_to_slice(VkBackend *r, VkCommandBuffer cmd, BufferSlice dst_slice, ByteSpan data);
 BufferSlice renderer_upload_buffer(VkBackend *r, VkCommandBuffer cmd, ByteSpan data, VkDeviceSize dst_alignment);
 bool create_buffer(VkBackend *r, VkDeviceSize size, VkBufferUsageFlags usage, VmaMemoryUsage memory_usage, Buffer *out);
 /* Unmapped, device-preferred storage. Upload through transfer commands;
    host visibility is not required. Uses the same destroy_buffer lifetime policy. */
-bool create_device_buffer(VkBackend *r, VkDeviceSize size, VkBufferUsageFlags usage, Buffer *out);
-void destroy_buffer(VkBackend *r, Buffer *buffer);
-bool rt_create(VkBackend *r, RenderTarget *rt, const RenderTargetSpec *spec);
-void rt_destroy(VkBackend *r, RenderTarget *rt);
-bool rt_resize(VkBackend *r, RenderTarget *rt, uint32_t width, uint32_t height);
-bool sampler_create(VkBackend *r, const SamplerDesc *desc, uint32_t *out_sampler_id);
-void sampler_destroy(VkBackend *r, SamplerID id);
+bool       create_device_buffer(VkBackend *r, VkDeviceSize size, VkBufferUsageFlags usage, Buffer *out);
+void       destroy_buffer(VkBackend *r, Buffer *buffer);
+bool       rt_create(VkBackend *r, RenderTarget *rt, const RenderTargetSpec *spec);
+void       rt_destroy(VkBackend *r, RenderTarget *rt);
+bool       rt_resize(VkBackend *r, RenderTarget *rt, uint32_t width, uint32_t height);
+bool       sampler_create(VkBackend *r, const SamplerDesc *desc, uint32_t *out_sampler_id);
+void       sampler_destroy(VkBackend *r, SamplerID id);
 VkPipeline create_graphics_pipeline(VkBackend *renderer, const GraphicsPipelineConfig *cfg);
 VkPipeline create_compute_pipeline(VkBackend *renderer, const char *compute_path);
 PipelineID pipeline_create_compute(VkBackend *r, const char *path);
 PipelineID pipeline_create_graphics(VkBackend *r, GraphicsPipelineConfig *cfg);
-void pipeline_rebuild(VkBackend *r);
-void pipeline_mark_dirty(VkBackend *r, const char *changed);
+void       pipeline_rebuild(VkBackend *r);
+void       pipeline_mark_dirty(VkBackend *r, const char *changed);
 // Commands
 void vk_cmd_set_viewport_scissor(VkCommandBuffer cmd, VkExtent2D extent);
 void image_transition_swapchain(VkBackend *r, VkCommandBuffer cmd, FlowSwapchain *sc, VkImageLayout new_layout,
                                 VkPipelineStageFlags2 dst_stage, VkAccessFlags2 dst_access);
 void cmd_transition_all_mips(VkBackend *r, VkCommandBuffer cmd, VkImage image, ImageState *state,
-                                    VkImageAspectFlags aspect, uint32_t mipCount, VkPipelineStageFlags2 newStage,
-                                    VkAccessFlags2 newAccess, VkImageLayout newLayout, uint32_t newQueueFamily);
+                             VkImageAspectFlags aspect, uint32_t mipCount, VkPipelineStageFlags2 newStage,
+                             VkAccessFlags2 newAccess, VkImageLayout newLayout, uint32_t newQueueFamily);
 void cmd_transition_mip(VkBackend *r, VkCommandBuffer cmd, VkImage image, ImageState *state, VkImageAspectFlags aspect,
                         uint32_t mip, VkPipelineStageFlags2 newStage, VkAccessFlags2 newAccess, VkImageLayout newLayout,
                         uint32_t newQueueFamily);
 void flush_barriers(VkBackend *r, VkCommandBuffer cmd);
-void rt_transition_mip(VkBackend *r, VkCommandBuffer cmd, RenderTarget *rt, uint32_t mip,
-                                 VkImageLayout new_layout, VkPipelineStageFlags2 new_stage, VkAccessFlags2 new_access
+void rt_transition_mip(VkBackend *r, VkCommandBuffer cmd, RenderTarget *rt, uint32_t mip, VkImageLayout new_layout,
+                       VkPipelineStageFlags2 new_stage, VkAccessFlags2 new_access
 
 );
 void rt_transition_all(VkBackend *r, VkCommandBuffer cmd, RenderTarget *rt, VkImageLayout new_layout,
-                                 VkPipelineStageFlags2 new_stage, VkAccessFlags2 new_access);
+                       VkPipelineStageFlags2 new_stage, VkAccessFlags2 new_access);
 void push_constants(VkBackend *r, VkCommandBuffer cmd, ByteSpan data);
-void cmd_draw(VkBackend *r, VkCommandBuffer cmd, ByteSpan root, uint32_t vertex_count,
-                           uint32_t instance_count);
-void dispatch_push(VkBackend *r, VkCommandBuffer cmd, ByteSpan root, uint32_t group_count_x,
-                                uint32_t group_count_y, uint32_t group_count_z);
+void cmd_draw(VkBackend *r, VkCommandBuffer cmd, ByteSpan root, uint32_t vertex_count, uint32_t instance_count);
+void dispatch_push(VkBackend *r, VkCommandBuffer cmd, ByteSpan root, uint32_t group_count_x, uint32_t group_count_y,
+                   uint32_t group_count_z);
 void end_pass(VkCommandBuffer cmd);
 void begin_pass(VkBackend *r, VkCommandBuffer cmd, const PassDesc *desc);
 void delete_queue_defer(VkBackend *r, uint64_t retire_value, DeferredDestroyFn fn, void *user);
@@ -615,5 +609,34 @@ void delete_queue_tick(VkBackend *r);
 void delete_queue_drain(VkBackend *r);
 bool vk_frame_acquire(VkBackend *r);
 void vk_frame_submit(VkBackend *r);
+
+// Makes prior buffer writes available to a subsequent GPU operation.
+void cmd_buffer_barrier(VkCommandBuffer cmd, VkBuffer buffer, VkDeviceSize offset, VkDeviceSize size,
+                        VkPipelineStageFlags2 src_stage, VkAccessFlags2 src_access, VkPipelineStageFlags2 dst_stage,
+                        VkAccessFlags2 dst_access);
+// Uploads texture data through the staging pool.
+// Handles row pitch, mip/layer regions, and transfer-to-sample barriers.
+bool texture_upload(
+    VkBackend *r,
+    TextureID id,
+    uint32_t mip,
+    uint32_t layer,
+    VkOffset3D offset,
+    VkExtent3D extent,
+    ByteSpan data
+);
+
+// Copies a texture region into a host-readable buffer.
+// Completion must be synchronized before CPU access.
+bool texture_readback(
+    VkBackend *r,
+    VkCommandBuffer cmd,
+    TextureID id,
+    BufferSlice dst,
+    VkImageSubresourceLayers region,
+    VkExtent3D extent
+);
+
+
 
 #endif

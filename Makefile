@@ -15,7 +15,7 @@ SRC_C := main.c vk.c renderer.c  ext.c src/platform.c src/nuklear.c src/input.c 
          external/mu/mu.c
 
 SRC_CPP := vma.cpp \
-           $(wildcard external/meshoptimizer/src/*.cpp)
+#           $(wildcard external/meshoptimizer/src/*.cpp)
 
 # =========================================================
 # Optional Tracy Profiler
@@ -128,8 +128,6 @@ RELEASE_FLAGS := \
 # =========================================================
 
 LIBS := \
-    -lvulkan \
-    -lm \
     -lX11 \
     -lXi \
     -lXrandr \
