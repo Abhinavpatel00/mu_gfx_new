@@ -108,7 +108,7 @@ Do not create tiny functions solely for abstraction, indirection, or stylistic p
 Extract functions when they provide meaningful reuse, improve reasoning, establish a useful boundary, or enable testing.
 
 Prefer straightforward code over fragmented code.
-
+prefer long functions if it is called once avoid to not make it function
 ## Global State
 
 Minimize global state and hidden side effects.
@@ -221,7 +221,7 @@ Prefer changes that improve memory behavior, locality, and data movement before 
 - Avoid copying large user data structures. Prefer references to structures, and use spans for array data in structures and function parameters.
 
 use custom span from mu library 
-- Always pass `Span`, `ByteSpan`, and `GpuRange` function parameters by value. This allows the compiler to pass their pointer-and-size fields in registers instead of forcing a memory store/load round trip. 
+- Always pass `Span`, `ByteSpan` etc function parameters by value. This allows the compiler to pass their pointer-and-size fields in registers instead of forcing a memory store/load round trip. 
 - prefer to use designated initializer 
 - Always review code for performance issues before considering work complete.
 - ask question about decisions rather than assuming this and that user is a programmer not a novice 
@@ -232,3 +232,4 @@ use custom span from mu library
 
  } SOMETHING;
 
+- 

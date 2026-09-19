@@ -2151,7 +2151,7 @@ static void deferred_destroy_pipeline(VkBackend *r, void *user) {
 void pipeline_rebuild(VkBackend *r) {
     bool any_dirty = false;
 
-    for (int i = 0; i < r->render_pipelines.count; i++)
+    for (u32 i = 0; i < r->render_pipelines.count; i++)
         if (r->render_pipelines.entries[i].dirty)
             any_dirty = true;
 
@@ -2619,9 +2619,27 @@ bool vk_swapchain_present(VkQueue present_queue, FlowSwapchain *sc, const VkSema
     return true;
 }
 
-
+FORCE_INLINE bool
+set_vulkan_driver(const char *icd_path)
+{
+#ifdef _WIN32
+    return _putenv_s("VK_DRIVER_FILES", icd_path) == 0;
+#else
+    return setenv("VK_DRIVER_FILES", icd_path, 1) == 0;
+#endif
+}
 void vk_instance_create(VkBackend *r, VkBackendDesc *desc) {
     TracyCZoneN(ctx, "renderer_create", 1);
+#ifndef _WIN32
+  /* Optional Linux override. Respect the user's existing setting. */
+  if (!getenv("VK_DRIVER_FILES")) {
+    if (!set_vulkan_driver("/usr/share/vulkan/icd.d/intel_icd.json")) {
+      perror("Failed to set Vulkan driver");
+    }
+  }
+#endif
+
+
     // Instance
     // Debug messenger
     // Physical device
