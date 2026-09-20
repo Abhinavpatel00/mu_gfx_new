@@ -1833,27 +1833,57 @@ static inline void pipeline_fill_blend_defaults(GraphicsPipelineConfig *cfg) {
             cfg->blends[i] = blend_disabled();
     }
 }
+#include "build/generated/shaders.h" // Generated single header.
+
+
+bool read_shader(const char *path, const void **code, size_t *size) {
+    if (!path || !code || !size)
+        return false;
+
+#ifndef EMBED_SHADERS
+    void  *data = NULL;
+    size_t len  = 0;
+
+    if (!read_file(path, &data, &len))
+        return false;
+
+    *code = data;
+    *size = len;
+    return true;
+#else
+    return embedded_shader_find(path, code, size);
+#endif
+}
+
+void shader_release(const void *code) {
+
+#ifndef EMBED_SHADERS
+    free((void *)code);
+#else
+    (void)code; // Embedded data has static lifetime.
+#endif
+}
 
 VkPipeline create_graphics_pipeline(VkBackend *renderer, const GraphicsPipelineConfig *cfg) {
 
     assert(cfg->vert_path && cfg->frag_path && "pipeline needs both shader paths");
 
-    void  *vs_code = NULL;
-    size_t vs_size = 0;
+    const void *vs_code = NULL;
+    const void *fs_code = NULL;
 
-    void  *fs_code = NULL;
+    size_t vs_size = 0;
     size_t fs_size = 0;
 
-    if (!read_file(cfg->vert_path, &vs_code, &vs_size))
+    if (!read_shader(cfg->vert_path, &vs_code, &vs_size))
         abort();
 
-    if (!read_file(cfg->frag_path, &fs_code, &fs_size))
+    if (!read_shader(cfg->frag_path, &fs_code, &fs_size))
         abort();
 
-    VkShaderModule vs = create_shader_module(renderer->devc.device, vs_code, vs_size);
+    VkShaderModule vs = create_shader_module(renderer->devc.device, (void *)vs_code, vs_size);
 
-    VkShaderModule fs = create_shader_module(renderer->devc.device, fs_code, fs_size);
-
+    VkShaderModule fs = create_shader_module(renderer->devc.device, (void *)fs_code, fs_size);
+ 
     VkPipelineShaderStageCreateInfo      stages[2] = {{
                                                           .sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
                                                           .stage  = VK_SHADER_STAGE_VERTEX_BIT,
@@ -2006,8 +2036,10 @@ VkPipeline create_graphics_pipeline(VkBackend *renderer, const GraphicsPipelineC
     vkDestroyShaderModule(renderer->devc.device, vs, NULL);
     vkDestroyShaderModule(renderer->devc.device, fs, NULL);
 
-    free(vs_code);
-    free(fs_code);
+
+
+    shader_release(vs_code);
+    shader_release(fs_code);
 
     return pipeline;
 }
@@ -2017,7 +2049,7 @@ VkPipeline create_compute_pipeline(VkBackend *renderer, const char *compute_path
     void  *code = NULL;
     size_t size = 0;
 
-    if (!read_file(compute_path, &code, &size))
+    if (!read_shader(compute_path, &code, &size))
         abort();
 
     VkShaderModule                  module = create_shader_module(renderer->devc.device, code, size);
@@ -2039,7 +2071,7 @@ VkPipeline create_compute_pipeline(VkBackend *renderer, const char *compute_path
     VK_CHECK(vkCreateComputePipelines(renderer->devc.device, renderer->devc.pipeline_cache, 1, &ci, NULL, &pipeline));
 
     vkDestroyShaderModule(renderer->devc.device, module, NULL);
-    free(code);
+    shader_release(code);
 
     return pipeline;
 }
