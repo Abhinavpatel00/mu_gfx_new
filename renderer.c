@@ -1,6 +1,6 @@
 #include "renderer.h"
 #include "src/platform.h"
-#include "src/input_rgfw.h"
+#include "src/input_glfw.h"
 #include "src/nuklear_ui.h"
 #include "src/slangtypes.h"
 #include "external/dmon/dmon.h"
@@ -10,9 +10,18 @@
 
 
 
+// Forward declarations for functions defined later in this file or in included files
+static void install_callbacks(Renderer *r);
+static void grass_system_init(Renderer *r);
+static void grass_camera_update(Renderer *r);
+static void grass_system_update_global(Renderer *r, GlobalData *data);
+
+
+
 
 
 #include "vk.h"
+// TODO : improve it may be using libav like something idk
 typedef struct CaptureState {
     Buffer   readback[CAPTURE_SLOTS];
     uint64_t submit_value[CAPTURE_SLOTS]; // timeline value of the submission carrying the copy; 0 = idle
@@ -73,7 +82,7 @@ struct Renderer {
     uint64_t cpu_prev_frame;
     uint32_t frame_count;
     float    dt;
-    RGFW_window           *window;
+struct     GLFWwindow          *window;
     Input                  input;
     NuklearUi        ui;
     RenderTarget depth[MAX_SWAPCHAIN_IMAGES];
@@ -97,14 +106,16 @@ struct Renderer {
         uint32_t fullscreen;
         uint32_t postprocess;
         uint32_t gltf_minimal;
-        uint32_t fire;
         uint32_t sprite;
         uint32_t slug_text;
 
         uint32_t beam;
         uint32_t sky;
         uint32_t skinning;
+        uint32_t grass;
     } EnginePipelines;
+    struct GrassSystem *grass;
+    mat4 grass_viewproj;
 };
 
 static bool trigger_shader_compilation(void) {
@@ -742,15 +753,6 @@ static void renderer_resources_create(Renderer *r, VkBackendDesc *desc) {
     {
 
         {
-            GraphicsPipelineConfig cfg = pipeline_config_fullscreen();
-            cfg.vert_path              = "compiledshaders/fire.vert.spv";
-            cfg.frag_path              = "compiledshaders/fire.frag.spv";
-            cfg.color_formats          = &r->hdr_color[0].format;
-
-            r->EnginePipelines.fire = pipeline_create_graphics(&r->vk, &cfg);
-        }
-
-        {
             r->EnginePipelines.postprocess = pipeline_create_compute(&r->vk, "compiledshaders/postprocess.comp.spv");
         }
 
@@ -783,32 +785,21 @@ static void renderer_resources_create(Renderer *r, VkBackendDesc *desc) {
     }
 }
 Renderer *renderer_create(bool use_wayland) {
-#ifndef RGFW_WAYLAND
-    if (use_wayland) {
-        log_error("[renderer] Wayland support is not enabled in this build");
-        return NULL;
-    }
-#endif
+
     VK_CHECK(volkInitialize());
-    if (RGFW_init("mu_gfx", RGFW_initVulkan | (use_wayland ? 0 : RGFW_initX11)) != 0) {
-        log_error("[renderer] RGFW initialization failed");
-        return NULL;
-    }
-    if (use_wayland && !RGFW_usingWayland()) {
-        log_error("[renderer] Could not connect to the requested Wayland display");
-        RGFW_deinit();
-        return NULL;
-    }
+    
+glfwInitVulkanLoader(vkGetInstanceProcAddr);
+glfwInitHint(GLFW_WAYLAND_LIBDECOR, GLFW_WAYLAND_DISABLE_LIBDECOR);
+glfwInit();
     const char *dev_exts[] = {VK_KHR_SWAPCHAIN_EXTENSION_NAME, VK_EXT_ROBUSTNESS_2_EXTENSION_NAME};
 
-    size_t       platform_ext_count = 0;
-    const char **platform_exts = RGFW_getRequiredInstanceExtensions_Vulkan(&platform_ext_count);
+    uint32_t     platform_ext_count = 0;
+    const char **platform_exts = glfwGetRequiredInstanceExtensions(&platform_ext_count);
     if (!platform_exts || !platform_ext_count) {
-        log_error("[renderer] RGFW Vulkan instance extensions unavailable");
-        RGFW_deinit();
+        log_error("[renderer] GLFW Vulkan instance extensions unavailable");
+        glfwTerminate();
         return NULL;
     }
-
     VkBackendDesc desc = {
         .app_name            = "My Renderer",
         .instance_layers     = NULL,
@@ -854,16 +845,26 @@ Renderer *renderer_create(bool use_wayland) {
     (void)posix_memalign((void **)&r, _Alignof(Renderer), sizeof(*r));
     memset(r, 0, sizeof(*r)); // zero-value = safe defaults everywhere
     vk_instance_create(&r->vk, &desc);
-    r->window = RGFW_createWindow("Vulkan", 0, 0, desc.width, desc.height, RGFW_windowCenter);
+    glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);   /* we drive Vulkan ourselves */
+    r->window = glfwCreateWindow((int)desc.width, (int)desc.height,
+                                 "Vulkan", NULL, NULL);
     if (!r->window) {
-        log_error("[renderer] RGFW window creation failed");
+        log_error("[renderer] glfwCreateWindow failed");
         exit(EXIT_FAILURE);
     }
-    RGFW_window_setExitKey(r->window, RGFW_keyNULL);
-    VK_CHECK(RGFW_window_createSurface_Vulkan(r->window, r->vk.instance.instance, &r->vk.surface));
+   
+
+
+VK_CHECK(glfwCreateWindowSurface(r->vk.instance.instance, r->window,
+                                     NULL, &r->vk.surface));
+
     int width, height;
-    RGFW_window_getSizeInPixels(r->window, &width, &height);
-    desc.width = (uint32_t)width;
+    glfwGetFramebufferSize(r->window, &width, &height);
+
+
+
+
+ desc.width = (uint32_t)width;
     desc.height = (uint32_t)height;
     vk_backend_create(&r->vk, &desc);
     renderer_resources_create(r, &desc);
@@ -873,6 +874,8 @@ Renderer *renderer_create(bool use_wayland) {
 
     // gfx_pipelines();
     input_init(&r->input, r->window);
+    install_callbacks(r);
+    grass_system_init(r);
     dmon_init();
     g_source_watch_id = dmon_watch("shaders", watch_callback, DMON_WATCHFLAGS_RECURSIVE, r);
     dmon_watch("compiledshaders", watch_callback, DMON_WATCHFLAGS_RECURSIVE, r);
@@ -989,17 +992,17 @@ static MU_INLINE bool frame_start(Renderer *r) {
     r->cpu_frame_ns    = (double)(frame_now - r->cpu_prev_frame);
     r->cpu_prev_frame  = frame_now;
     r->vk.current_frame   = (r->vk.current_frame + 1) % MAX_FRAMES_IN_FLIGHT;
+int fb_w, fb_h;
+glfwGetFramebufferSize(r->window, &fb_w, &fb_h);
 
-    int fb_w, fb_h;
-    RGFW_window_getSizeInPixels(r->window, &fb_w, &fb_h);
-
-    if (fb_w == 0 || fb_h == 0 || RGFW_window_isMinimized(r->window)) {
-        uint64_t wait_start = mu_time_now();
-        RGFW_waitForEvent(100);
-        r->cpu_wait_accum_ns += (double)(mu_time_now() - wait_start);
-        TracyCZoneEnd(ctx);
-        return false;
-    }
+if (fb_w == 0 || fb_h == 0 ||
+    glfwGetWindowAttrib(r->window, GLFW_ICONIFIED)) {
+    uint64_t wait_start = mu_time_now();
+    glfwWaitEventsTimeout(0.1);          /* was RGFW_waitForEvent(100) */
+    r->cpu_wait_accum_ns += (double)(mu_time_now() - wait_start);
+    TracyCZoneEnd(ctx);
+    return false;
+}
     r->vk.swapchain.needs_recreate |= fb_w != (int)r->vk.swapchain.extent.width || fb_h != (int)r->vk.swapchain.extent.height;
 
     // Recreate first, acquire after: if the swapchain is (re)created, the old
@@ -1045,8 +1048,13 @@ static void update_global_data(Renderer *r) {
     glm_mat4_identity(data.inv_projection);
     glm_mat4_identity(data.inv_viewproj);
 
+    r->dt = (float)((double)r->cpu_frame_ns / 1000000000.0);
+    grass_camera_update(r);
+    grass_system_update_global(r, &data);
+    glm_mat4_copy(data.viewproj, r->grass_viewproj);
+
     data.time             = (float)((double)(mu_time_now() - r->start_time) / mu_time_freq());
-    data.delta_time       = (float)((double)r->cpu_frame_ns / 1000000000.0);
+    data.delta_time       = r->dt;
     data.frame_count      = r->frame_count++;
     data.screen_params[0] = (float)r->vk.swapchain.extent.width;
     data.screen_params[1] = (float)r->vk.swapchain.extent.height;
@@ -1112,38 +1120,6 @@ static void post_pass(Renderer *r, VkCommandBuffer cmd) {
         };
 
         dispatch_push(&r->vk, cmd, BYTE_SPAN(push), (push.width + 15) / 16, (push.height + 15) / 16, 1);
-    }
-}
-
-typedef struct FirePush {
-    uint32_t width;
-    uint32_t height;
-    float    time;
-    float    pad;
-} FirePush;
-
-static void pass_fire(Renderer *r, VkCommandBuffer cmd) {
-    GpuProfiler *frame_prof = &r->vk.gpuprofiler[r->vk.current_frame];
-    GPU_SCOPE(frame_prof, cmd, "Fire Pass", VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT) {
-        uint32_t image = r->vk.swapchain.current_image;
-
-        PassAttachment color = {
-            .target = &r->hdr_color[image],
-            .load   = LOAD_CLEAR,
-            .clear  = {0.02f, 0.025f, 0.03f, 1.0f},
-        };
-
-        begin_pass(&r->vk, cmd, &(PassDesc){.colors = &color, .color_count = 1, .pipeline = r->EnginePipelines.fire});
-
-        FirePush push = {
-            .width  = r->vk.swapchain.extent.width,
-            .height = r->vk.swapchain.extent.height,
-            .time   = (float)((double)(mu_time_now() - r->start_time) / mu_time_freq()),
-            .pad    = 0.0f,
-        };
-
-        cmd_draw(&r->vk, cmd, BYTE_SPAN(push), 3, 1);
-        end_pass(cmd);
     }
 }
 
@@ -1274,123 +1250,163 @@ static void pass_ldr_to_swapchain(Renderer *r, VkCommandBuffer cmd) {
 }
 
 #include "src/nuklear_pass.inl"
+#include "src/grass.c"
+
+static Renderer *g_renderer;
+
+static void on_key(GLFWwindow *w, int key, int scancode, int action, int mods) {
+    Renderer          *r   = g_renderer;
+    struct nk_context *ctx = &r->ui.context;
+
+    input_feed_key(&r->input, key, action);
+
+    bool down = action != GLFW_RELEASE;
+    bool ctrl = (mods & GLFW_MOD_CONTROL) != 0;
+
+    nk_input_key(ctx, NK_KEY_SHIFT, (mods & GLFW_MOD_SHIFT) != 0);
+    nk_input_key(ctx, NK_KEY_CTRL,  ctrl);
+
+    switch (key) {
+    case GLFW_KEY_DELETE:    nk_input_key(ctx, NK_KEY_DEL,       down); break;
+    case GLFW_KEY_ENTER:     nk_input_key(ctx, NK_KEY_ENTER,     down); break;
+    case GLFW_KEY_TAB:       nk_input_key(ctx, NK_KEY_TAB,       down); break;
+    case GLFW_KEY_BACKSPACE: nk_input_key(ctx, NK_KEY_BACKSPACE, down); break;
+    case GLFW_KEY_UP:        nk_input_key(ctx, NK_KEY_UP,        down); break;
+    case GLFW_KEY_DOWN:      nk_input_key(ctx, NK_KEY_DOWN,      down); break;
+    case GLFW_KEY_LEFT:
+        nk_input_key(ctx, NK_KEY_LEFT,           down && !ctrl);
+        nk_input_key(ctx, NK_KEY_TEXT_WORD_LEFT, down &&  ctrl);
+        break;
+    case GLFW_KEY_RIGHT:
+        nk_input_key(ctx, NK_KEY_RIGHT,           down && !ctrl);
+        nk_input_key(ctx, NK_KEY_TEXT_WORD_RIGHT, down &&  ctrl);
+        break;
+    case GLFW_KEY_HOME:
+        nk_input_key(ctx, NK_KEY_TEXT_START,   down);
+        nk_input_key(ctx, NK_KEY_SCROLL_START, down);
+        break;
+    case GLFW_KEY_END:
+        nk_input_key(ctx, NK_KEY_TEXT_END,     down);
+        nk_input_key(ctx, NK_KEY_SCROLL_END,   down);
+        break;
+    case GLFW_KEY_PAGE_UP:   nk_input_key(ctx, NK_KEY_SCROLL_UP,   down); break;
+    case GLFW_KEY_PAGE_DOWN: nk_input_key(ctx, NK_KEY_SCROLL_DOWN, down); break;
+    case GLFW_KEY_C: nk_input_key(ctx, NK_KEY_COPY,             down && ctrl); break;
+    case GLFW_KEY_V: nk_input_key(ctx, NK_KEY_PASTE,            down && ctrl); break;
+    case GLFW_KEY_X: nk_input_key(ctx, NK_KEY_CUT,              down && ctrl); break;
+    case GLFW_KEY_Z: nk_input_key(ctx, NK_KEY_TEXT_UNDO,        down && ctrl); break;
+    case GLFW_KEY_Y: nk_input_key(ctx, NK_KEY_TEXT_REDO,        down && ctrl); break;
+    case GLFW_KEY_A: nk_input_key(ctx, NK_KEY_TEXT_SELECT_ALL,  down && ctrl); break;
+    default: break;
+    }
+
+    /* Hotkeys: only on the initial press, no Ctrl, no active text edit.
+     * GLFW's repeat is a separate action value, so it's excluded here. */
+    if (action != GLFW_PRESS || ctrl || ctx->text_edit.active)
+        return;
+
+    if (key == GLFW_KEY_R) {
+        char path[256];
+        snprintf(path, sizeof(path), "screenshot_%llu.png",
+                 (unsigned long long)(mu_time_now() * 1000.0 / mu_time_freq()));
+        capture_take_screenshot(r, path);
+    } else if (key == GLFW_KEY_F9) {
+        if (r->capture.recording) {
+            capture_stop_video(r);
+        } else {
+            char path[256];
+            snprintf(path, sizeof(path), "recording_%llu.mp4",
+                     (unsigned long long)(mu_time_now() / mu_time_freq()));
+            capture_start_video(r, path, 60);
+        }
+    }
+}
+
+static void on_char(GLFWwindow *w, unsigned int codepoint) {
+    nk_input_unicode(&g_renderer->ui.context, codepoint);
+}
+
+static void on_mouse_button(GLFWwindow *w, int button, int action, int mods) {
+    Renderer          *r   = g_renderer;
+    struct nk_context *ctx = &r->ui.context;
+
+    input_feed_button(&r->input, button, action);
+
+    enum nk_buttons b;
+    switch (button) {
+    case GLFW_MOUSE_BUTTON_LEFT:   b = NK_BUTTON_LEFT;   break;
+    case GLFW_MOUSE_BUTTON_MIDDLE: b = NK_BUTTON_MIDDLE; break;
+    case GLFW_MOUSE_BUTTON_RIGHT:  b = NK_BUTTON_RIGHT;  break;
+    default: return;
+    }
+    nk_input_button(ctx, b, (int)ctx->input.mouse.pos.x,
+                    (int)ctx->input.mouse.pos.y, action == GLFW_PRESS);
+}
+
+static void on_cursor(GLFWwindow *w, double x, double y) {
+    Renderer *r = g_renderer;
+    input_feed_cursor(&r->input, x, y);
+    nk_input_motion(&r->ui.context, (int)x, (int)y);
+}
+
+static void on_scroll(GLFWwindow *w, double x, double y) {
+    Renderer *r = g_renderer;
+    input_feed_scroll(&r->input, x, y);
+    nk_input_scroll(&r->ui.context, nk_vec2((float)x, (float)y));
+}
+
+static void on_focus(GLFWwindow *w, int focused) {
+    Renderer          *r   = g_renderer;
+    struct nk_context *ctx = &r->ui.context;
+
+    input_feed_focus(&r->input, focused != 0);
+    if (!focused) {
+        for (int k = 0; k < NK_KEY_MAX; ++k)
+            nk_input_key(ctx, (enum nk_keys)k, nk_false);
+        for (int b = 0; b < NK_BUTTON_MAX; ++b)
+            nk_input_button(ctx, (enum nk_buttons)b,
+                            (int)ctx->input.mouse.pos.x,
+                            (int)ctx->input.mouse.pos.y, nk_false);
+    }
+}
+
+static void install_callbacks(Renderer *r) {
+    g_renderer = r;
+    GLFWwindow *w = r->window;
+    glfwSetWindowUserPointer(w, r);
+    glfwSetKeyCallback(w, on_key);
+    glfwSetCharCallback(w, on_char);
+    glfwSetMouseButtonCallback(w, on_mouse_button);
+    glfwSetCursorPosCallback(w, on_cursor);
+    glfwSetScrollCallback(w, on_scroll);
+    glfwSetWindowFocusCallback(w, on_focus);
+}
+
 
 static void platform_poll_events(Renderer *r) {
     struct nk_context *ctx = &r->ui.context;
-    RGFW_event event;
     input_begin(&r->input);
     nk_input_begin(ctx);
-    while (RGFW_checkEvent(&event)) {
-        input_feed_rgfw(&r->input, &event);
-        if (event.common.win != r->window)
-            continue;
-        switch (event.type) {
-        case RGFW_windowClose:
-            break;
-        case RGFW_mouseMotion:
-            nk_input_motion(ctx, event.mouse.x, event.mouse.y);
-            break;
-        case RGFW_mouseButtonPressed:
-        case RGFW_mouseButtonReleased: {
-            enum nk_buttons button;
-            switch (event.button.value) {
-            case RGFW_mouseLeft: button = NK_BUTTON_LEFT; break;
-            case RGFW_mouseMiddle: button = NK_BUTTON_MIDDLE; break;
-            case RGFW_mouseRight: button = NK_BUTTON_RIGHT; break;
-            default: continue;
-            }
-            nk_input_button(ctx, button, (int)ctx->input.mouse.pos.x, (int)ctx->input.mouse.pos.y,
-                            event.type == RGFW_mouseButtonPressed);
-            break;
-        }
-        case RGFW_mouseScroll:
-            nk_input_scroll(ctx, nk_vec2(event.delta.x, event.delta.y));
-            break;
-        case RGFW_keyChar:
-            nk_input_unicode(ctx, event.keyChar.value);
-            break;
-        case RGFW_windowFocusOut:
-            for (int key = 0; key < NK_KEY_MAX; ++key)
-                nk_input_key(ctx, (enum nk_keys)key, nk_false);
-            for (int button = 0; button < NK_BUTTON_MAX; ++button)
-                nk_input_button(ctx, (enum nk_buttons)button, (int)ctx->input.mouse.pos.x,
-                                (int)ctx->input.mouse.pos.y, nk_false);
-            break;
-        case RGFW_keyPressed:
-        case RGFW_keyReleased: {
-            bool down = event.type == RGFW_keyPressed;
-            bool ctrl = (event.key.mod & RGFW_modControl) != 0;
-            nk_input_key(ctx, NK_KEY_SHIFT, (event.key.mod & RGFW_modShift) != 0);
-            nk_input_key(ctx, NK_KEY_CTRL, ctrl);
-            switch (event.key.value) {
-            case RGFW_keyDelete: nk_input_key(ctx, NK_KEY_DEL, down); break;
-            case RGFW_keyReturn: nk_input_key(ctx, NK_KEY_ENTER, down); break;
-            case RGFW_keyTab: nk_input_key(ctx, NK_KEY_TAB, down); break;
-            case RGFW_keyBackSpace: nk_input_key(ctx, NK_KEY_BACKSPACE, down); break;
-            case RGFW_keyUp: nk_input_key(ctx, NK_KEY_UP, down); break;
-            case RGFW_keyDown: nk_input_key(ctx, NK_KEY_DOWN, down); break;
-            case RGFW_keyLeft:
-                nk_input_key(ctx, NK_KEY_LEFT, down && !ctrl);
-                nk_input_key(ctx, NK_KEY_TEXT_WORD_LEFT, down && ctrl);
-                break;
-            case RGFW_keyRight:
-                nk_input_key(ctx, NK_KEY_RIGHT, down && !ctrl);
-                nk_input_key(ctx, NK_KEY_TEXT_WORD_RIGHT, down && ctrl);
-                break;
-            case RGFW_keyHome:
-                nk_input_key(ctx, NK_KEY_TEXT_START, down);
-                nk_input_key(ctx, NK_KEY_SCROLL_START, down);
-                break;
-            case RGFW_keyEnd:
-                nk_input_key(ctx, NK_KEY_TEXT_END, down);
-                nk_input_key(ctx, NK_KEY_SCROLL_END, down);
-                break;
-            case RGFW_keyPageUp: nk_input_key(ctx, NK_KEY_SCROLL_UP, down); break;
-            case RGFW_keyPageDown: nk_input_key(ctx, NK_KEY_SCROLL_DOWN, down); break;
-            case RGFW_keyC: nk_input_key(ctx, NK_KEY_COPY, down && ctrl); break;
-            case RGFW_keyV: nk_input_key(ctx, NK_KEY_PASTE, down && ctrl); break;
-            case RGFW_keyX: nk_input_key(ctx, NK_KEY_CUT, down && ctrl); break;
-            case RGFW_keyZ: nk_input_key(ctx, NK_KEY_TEXT_UNDO, down && ctrl); break;
-            case RGFW_keyY: nk_input_key(ctx, NK_KEY_TEXT_REDO, down && ctrl); break;
-            case RGFW_keyA: nk_input_key(ctx, NK_KEY_TEXT_SELECT_ALL, down && ctrl); break;
-            default: break;
-            }
-            if (!down || event.key.repeat || ctrl || ctx->text_edit.active)
-                break;
-            if (event.key.value == RGFW_keyR) {
-                char path[256];
-                snprintf(path, sizeof(path), "screenshot_%llu.png",
-                         (unsigned long long)(mu_time_now() * 1000.0 / mu_time_freq()));
-                capture_take_screenshot(r, path);
-            } else if (event.key.value == RGFW_keyF9) {
-                if (r->capture.recording) {
-                    capture_stop_video(r);
-                } else {
-                    char path[256];
-                    snprintf(path, sizeof(path), "recording_%llu.mp4",
-                             (unsigned long long)(mu_time_now() / mu_time_freq()));
-                    capture_start_video(r, path, 60);
-                }
-            }
-            break;
-        }
-        default: break;
-        }
-    }
+    glfwPollEvents();                 /* fires the callbacks above */
     nk_input_end(ctx);
+
     int width, height;
-    RGFW_window_getSize(r->window, &width, &height);
+    glfwGetWindowSize(r->window, &width, &height);
     r->ui.width  = (float)width;
     r->ui.height = (float)height;
 }
 
 
+
+
+
 bool renderer_frame(Renderer *r) {
         TracyCFrameMark;
         platform_poll_events(r);
-        if (RGFW_window_shouldClose(r->window))
-            return false;
-        pipeline_rebuild(&r->vk);
+if (glfwWindowShouldClose(r->window))    /* was RGFW_window_shouldClose */
+    return false;     
+
+   pipeline_rebuild(&r->vk);
    
 
         delete_queue_tick(&r->vk);
@@ -1430,7 +1446,8 @@ bool renderer_frame(Renderer *r) {
             }
         }
 
-       post_pass(r, cmd);
+        grass_pass(r, cmd);
+        post_pass(r, cmd);
         pass_smaa(r, cmd);
         pass_ldr_to_swapchain(r, cmd);
         render_gpu_profiler_ui(r);
@@ -1459,6 +1476,13 @@ void renderer_destroy(Renderer *r) {
     }
     nuklear_shutdown(r);
     capture_shutdown(r);
+    if (r->grass) {
+        GrassSystem *g = r->grass;
+        forEach(i, MAX_FRAMES_IN_FLIGHT)
+            destroy_buffer(&r->vk, &g->args[i]);
+        free(g);
+        r->grass = NULL;
+    }
     forEach(i, MAX_SWAPCHAIN_IMAGES) {
         rt_destroy(&r->vk, &r->depth[i]);
         rt_destroy(&r->vk, &r->hdr_color[i]);
@@ -1475,7 +1499,7 @@ void renderer_destroy(Renderer *r) {
     vk_backend_destroy(&r->vk);
     vkDestroySurfaceKHR(r->vk.instance.instance, r->vk.surface, NULL);
     vk_instance_destroy(&r->vk);
-    RGFW_window_close(r->window);
-    RGFW_deinit();
+glfwDestroyWindow(r->window);
+glfwTerminate();                         
     free(r);
 }

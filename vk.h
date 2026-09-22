@@ -330,6 +330,24 @@ typedef struct ColorAttachmentBlend {
 
 } ColorAttachmentBlend;
 
+#define MAX_VERTEX_ATTRIBUTES 8
+
+typedef struct VertexAttribute {
+    uint32_t location;
+    VkFormat format;
+    uint32_t offset;
+} VertexAttribute;
+
+// Mesh vertex input. All attributes live in binding 0 at VERTEX input rate,
+// so a config describes one interleaved vertex stream. stride == 0 means "no
+// vertex input": the vertex shader derives geometry from SV_VertexID or a
+// storage buffer. Shader inputs are declared with explicit [[vk::location(n)]].
+typedef struct VertexLayout {
+    uint32_t        stride; // 0 = no vertex input
+    uint32_t        count;
+    VertexAttribute attributes[MAX_VERTEX_ATTRIBUTES];
+} VertexLayout;
+
 typedef struct GraphicsPipelineConfig {
     // Rasterization
     //
