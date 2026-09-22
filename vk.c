@@ -3352,3 +3352,26 @@ void sampler_destroy(VkBackend *r, SamplerID id) {
     r->samplers[id] = VK_NULL_HANDLE;
     mu_id_pool_destroy_id(&r->sampler_pool, id);
 }
+
+void cmd_buffer_barrier(VkCommandBuffer cmd, VkBuffer buffer, VkDeviceSize offset, VkDeviceSize size,
+                        VkPipelineStageFlags2 src_stage, VkAccessFlags2 src_access, VkPipelineStageFlags2 dst_stage,
+                        VkAccessFlags2 dst_access) {
+    VkBufferMemoryBarrier2 barrier = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2,
+        .srcStageMask = src_stage,
+        .srcAccessMask = src_access,
+        .dstStageMask = dst_stage,
+        .dstAccessMask = dst_access,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .buffer = buffer,
+        .offset = offset,
+        .size = size,
+    };
+    VkDependencyInfo dep_info = {
+        .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+        .bufferMemoryBarrierCount = 1,
+        .pBufferMemoryBarriers = &barrier,
+    };
+    vkCmdPipelineBarrier2(cmd, &dep_info);
+}

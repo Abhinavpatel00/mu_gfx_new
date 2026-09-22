@@ -1,9 +1,9 @@
 #ifndef MU_PLATFORM_H
 #define MU_PLATFORM_H
-
 #define VK_NO_PROTOTYPES
-#define RGFW_VULKAN
-#include "../external/RGFW/RGFW.h"
+#define GLFW_INCLUDE_VULKAN
+
+#include "GLFW/glfw3.h"
 #ifdef Status
 #undef Status
 #endif

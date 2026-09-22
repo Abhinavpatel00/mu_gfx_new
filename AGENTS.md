@@ -232,4 +232,7 @@ use custom span from mu library
 
  } SOMETHING;
 
-- 
+- never waste time in writing tests
+- do not introduce too much additional files and if necessary ask before introducing 
+- be talktive ask question about implemention of algorithm and how you should approach the problem rather than just blindly taking decision yourself ask as much as to me about 
+changes you do 

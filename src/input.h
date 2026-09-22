@@ -4,7 +4,7 @@
 #include <assert.h>
 #include <stdbool.h>
 
-struct RGFW_window;
+struct GLFWwindow;
 
 typedef enum InputKey {
     KEY_NONE,
@@ -43,7 +43,7 @@ typedef struct InputButton {
 
 /* Read-only state. Window ownership remains with the application. No allocations. */
 typedef struct Input {
-    struct RGFW_window *window;
+    struct GLFWwindow *window;
     InputButton keys[KEY_COUNT];
     InputButton mouse[MOUSE_BUTTON_COUNT];
     double mouse_x, mouse_y;
@@ -54,12 +54,12 @@ typedef struct Input {
 } Input;
 
 /* Initialize before pumping. Held inputs start up; first motion sets the baseline. */
-void input_init(Input *input, struct RGFW_window *window);
-/* Single-window convenience pump; do not also drain RGFW's global event queue.
- * Clears edges/deltas first. Down/up sets both edges; repeat never sets pressed.
+void input_init(Input *input, struct GLFWwindow *window);
+/* Single-window convenience pump: clears then polls. Requires the adapter's
+ * callbacks to be installed, either by input_attach or by the application.
+ * Down/up sets both edges; repeat never sets pressed.
  * Focus loss releases held buttons as cancellation, not an activation.
  * Coordinates/deltas are window-local; raw motion is not accumulated here.
- * Other native events are drained too: use input_rgfw.h for an app-owned pump.
  */
 void input_update(Input *input);
 
