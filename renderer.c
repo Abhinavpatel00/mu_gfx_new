@@ -12,10 +12,6 @@
 
 // Forward declarations for functions defined later in this file or in included files
 static void install_callbacks(Renderer *r);
-static void grass_system_init(Renderer *r);
-static void grass_camera_update(Renderer *r);
-static void grass_system_update_global(Renderer *r, GlobalData *data);
-
 
 
 
@@ -114,8 +110,6 @@ struct     GLFWwindow          *window;
         uint32_t skinning;
         uint32_t grass;
     } EnginePipelines;
-    struct GrassSystem *grass;
-    mat4 grass_viewproj;
 };
 
 static bool trigger_shader_compilation(void) {
@@ -875,7 +869,6 @@ VK_CHECK(glfwCreateWindowSurface(r->vk.instance.instance, r->window,
     // gfx_pipelines();
     input_init(&r->input, r->window);
     install_callbacks(r);
-    grass_system_init(r);
     dmon_init();
     g_source_watch_id = dmon_watch("shaders", watch_callback, DMON_WATCHFLAGS_RECURSIVE, r);
     dmon_watch("compiledshaders", watch_callback, DMON_WATCHFLAGS_RECURSIVE, r);
@@ -1049,9 +1042,6 @@ static void update_global_data(Renderer *r) {
     glm_mat4_identity(data.inv_viewproj);
 
     r->dt = (float)((double)r->cpu_frame_ns / 1000000000.0);
-    grass_camera_update(r);
-    grass_system_update_global(r, &data);
-    glm_mat4_copy(data.viewproj, r->grass_viewproj);
 
     data.time             = (float)((double)(mu_time_now() - r->start_time) / mu_time_freq());
     data.delta_time       = r->dt;
@@ -1250,7 +1240,6 @@ static void pass_ldr_to_swapchain(Renderer *r, VkCommandBuffer cmd) {
 }
 
 #include "src/nuklear_pass.inl"
-#include "src/grass.c"
 
 static Renderer *g_renderer;
 
@@ -1446,7 +1435,6 @@ if (glfwWindowShouldClose(r->window))    /* was RGFW_window_shouldClose */
             }
         }
 
-        grass_pass(r, cmd);
         post_pass(r, cmd);
         pass_smaa(r, cmd);
         pass_ldr_to_swapchain(r, cmd);
