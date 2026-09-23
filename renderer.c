@@ -1,20 +1,16 @@
 #include "renderer.h"
-#include "src/platform.h"
-#include "src/input_glfw.h"
-#include "src/nuklear_ui.h"
-#include "src/slangtypes.h"
 #include "external/dmon/dmon.h"
+#include "external/mu/mu/mu_perf.h"
 #include "external/stb/stb_image.h"
 #include "external/stb/stb_image_write.h"
-#include "external/mu/mu/mu_perf.h"
-
-
+#include "src/input_glfw.h"
+#include "src/nuklear_ui.h"
+#include "src/platform.h"
+#include "src/slangtypes.h"
+#include <stdint.h>
 
 // Forward declarations for functions defined later in this file or in included files
 static void install_callbacks(Renderer *r);
-
-
-
 
 #include "vk.h"
 // TODO : improve it may be using libav like something idk
@@ -61,50 +57,45 @@ typedef struct NuklearUi {
     float                       height;
 } NuklearUi;
 
-
 struct Renderer {
     VkBackend vk;
 
-
-
-
-
     //  Renderer3D scene;
-    double   cpu_frame_ns;
-    uint64_t start_time;
-    double   cpu_active_ns;
-    double   cpu_wait_ns;
-    double   cpu_wait_accum_ns;
-    uint64_t cpu_prev_frame;
-    uint32_t frame_count;
-    float    dt;
-struct     GLFWwindow          *window;
-    Input                  input;
-    NuklearUi        ui;
-    RenderTarget depth[MAX_SWAPCHAIN_IMAGES];
-    RenderTarget hdr_color[MAX_SWAPCHAIN_IMAGES];
-    RenderTarget ldr_color[MAX_SWAPCHAIN_IMAGES];
-    RenderTarget smaa_final[MAX_SWAPCHAIN_IMAGES];
-    RenderTarget smaa_edges[MAX_SWAPCHAIN_IMAGES];
-    RenderTarget smaa_weights[MAX_SWAPCHAIN_IMAGES];
-    TextureID dummy_texture;
-    TextureID smaa_area_tex;
-    TextureID smaa_search_tex;
+    double             cpu_frame_ns;
+    uint64_t           start_time;
+    double             cpu_active_ns;
+    double             cpu_wait_ns;
+    double             cpu_wait_accum_ns;
+    uint64_t           cpu_prev_frame;
+    uint32_t           frame_count;
+    float              dt;
+    struct GLFWwindow *window;
+    Input              input;
+    NuklearUi          ui;
+    RenderTarget       depth[MAX_SWAPCHAIN_IMAGES];
+    RenderTarget       hdr_color[MAX_SWAPCHAIN_IMAGES];
+    RenderTarget       ldr_color[MAX_SWAPCHAIN_IMAGES];
+    RenderTarget       smaa_final[MAX_SWAPCHAIN_IMAGES];
+    RenderTarget       smaa_edges[MAX_SWAPCHAIN_IMAGES];
+    RenderTarget       smaa_weights[MAX_SWAPCHAIN_IMAGES];
+    TextureID          dummy_texture;
+    TextureID          smaa_area_tex;
+    TextureID          smaa_search_tex;
     struct {
         uint32_t smaa_edge;
         uint32_t smaa_weight;
         uint32_t smaa_blend;
     } smaa_pipelines;
-    Buffer global_ubo[MAX_FRAMES_IN_FLIGHT];
-    Buffer            readback_buffer;
-    CaptureState      capture;
+    Buffer       global_ubo[MAX_FRAMES_IN_FLIGHT];
+    Buffer       readback_buffer;
+    CaptureState capture;
     struct {
         uint32_t fullscreen;
         uint32_t postprocess;
         uint32_t gltf_minimal;
         uint32_t sprite;
         uint32_t slug_text;
-
+        uint32_t fire;
         uint32_t beam;
         uint32_t sky;
         uint32_t skinning;
@@ -114,8 +105,8 @@ struct     GLFWwindow          *window;
 
 static bool trigger_shader_compilation(void) {
     // Use system() to run the bash script
-    // Note: system() blocks until the process finishes. 
-    // For a quick compilation script, this is acceptable, 
+    // Note: system() blocks until the process finishes.
+    // For a quick compilation script, this is acceptable,
     // but for better UX, consider using popen() or a thread.
     // Since dmon callback is already on a thread, blocking there is okay.
     // But if the script is slow, it might queue up. We'll use system() for simplicity.
@@ -127,7 +118,6 @@ static bool trigger_shader_compilation(void) {
     }
     return true;
 }
-
 
 static dmon_watch_id g_source_watch_id;
 
@@ -289,8 +279,7 @@ bool capture_start_video(Renderer *r, const char *path, uint32_t fps) {
              "-f rawvideo -pix_fmt %s -s %ux%u -r %u -i - "
              "-vf \"pad=ceil(iw/2)*2:ceil(ih/2)*2\" "
              "-c:v libx264 -preset ultrafast -crf 18 -pix_fmt yuv420p \"%s\"",
-             c->src_is_bgra ? "bgra" : "rgba",
-             c->width, c->height, fps, path);
+             c->src_is_bgra ? "bgra" : "rgba", c->width, c->height, fps, path);
 
     FILE *p = popen(cmd, "w");
     if (!p) {
@@ -480,10 +469,9 @@ static void capture_record(Renderer *r, VkCommandBuffer cmd) {
 }
 #include "src/nuklear_renderer.inl"
 
-
 static void renderer_resources_create(Renderer *r, VkBackendDesc *desc) {
     VkFormat depth_format = pick_depth_format(r->vk.devc.physical_device);
-    VkFormat hdr_format = VK_FORMAT_R16G16B16A16_SFLOAT;
+    VkFormat hdr_format   = VK_FORMAT_R16G16B16A16_SFLOAT;
     capture_init(r, r->vk.swapchain.extent.width, r->vk.swapchain.extent.height);
 
     RenderTargetSpec depth_spec = {.width  = r->vk.swapchain.extent.width,
@@ -551,7 +539,6 @@ static void renderer_resources_create(Renderer *r, VkBackendDesc *desc) {
 
                                          .mip_count  = 1,
                                          .debug_name = "smaa_weights"};
-
 
 #include "external/smaa/Textures/AreaTex.h"
 
@@ -697,7 +684,8 @@ static void renderer_resources_create(Renderer *r, VkBackendDesc *desc) {
         TextureInfo *texinfo    = &r->vk.texture_system.info[id];
         VkDeviceSize image_size = w * h * 4;
         Buffer       staging;
-        create_buffer(&r->vk, image_size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VMA_MEMORY_USAGE_AUTO_PREFER_HOST, &staging);
+        create_buffer(&r->vk, image_size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+                      &staging);
 
         memcpy(staging.mapping, pixels, image_size);
         stbi_image_free(pixels);
@@ -776,19 +764,30 @@ static void renderer_resources_create(Renderer *r, VkBackendDesc *desc) {
 
             r->smaa_pipelines.smaa_blend = pipeline_create_graphics(&r->vk, &cfg);
         }
+
+        {
+
+            GraphicsPipelineConfig cfg = pipeline_config_fullscreen();
+            cfg.vert_path              = "compiledshaders/fire.vert.spv";
+            cfg.frag_path              = "compiledshaders/fire.frag.spv";
+            cfg.color_formats          = &r->hdr_color[0].format;
+
+            r->EnginePipelines.fire = pipeline_create_graphics(&r->vk, &cfg);
+        }
     }
 }
+
 Renderer *renderer_create(bool use_wayland) {
 
     VK_CHECK(volkInitialize());
-    
-glfwInitVulkanLoader(vkGetInstanceProcAddr);
-glfwInitHint(GLFW_WAYLAND_LIBDECOR, GLFW_WAYLAND_DISABLE_LIBDECOR);
-glfwInit();
+
+    glfwInitVulkanLoader(vkGetInstanceProcAddr);
+    glfwInitHint(GLFW_WAYLAND_LIBDECOR, GLFW_WAYLAND_DISABLE_LIBDECOR);
+    glfwInit();
     const char *dev_exts[] = {VK_KHR_SWAPCHAIN_EXTENSION_NAME, VK_EXT_ROBUSTNESS_2_EXTENSION_NAME};
 
     uint32_t     platform_ext_count = 0;
-    const char **platform_exts = glfwGetRequiredInstanceExtensions(&platform_ext_count);
+    const char **platform_exts      = glfwGetRequiredInstanceExtensions(&platform_ext_count);
     if (!platform_exts || !platform_ext_count) {
         log_error("[renderer] GLFW Vulkan instance extensions unavailable");
         glfwTerminate();
@@ -839,30 +838,23 @@ glfwInit();
     (void)posix_memalign((void **)&r, _Alignof(Renderer), sizeof(*r));
     memset(r, 0, sizeof(*r)); // zero-value = safe defaults everywhere
     vk_instance_create(&r->vk, &desc);
-    glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);   /* we drive Vulkan ourselves */
-    r->window = glfwCreateWindow((int)desc.width, (int)desc.height,
-                                 "Vulkan", NULL, NULL);
+    glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API); /* we drive Vulkan ourselves */
+    r->window = glfwCreateWindow((int)desc.width, (int)desc.height, "Vulkan", NULL, NULL);
     if (!r->window) {
         log_error("[renderer] glfwCreateWindow failed");
         exit(EXIT_FAILURE);
     }
-   
 
-
-VK_CHECK(glfwCreateWindowSurface(r->vk.instance.instance, r->window,
-                                     NULL, &r->vk.surface));
+    VK_CHECK(glfwCreateWindowSurface(r->vk.instance.instance, r->window, NULL, &r->vk.surface));
 
     int width, height;
     glfwGetFramebufferSize(r->window, &width, &height);
 
-
-
-
- desc.width = (uint32_t)width;
+    desc.width  = (uint32_t)width;
     desc.height = (uint32_t)height;
     vk_backend_create(&r->vk, &desc);
     renderer_resources_create(r, &desc);
-    
+
     r->start_time = r->cpu_prev_frame = mu_time_now();
     nuklear_init(r);
 
@@ -981,22 +973,22 @@ static void profiler_format_count(char *buffer, size_t buffer_size, uint64_t val
 
 static MU_INLINE bool frame_start(Renderer *r) {
     TracyCZoneNC(ctx, "frame_start", 0x00FF00, 1);
-    uint64_t frame_now = mu_time_now();
-    r->cpu_frame_ns    = (double)(frame_now - r->cpu_prev_frame);
-    r->cpu_prev_frame  = frame_now;
-    r->vk.current_frame   = (r->vk.current_frame + 1) % MAX_FRAMES_IN_FLIGHT;
-int fb_w, fb_h;
-glfwGetFramebufferSize(r->window, &fb_w, &fb_h);
+    uint64_t frame_now  = mu_time_now();
+    r->cpu_frame_ns     = (double)(frame_now - r->cpu_prev_frame);
+    r->cpu_prev_frame   = frame_now;
+    r->vk.current_frame = (r->vk.current_frame + 1) % MAX_FRAMES_IN_FLIGHT;
+    int fb_w, fb_h;
+    glfwGetFramebufferSize(r->window, &fb_w, &fb_h);
 
-if (fb_w == 0 || fb_h == 0 ||
-    glfwGetWindowAttrib(r->window, GLFW_ICONIFIED)) {
-    uint64_t wait_start = mu_time_now();
-    glfwWaitEventsTimeout(0.1);          /* was RGFW_waitForEvent(100) */
-    r->cpu_wait_accum_ns += (double)(mu_time_now() - wait_start);
-    TracyCZoneEnd(ctx);
-    return false;
-}
-    r->vk.swapchain.needs_recreate |= fb_w != (int)r->vk.swapchain.extent.width || fb_h != (int)r->vk.swapchain.extent.height;
+    if (fb_w == 0 || fb_h == 0 || glfwGetWindowAttrib(r->window, GLFW_ICONIFIED)) {
+        uint64_t wait_start = mu_time_now();
+        glfwWaitEventsTimeout(0.1); /* was RGFW_waitForEvent(100) */
+        r->cpu_wait_accum_ns += (double)(mu_time_now() - wait_start);
+        TracyCZoneEnd(ctx);
+        return false;
+    }
+    r->vk.swapchain.needs_recreate |=
+        fb_w != (int)r->vk.swapchain.extent.width || fb_h != (int)r->vk.swapchain.extent.height;
 
     // Recreate first, acquire after: if the swapchain is (re)created, the old
     // acquired image would be invalid. Skip the frame and acquire fresh next time.
@@ -1022,11 +1014,11 @@ if (fb_w == 0 || fb_h == 0 ||
         return false;
     }
 
-    uint64_t wait_start = mu_time_now();
-    bool acquired = vk_frame_acquire(&r->vk);
-    r->cpu_wait_ns = (double)(mu_time_now() - wait_start);
+    uint64_t wait_start  = mu_time_now();
+    bool     acquired    = vk_frame_acquire(&r->vk);
+    r->cpu_wait_ns       = (double)(mu_time_now() - wait_start);
     r->cpu_wait_accum_ns = r->cpu_wait_accum_ns * 0.95 + r->cpu_wait_ns * 0.05;
-    r->cpu_active_ns = MAX(r->cpu_frame_ns - r->cpu_wait_ns, 0.0);
+    r->cpu_active_ns     = MAX(r->cpu_frame_ns - r->cpu_wait_ns, 0.0);
     capture_consume(r);
     gpu_profiler_ui_update(&r->vk.gpuprofiler[r->vk.current_frame]);
     TracyCZoneEnd(ctx);
@@ -1091,13 +1083,14 @@ static void post_pass(Renderer *r, VkCommandBuffer cmd) {
         RenderTarget *reads[]  = {&r->hdr_color[image]};
         RenderTarget *writes[] = {&r->ldr_color[image]};
 
-        begin_pass(&r->vk, cmd, &(PassDesc){
-                         .shader_reads      = reads,
-                         .shader_read_count = 1,
-                         .shader_writes     = writes,
-                         .shader_write_count = 1,
-                         .pipeline          = r->EnginePipelines.postprocess,
-                     });
+        begin_pass(&r->vk, cmd,
+                   &(PassDesc){
+                       .shader_reads       = reads,
+                       .shader_read_count  = 1,
+                       .shader_writes      = writes,
+                       .shader_write_count = 1,
+                       .pipeline           = r->EnginePipelines.postprocess,
+                   });
 
         PostPush push = {
             .src_texture_id  = r->hdr_color[image].bindless_index,
@@ -1113,6 +1106,7 @@ static void post_pass(Renderer *r, VkCommandBuffer cmd) {
     }
 }
 
+
 static void pass_smaa(Renderer *r, VkCommandBuffer cmd) {
     uint32_t     image      = r->vk.swapchain.current_image;
     GpuProfiler *frame_prof = &r->vk.gpuprofiler[r->vk.current_frame];
@@ -1120,16 +1114,17 @@ static void pass_smaa(Renderer *r, VkCommandBuffer cmd) {
     {
         /* 1. Edge detection */
         GPU_SCOPE(frame_prof, cmd, "SMAA Edge", VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT) {
-            PassAttachment color = {.target = &r->smaa_edges[image], .load = LOAD_CLEAR};
+            PassAttachment color   = {.target = &r->smaa_edges[image], .load = LOAD_CLEAR};
             RenderTarget  *reads[] = {&r->ldr_color[image]};
 
-            begin_pass(&r->vk, cmd, &(PassDesc){
-                             .colors            = &color,
-                             .color_count       = 1,
-                             .shader_reads      = reads,
-                             .shader_read_count = 1,
-                             .pipeline          = r->smaa_pipelines.smaa_edge,
-                         });
+            begin_pass(&r->vk, cmd,
+                       &(PassDesc){
+                           .colors            = &color,
+                           .color_count       = 1,
+                           .shader_reads      = reads,
+                           .shader_read_count = 1,
+                           .pipeline          = r->smaa_pipelines.smaa_edge,
+                       });
 
             EdgePush edge_push = {
                 .texture_id = r->ldr_color[image].bindless_index,
@@ -1143,16 +1138,17 @@ static void pass_smaa(Renderer *r, VkCommandBuffer cmd) {
     {
         /* 2. Weight calculation */
         GPU_SCOPE(frame_prof, cmd, "SMAA Weight", VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT) {
-            PassAttachment color      = {.target = &r->smaa_weights[image], .load = LOAD_CLEAR};
-            RenderTarget  *reads[]    = {&r->smaa_edges[image]};
+            PassAttachment color   = {.target = &r->smaa_weights[image], .load = LOAD_CLEAR};
+            RenderTarget  *reads[] = {&r->smaa_edges[image]};
 
-            begin_pass(&r->vk, cmd, &(PassDesc){
-                             .colors            = &color,
-                             .color_count       = 1,
-                             .shader_reads      = reads,
-                             .shader_read_count = 1,
-                             .pipeline          = r->smaa_pipelines.smaa_weight,
-                         });
+            begin_pass(&r->vk, cmd,
+                       &(PassDesc){
+                           .colors            = &color,
+                           .color_count       = 1,
+                           .shader_reads      = reads,
+                           .shader_read_count = 1,
+                           .pipeline          = r->smaa_pipelines.smaa_weight,
+                       });
 
             WeightPush weight_push = {
                 .edge_tex   = r->smaa_edges[image].bindless_index,
@@ -1171,13 +1167,14 @@ static void pass_smaa(Renderer *r, VkCommandBuffer cmd) {
             PassAttachment color   = {.target = &r->smaa_final[image], .load = LOAD_CLEAR};
             RenderTarget  *reads[] = {&r->ldr_color[image], &r->smaa_weights[image]};
 
-            begin_pass(&r->vk, cmd, &(PassDesc){
-                             .colors            = &color,
-                             .color_count       = 1,
-                             .shader_reads      = reads,
-                             .shader_read_count = 2,
-                             .pipeline          = r->smaa_pipelines.smaa_blend,
-                         });
+            begin_pass(&r->vk, cmd,
+                       &(PassDesc){
+                           .colors            = &color,
+                           .color_count       = 1,
+                           .shader_reads      = reads,
+                           .shader_read_count = 2,
+                           .pipeline          = r->smaa_pipelines.smaa_blend,
+                       });
 
             BlendPush blend_push = {
                 .color_tex  = r->ldr_color[image].bindless_index,
@@ -1235,7 +1232,40 @@ static void pass_ldr_to_swapchain(Renderer *r, VkCommandBuffer cmd) {
         };
 
         vkCmdBlitImage(cmd, r->smaa_final[image].image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                       r->vk.swapchain.images[image], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_NEAREST);
+                       r->vk.swapchain.images[image], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
+                       VK_FILTER_NEAREST);
+    }
+}
+
+typedef struct FirePush {
+    uint32_t width;
+    uint32_t height;
+    float    time;
+    float    pad;
+} FirePush;
+
+static void pass_fire(Renderer *r, VkCommandBuffer cmd) {
+    GpuProfiler *frame_prof = &r->vk.gpuprofiler[r->vk.current_frame];
+    GPU_SCOPE(frame_prof, cmd, "Fire Pass", VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT) {
+        uint32_t image = r->vk.swapchain.current_image;
+
+        PassAttachment color = {
+            .target = &r->hdr_color[image],
+            .load   = LOAD_CLEAR,
+            .clear  = {0.02f, 0.025f, 0.03f, 1.0f},
+        };
+
+        begin_pass(&r->vk, cmd, &(PassDesc){.colors = &color, .color_count = 1, .pipeline = r->EnginePipelines.fire});
+
+        FirePush push = {
+            .width  = r->vk.swapchain.extent.width,
+            .height = r->vk.swapchain.extent.height,
+            .time   = (float)((double)(mu_time_now() - r->start_time) / mu_time_freq()),
+            .pad    = 0.0f,
+        };
+
+        cmd_draw(&r->vk, cmd, BYTE_SPAN(push), 3, 1);
+        end_pass(cmd);
     }
 }
 
@@ -1253,40 +1283,69 @@ static void on_key(GLFWwindow *w, int key, int scancode, int action, int mods) {
     bool ctrl = (mods & GLFW_MOD_CONTROL) != 0;
 
     nk_input_key(ctx, NK_KEY_SHIFT, (mods & GLFW_MOD_SHIFT) != 0);
-    nk_input_key(ctx, NK_KEY_CTRL,  ctrl);
+    nk_input_key(ctx, NK_KEY_CTRL, ctrl);
 
     switch (key) {
-    case GLFW_KEY_DELETE:    nk_input_key(ctx, NK_KEY_DEL,       down); break;
-    case GLFW_KEY_ENTER:     nk_input_key(ctx, NK_KEY_ENTER,     down); break;
-    case GLFW_KEY_TAB:       nk_input_key(ctx, NK_KEY_TAB,       down); break;
-    case GLFW_KEY_BACKSPACE: nk_input_key(ctx, NK_KEY_BACKSPACE, down); break;
-    case GLFW_KEY_UP:        nk_input_key(ctx, NK_KEY_UP,        down); break;
-    case GLFW_KEY_DOWN:      nk_input_key(ctx, NK_KEY_DOWN,      down); break;
+    case GLFW_KEY_DELETE:
+        nk_input_key(ctx, NK_KEY_DEL, down);
+        break;
+    case GLFW_KEY_ENTER:
+        nk_input_key(ctx, NK_KEY_ENTER, down);
+        break;
+    case GLFW_KEY_TAB:
+        nk_input_key(ctx, NK_KEY_TAB, down);
+        break;
+    case GLFW_KEY_BACKSPACE:
+        nk_input_key(ctx, NK_KEY_BACKSPACE, down);
+        break;
+    case GLFW_KEY_UP:
+        nk_input_key(ctx, NK_KEY_UP, down);
+        break;
+    case GLFW_KEY_DOWN:
+        nk_input_key(ctx, NK_KEY_DOWN, down);
+        break;
     case GLFW_KEY_LEFT:
-        nk_input_key(ctx, NK_KEY_LEFT,           down && !ctrl);
-        nk_input_key(ctx, NK_KEY_TEXT_WORD_LEFT, down &&  ctrl);
+        nk_input_key(ctx, NK_KEY_LEFT, down && !ctrl);
+        nk_input_key(ctx, NK_KEY_TEXT_WORD_LEFT, down && ctrl);
         break;
     case GLFW_KEY_RIGHT:
-        nk_input_key(ctx, NK_KEY_RIGHT,           down && !ctrl);
-        nk_input_key(ctx, NK_KEY_TEXT_WORD_RIGHT, down &&  ctrl);
+        nk_input_key(ctx, NK_KEY_RIGHT, down && !ctrl);
+        nk_input_key(ctx, NK_KEY_TEXT_WORD_RIGHT, down && ctrl);
         break;
     case GLFW_KEY_HOME:
-        nk_input_key(ctx, NK_KEY_TEXT_START,   down);
+        nk_input_key(ctx, NK_KEY_TEXT_START, down);
         nk_input_key(ctx, NK_KEY_SCROLL_START, down);
         break;
     case GLFW_KEY_END:
-        nk_input_key(ctx, NK_KEY_TEXT_END,     down);
-        nk_input_key(ctx, NK_KEY_SCROLL_END,   down);
+        nk_input_key(ctx, NK_KEY_TEXT_END, down);
+        nk_input_key(ctx, NK_KEY_SCROLL_END, down);
         break;
-    case GLFW_KEY_PAGE_UP:   nk_input_key(ctx, NK_KEY_SCROLL_UP,   down); break;
-    case GLFW_KEY_PAGE_DOWN: nk_input_key(ctx, NK_KEY_SCROLL_DOWN, down); break;
-    case GLFW_KEY_C: nk_input_key(ctx, NK_KEY_COPY,             down && ctrl); break;
-    case GLFW_KEY_V: nk_input_key(ctx, NK_KEY_PASTE,            down && ctrl); break;
-    case GLFW_KEY_X: nk_input_key(ctx, NK_KEY_CUT,              down && ctrl); break;
-    case GLFW_KEY_Z: nk_input_key(ctx, NK_KEY_TEXT_UNDO,        down && ctrl); break;
-    case GLFW_KEY_Y: nk_input_key(ctx, NK_KEY_TEXT_REDO,        down && ctrl); break;
-    case GLFW_KEY_A: nk_input_key(ctx, NK_KEY_TEXT_SELECT_ALL,  down && ctrl); break;
-    default: break;
+    case GLFW_KEY_PAGE_UP:
+        nk_input_key(ctx, NK_KEY_SCROLL_UP, down);
+        break;
+    case GLFW_KEY_PAGE_DOWN:
+        nk_input_key(ctx, NK_KEY_SCROLL_DOWN, down);
+        break;
+    case GLFW_KEY_C:
+        nk_input_key(ctx, NK_KEY_COPY, down && ctrl);
+        break;
+    case GLFW_KEY_V:
+        nk_input_key(ctx, NK_KEY_PASTE, down && ctrl);
+        break;
+    case GLFW_KEY_X:
+        nk_input_key(ctx, NK_KEY_CUT, down && ctrl);
+        break;
+    case GLFW_KEY_Z:
+        nk_input_key(ctx, NK_KEY_TEXT_UNDO, down && ctrl);
+        break;
+    case GLFW_KEY_Y:
+        nk_input_key(ctx, NK_KEY_TEXT_REDO, down && ctrl);
+        break;
+    case GLFW_KEY_A:
+        nk_input_key(ctx, NK_KEY_TEXT_SELECT_ALL, down && ctrl);
+        break;
+    default:
+        break;
     }
 
     /* Hotkeys: only on the initial press, no Ctrl, no active text edit.
@@ -1304,16 +1363,13 @@ static void on_key(GLFWwindow *w, int key, int scancode, int action, int mods) {
             capture_stop_video(r);
         } else {
             char path[256];
-            snprintf(path, sizeof(path), "recording_%llu.mp4",
-                     (unsigned long long)(mu_time_now() / mu_time_freq()));
+            snprintf(path, sizeof(path), "recording_%llu.mp4", (unsigned long long)(mu_time_now() / mu_time_freq()));
             capture_start_video(r, path, 60);
         }
     }
 }
 
-static void on_char(GLFWwindow *w, unsigned int codepoint) {
-    nk_input_unicode(&g_renderer->ui.context, codepoint);
-}
+static void on_char(GLFWwindow *w, unsigned int codepoint) { nk_input_unicode(&g_renderer->ui.context, codepoint); }
 
 static void on_mouse_button(GLFWwindow *w, int button, int action, int mods) {
     Renderer          *r   = g_renderer;
@@ -1323,13 +1379,19 @@ static void on_mouse_button(GLFWwindow *w, int button, int action, int mods) {
 
     enum nk_buttons b;
     switch (button) {
-    case GLFW_MOUSE_BUTTON_LEFT:   b = NK_BUTTON_LEFT;   break;
-    case GLFW_MOUSE_BUTTON_MIDDLE: b = NK_BUTTON_MIDDLE; break;
-    case GLFW_MOUSE_BUTTON_RIGHT:  b = NK_BUTTON_RIGHT;  break;
-    default: return;
+    case GLFW_MOUSE_BUTTON_LEFT:
+        b = NK_BUTTON_LEFT;
+        break;
+    case GLFW_MOUSE_BUTTON_MIDDLE:
+        b = NK_BUTTON_MIDDLE;
+        break;
+    case GLFW_MOUSE_BUTTON_RIGHT:
+        b = NK_BUTTON_RIGHT;
+        break;
+    default:
+        return;
     }
-    nk_input_button(ctx, b, (int)ctx->input.mouse.pos.x,
-                    (int)ctx->input.mouse.pos.y, action == GLFW_PRESS);
+    nk_input_button(ctx, b, (int)ctx->input.mouse.pos.x, (int)ctx->input.mouse.pos.y, action == GLFW_PRESS);
 }
 
 static void on_cursor(GLFWwindow *w, double x, double y) {
@@ -1353,14 +1415,13 @@ static void on_focus(GLFWwindow *w, int focused) {
         for (int k = 0; k < NK_KEY_MAX; ++k)
             nk_input_key(ctx, (enum nk_keys)k, nk_false);
         for (int b = 0; b < NK_BUTTON_MAX; ++b)
-            nk_input_button(ctx, (enum nk_buttons)b,
-                            (int)ctx->input.mouse.pos.x,
-                            (int)ctx->input.mouse.pos.y, nk_false);
+            nk_input_button(ctx, (enum nk_buttons)b, (int)ctx->input.mouse.pos.x, (int)ctx->input.mouse.pos.y,
+                            nk_false);
     }
 }
 
 static void install_callbacks(Renderer *r) {
-    g_renderer = r;
+    g_renderer    = r;
     GLFWwindow *w = r->window;
     glfwSetWindowUserPointer(w, r);
     glfwSetKeyCallback(w, on_key);
@@ -1371,12 +1432,11 @@ static void install_callbacks(Renderer *r) {
     glfwSetWindowFocusCallback(w, on_focus);
 }
 
-
 static void platform_poll_events(Renderer *r) {
     struct nk_context *ctx = &r->ui.context;
     input_begin(&r->input);
     nk_input_begin(ctx);
-    glfwPollEvents();                 /* fires the callbacks above */
+    glfwPollEvents(); /* fires the callbacks above */
     nk_input_end(ctx);
 
     int width, height;
@@ -1385,71 +1445,62 @@ static void platform_poll_events(Renderer *r) {
     r->ui.height = (float)height;
 }
 
-
-
-
-
 bool renderer_frame(Renderer *r) {
-        TracyCFrameMark;
-        platform_poll_events(r);
-if (glfwWindowShouldClose(r->window))    /* was RGFW_window_shouldClose */
-    return false;     
+    TracyCFrameMark;
+    platform_poll_events(r);
+    if (glfwWindowShouldClose(r->window)) /* was RGFW_window_shouldClose */
+        return false;
 
-   pipeline_rebuild(&r->vk);
-   
+    pipeline_rebuild(&r->vk);
 
-        delete_queue_tick(&r->vk);
-        
+    delete_queue_tick(&r->vk);
 
-        if (!frame_start(r))
-            return true; // swapchain out-of-date / minimized: nothing to record
-        update_global_data(r);
+    if (!frame_start(r))
+        return true; // swapchain out-of-date / minimized: nothing to record
+    update_global_data(r);
 
+    VkCommandBuffer cmd        = r->vk.frames[r->vk.current_frame].cmdbuf;
+    GpuProfiler    *frame_prof = &r->vk.gpuprofiler[r->vk.current_frame];
 
+    vk_cmd_begin(cmd, false);
+    // This frame's queries complete with this frame's submission value; the
+    // slot is consumed once the timeline covers it. Same value the capture
+    // slot records.
+    frame_prof->submit_value = r->vk.timeline_last_submitted + 1;
+    gpu_profiler_begin_frame(frame_prof, cmd);
 
-
-        VkCommandBuffer cmd        = r->vk.frames[r->vk.current_frame].cmdbuf;
-        GpuProfiler    *frame_prof = &r->vk.gpuprofiler[r->vk.current_frame];
-
-        vk_cmd_begin(cmd, false);
-        // This frame's queries complete with this frame's submission value; the
-        // slot is consumed once the timeline covers it. Same value the capture
-        // slot records.
-        frame_prof->submit_value = r->vk.timeline_last_submitted + 1;
-        gpu_profiler_begin_frame(frame_prof, cmd);
-
+    {
         {
-            {
-                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, r->vk.bindless_system.pipeline_layout,
-                                        0, 1, &r->vk.bindless_system.set, 0, NULL);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, r->vk.bindless_system.pipeline_layout, 0, 1,
+                                    &r->vk.bindless_system.set, 0, NULL);
 
-                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, r->vk.bindless_system.pipeline_layout,
-                                        0, 1, &r->vk.bindless_system.set, 0, NULL);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, r->vk.bindless_system.pipeline_layout, 0, 1,
+                                    &r->vk.bindless_system.set, 0, NULL);
 
-                rt_transition_all(&r->vk, cmd, &r->depth[r->vk.swapchain.current_image],
-                    VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
-                    VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
-                    VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT);
+            rt_transition_all(
+                &r->vk, cmd, &r->depth[r->vk.swapchain.current_image], VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+                VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+                VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT);
 
-                flush_barriers(&r->vk, cmd);
-            }
+            flush_barriers(&r->vk, cmd);
         }
+    }
+    pass_fire(r, cmd);
+    post_pass(r, cmd);
+    pass_smaa(r, cmd);
+    pass_ldr_to_swapchain(r, cmd);
+    render_gpu_profiler_ui(r);
+    render_capture_ui(r);
+    pass_nuklear(r, cmd);
+    capture_record(r, cmd);
+    image_transition_swapchain(&r->vk, cmd, &r->vk.swapchain, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                               VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, 0);
 
-        post_pass(r, cmd);
-        pass_smaa(r, cmd);
-        pass_ldr_to_swapchain(r, cmd);
-        render_gpu_profiler_ui(r);
-        render_capture_ui(r);
-        pass_nuklear(r, cmd);
-        capture_record(r, cmd);
-        image_transition_swapchain(&r->vk, cmd, &r->vk.swapchain, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
-                                   VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, 0);
+    flush_barriers(&r->vk, cmd);
 
-        flush_barriers(&r->vk, cmd);
+    vk_cmd_end(cmd);
 
-        vk_cmd_end(cmd);
-
-        vk_frame_submit(&r->vk);
+    vk_frame_submit(&r->vk);
 
     return true;
 }
@@ -1464,13 +1515,6 @@ void renderer_destroy(Renderer *r) {
     }
     nuklear_shutdown(r);
     capture_shutdown(r);
-    if (r->grass) {
-        GrassSystem *g = r->grass;
-        forEach(i, MAX_FRAMES_IN_FLIGHT)
-            destroy_buffer(&r->vk, &g->args[i]);
-        free(g);
-        r->grass = NULL;
-    }
     forEach(i, MAX_SWAPCHAIN_IMAGES) {
         rt_destroy(&r->vk, &r->depth[i]);
         rt_destroy(&r->vk, &r->hdr_color[i]);
@@ -1479,15 +1523,13 @@ void renderer_destroy(Renderer *r) {
         rt_destroy(&r->vk, &r->smaa_edges[i]);
         rt_destroy(&r->vk, &r->smaa_weights[i]);
     }
-    forEach(i, MAX_FRAMES_IN_FLIGHT)
-        destroy_buffer(&r->vk, &r->global_ubo[i]);
+    forEach(i, MAX_FRAMES_IN_FLIGHT) destroy_buffer(&r->vk, &r->global_ubo[i]);
     destroy_buffer(&r->vk, &r->readback_buffer);
-    pipeline_cache_save(r->vk.devc.device, r->vk.devc.physical_device, r->vk.devc.pipeline_cache,
-                        "pipeline_cache.bin");
+    pipeline_cache_save(r->vk.devc.device, r->vk.devc.physical_device, r->vk.devc.pipeline_cache, "pipeline_cache.bin");
     vk_backend_destroy(&r->vk);
     vkDestroySurfaceKHR(r->vk.instance.instance, r->vk.surface, NULL);
     vk_instance_destroy(&r->vk);
-glfwDestroyWindow(r->window);
-glfwTerminate();                         
+    glfwDestroyWindow(r->window);
+    glfwTerminate();
     free(r);
 }
