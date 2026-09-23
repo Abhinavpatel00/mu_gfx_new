@@ -107,7 +107,97 @@ float3 shader_hopf(float2 uv, float T)
     return col;                       
 }
 
+float sd_capsule(float2 p, float2 a, float2 b, float r)
+{
+    float2 pa = p - a;
+    float2 ba = b - a;
 
+    float h = saturate(dot(pa, ba) / dot(ba, ba));
+
+    return length(pa - ba * h) - r;
+}
+
+// Cheap deterministic hash for per-capsule variation.
+float grass_hash(float n)
+{
+    return frac(sin(n * 127.1 + 311.7) * 43758.5453);
+}
+
+float3 capsule_grass(float2 uv, float T)
+{
+    // Center and scale the grass clump.
+    float2 p = uv * float2(1.0, 1.0);
+
+    // Ground position.
+    p.y -= 0.25;
+
+    // Background.
+    float3 col = float3(0.025, 0.075, 0.025);
+
+    // Capsule cluster.
+    // Each capsule overlaps its neighbors to form a
+    // continuous, chunky grass silhouette.
+    const int N = 11;
+
+    [unroll]
+    for (int i = 0; i < N; i++)
+    {
+        float id = (float)i;
+
+        // Spread capsules horizontally.
+        float x = (id - 5.0) * 0.105;
+
+        // Small irregular displacement.
+        x += (grass_hash(id + 2.0) - 0.5) * 0.045;
+
+        // Varied capsule height.
+        float h = lerp(0.24, 0.58, grass_hash(id + 9.0));
+
+        // Capsule width/radius.
+        float r = lerp(0.045, 0.075, grass_hash(id + 17.0));
+
+        // Capsule endpoints.
+        // The upper endpoint plus radius creates a rounded top.
+        float2 a = float2(x, -0.18);
+        float2 b = float2(
+            x + (grass_hash(id + 31.0) - 0.5) * 0.06,
+            -0.18 + h
+        );
+
+        float d = sd_capsule(p, a, b, r);
+
+        // Antialiased capsule coverage.
+        float aa = max(fwidth(d), 0.001);
+        float mask = 1.0 - smoothstep(-aa, aa, d);
+
+        // Per-capsule green variation.
+        float variation = grass_hash(id + 51.0);
+
+        float3 green = lerp(
+            float3(0.12, 0.43, 0.035),
+            float3(0.34, 0.78, 0.075),
+            variation
+        );
+
+        // Simple rounded-volume lighting.
+        // Bright upper-left, darker lower-right.
+        float2 local = p - (a + b) * 0.5;
+
+        float light = 0.82 + 0.18 * saturate(-local.x + local.y);
+
+        green *= light;
+
+        // Slight brightening near the capsule crown.
+        float crown = smoothstep(0.0, 0.12, p.y - b.y + r);
+
+        green += crown * float3(0.035, 0.09, 0.012);
+
+        // Composite capsule over background.
+        col = lerp(col, green, mask);
+    }
+
+    return col;
+}
 
 struct VSOutput
 {
@@ -323,6 +413,6 @@ float3 rd = normalize(float3(
 
 
 
- float3 col = shader_hopf(uv, T);
+ float3 col = capsule_grass(uv, T);
 return float4(col, 1.0);
 }

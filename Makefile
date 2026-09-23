@@ -102,7 +102,7 @@ BASE_CXXFLAGS := \
 DEBUG_FLAGS := \
     -O0 -g -ggdb -fno-omit-frame-pointer -fno-strict-aliasing \
     -DDEBUG $(TRACY_FLAGS) \
-    -DEMBED_SHADERS
+#    -DEMBED_SHADERS
 
 
 ASAN_FLAGS := \
