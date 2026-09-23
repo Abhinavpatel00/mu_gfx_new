@@ -1,8 +1,7 @@
 # Vulkan Renderer Design & Architecture Reference
 
 Status: maintained renderer reference, but not fully synchronized with source.
-The application now uses RGFW and Nuklear; GLFW/cimgui/ImGui names in older
-sections and diagrams below are historical. The shared CPU-pool reset described
+The application now uses GLFW and Nuklear. The shared CPU-pool reset described
 below is not a guarantee that new GPU-readable frame data is safe across frames
 in flight. Audit upload ownership before adding consumers. The old sibling
 [rendererdesign.md](../rendererdesign.md) is a historical snapshot.

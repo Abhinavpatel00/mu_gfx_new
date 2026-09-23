@@ -78,7 +78,7 @@ Source is authoritative; older proposals describe more than is implemented.
 | Fullscreen pipeline preset | Implemented; leave fire/SMAA behavior unchanged |
 | HDR postprocess and SMAA | Implemented; reuse after scene rendering |
 | Buffer pools, staging, timeline, deletion queue | Implemented mechanisms; audit new usage and ownership |
-| RGFW and polling input | Implemented; follow [input layering](input-api-layers.md) |
+| GLFW and polling input | Implemented; follow [input layering](input-api-layers.md) |
 | Nuklear | Current UI; do not reintroduce GLFW or ImGui |
 | Slang, cglm, stb, meshoptimizer, mu containers | Present dependencies; use where relevant |
 | Static scene API, procedural building tools | Proposed here; not implemented |
