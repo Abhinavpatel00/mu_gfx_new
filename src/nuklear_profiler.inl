@@ -53,6 +53,32 @@ static void render_gpu_profiler_ui(Renderer *r) {
     nk_label(ctx, "Nuklear workload", NK_TEXT_LEFT);
     nk_labelf(ctx, NK_TEXT_LEFT, "%u draw commands", r->ui.draw_count);
     nk_labelf(ctx, NK_TEXT_LEFT, "%u vertices | %u indices", r->ui.vertex_count, r->ui.index_count);
+
+    nk_layout_row_dynamic(ctx, 24, 1);
+    nk_label_colored(ctx, "Sprite batcher", NK_TEXT_LEFT, nk_rgb(75, 205, 255));
+    nk_layout_row_dynamic(ctx, 22, 3);
+    nk_label(ctx, "Metric", NK_TEXT_LEFT);
+    nk_label(ctx, "Current", NK_TEXT_LEFT);
+    nk_label(ctx, "Details", NK_TEXT_LEFT);
+    nk_label(ctx, "Sprites pushed", NK_TEXT_LEFT);
+    nk_labelf(ctx, NK_TEXT_LEFT, "%u", r->sprites.last_instances);
+    nk_labelf(ctx, NK_TEXT_LEFT, "cap %u", (uint32_t)SPRITE_MAX_INSTANCES);
+    nk_label(ctx, "Batches", NK_TEXT_LEFT);
+    nk_labelf(ctx, NK_TEXT_LEFT, "%u", r->sprites.last_batches);
+    nk_labelf(ctx, NK_TEXT_LEFT, "cap %u", (uint32_t)SPRITE_MAX_BATCHES);
+    nk_label(ctx, "Indirect draws", NK_TEXT_LEFT);
+    nk_labelf(ctx, NK_TEXT_LEFT, "%u", r->sprites.last_draws);
+    nk_labelf(ctx, NK_TEXT_LEFT, "1 per batch");
+    nk_label(ctx, "Dropped", NK_TEXT_LEFT);
+    nk_labelf(ctx, NK_TEXT_LEFT, "%u", r->sprites.dropped);
+    nk_labelf(ctx, NK_TEXT_LEFT, "over cap or region full");
+    nk_label(ctx, "Atlases", NK_TEXT_LEFT);
+    nk_labelf(ctx, NK_TEXT_LEFT, "%u", r->sprites.atlas_count);
+    nk_labelf(ctx, NK_TEXT_LEFT, "%u pictures", r->sprites.picture_count);
+    nk_label(ctx, "Camera", NK_TEXT_LEFT);
+    nk_labelf(ctx, NK_TEXT_LEFT, "%.0f, %.0f", r->sprites.origin_x, r->sprites.origin_y);
+    nk_labelf(ctx, NK_TEXT_LEFT, "zoom %.3f", r->sprites.zoom);
+
     nk_layout_row_dynamic(ctx, 24, 1);
     if (g_gpu_profiler_ui.show_pipeline_stats) {
         uint64_t total_vs = 0, total_fs = 0, total_primitives = 0;
@@ -104,5 +130,23 @@ static void render_gpu_profiler_ui(Renderer *r) {
     nk_layout_row_dynamic(ctx, 22, 1);
     nk_labelf(ctx, NK_TEXT_LEFT, "Timestamp Period: %.2f ns | Query Pool Size: %d passes",
               (double)r->vk.info.properties.limits.timestampPeriod, MAX_GPU_PASSES);
+    nk_end(ctx);
+}
+
+/* Lines the game queued through renderer_hud() this frame. */
+static void render_game_ui(Renderer *r) {
+    if (r->hud_count == 0)
+        return;
+
+    struct nk_context *ctx = &r->ui.context;
+    float              h   = 34.0f + 22.0f * (float)r->hud_count;
+    if (!nk_begin(ctx, "Game", nk_rect(10.0f, 340.0f, 420.0f, h),
+                  NK_WINDOW_BORDER | NK_WINDOW_MOVABLE | NK_WINDOW_NO_SCROLLBAR)) {
+        nk_end(ctx);
+        return;
+    }
+    nk_layout_row_dynamic(ctx, 22, 1);
+    for (uint32_t i = 0; i < r->hud_count; i++)
+        nk_label(ctx, r->hud_text[i], NK_TEXT_LEFT);
     nk_end(ctx);
 }

@@ -7,12 +7,18 @@
 #include "src/nuklear_ui.h"
 #include "src/platform.h"
 #include "src/slangtypes.h"
+#include <stdarg.h>
 #include <stdint.h>
 
 // Forward declarations for functions defined later in this file or in included files
 static void install_callbacks(Renderer *r);
 
 #include "vk.h"
+#include "src/two_d/sprite.h"
+
+/* How many HUD lines the game can queue per frame, and how long each may be. */
+#define GAME_HUD_LINES 12
+#define GAME_HUD_CHARS 96
 // TODO : improve it may be using libav like something idk
 typedef struct CaptureState {
     Buffer   readback[CAPTURE_SLOTS];
@@ -89,6 +95,10 @@ struct Renderer {
     Buffer       global_ubo[MAX_FRAMES_IN_FLIGHT];
     Buffer       readback_buffer;
     CaptureState capture;
+    SpriteSystem sprites;
+    GameHooks    game;
+    uint32_t     hud_count;
+    char         hud_text[GAME_HUD_LINES][GAME_HUD_CHARS];
     struct {
         uint32_t fullscreen;
         uint32_t postprocess;
@@ -468,6 +478,7 @@ static void capture_record(Renderer *r, VkCommandBuffer cmd) {
     }
 }
 #include "src/nuklear_renderer.inl"
+#include "src/two_d/sprite_init.inl"
 
 static void renderer_resources_create(Renderer *r, VkBackendDesc *desc) {
     VkFormat depth_format = pick_depth_format(r->vk.devc.physical_device);
@@ -775,9 +786,13 @@ static void renderer_resources_create(Renderer *r, VkBackendDesc *desc) {
             r->EnginePipelines.fire = pipeline_create_graphics(&r->vk, &cfg);
         }
     }
+
+    sprite_system_init(&r->sprites, &r->vk, &r->hdr_color[0].format);
+    if (r->game.start)
+        r->game.start(r->game.user, &r->sprites);
 }
 
-Renderer *renderer_create(bool use_wayland) {
+Renderer *renderer_create(bool use_wayland, GameHooks game) {
 
     VK_CHECK(volkInitialize());
 
@@ -837,6 +852,7 @@ Renderer *renderer_create(bool use_wayland) {
     Renderer *r;
     (void)posix_memalign((void **)&r, _Alignof(Renderer), sizeof(*r));
     memset(r, 0, sizeof(*r)); // zero-value = safe defaults everywhere
+    r->game = game;
     vk_instance_create(&r->vk, &desc);
     glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API); /* we drive Vulkan ourselves */
     r->window = glfwCreateWindow((int)desc.width, (int)desc.height, "Vulkan", NULL, NULL);
@@ -899,7 +915,7 @@ static double ns_to_ms(double ns) { return ns / 1000000.0; }
 
 static GpuProfilerUIState g_gpu_profiler_ui = {
     .open                = false,
-    .paused              = false,
+    .paused              = true,
     .show_pipeline_stats = true,
 };
 
@@ -1237,37 +1253,7 @@ static void pass_ldr_to_swapchain(Renderer *r, VkCommandBuffer cmd) {
     }
 }
 
-typedef struct FirePush {
-    uint32_t width;
-    uint32_t height;
-    float    time;
-    float    pad;
-} FirePush;
-
-static void pass_fire(Renderer *r, VkCommandBuffer cmd) {
-    GpuProfiler *frame_prof = &r->vk.gpuprofiler[r->vk.current_frame];
-    GPU_SCOPE(frame_prof, cmd, "Fire Pass", VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT) {
-        uint32_t image = r->vk.swapchain.current_image;
-
-        PassAttachment color = {
-            .target = &r->hdr_color[image],
-            .load   = LOAD_CLEAR,
-            .clear  = {0.02f, 0.025f, 0.03f, 1.0f},
-        };
-
-        begin_pass(&r->vk, cmd, &(PassDesc){.colors = &color, .color_count = 1, .pipeline = r->EnginePipelines.fire});
-
-        FirePush push = {
-            .width  = r->vk.swapchain.extent.width,
-            .height = r->vk.swapchain.extent.height,
-            .time   = (float)((double)(mu_time_now() - r->start_time) / mu_time_freq()),
-            .pad    = 0.0f,
-        };
-
-        cmd_draw(&r->vk, cmd, BYTE_SPAN(push), 3, 1);
-        end_pass(cmd);
-    }
-}
+#include "src/two_d/sprite_pass.inl"
 
 #include "src/nuklear_pass.inl"
 
@@ -1445,6 +1431,49 @@ static void platform_poll_events(Renderer *r) {
     r->ui.height = (float)height;
 }
 
+
+
+
+typedef struct Transform2D
+{
+    vec2  position;
+    vec2  scale;
+    float rotation;
+} Transform2D;
+
+typedef struct Sprite2D
+{
+    TextureID texture_id;
+    Transform2D transform;
+
+    vec2 velocity;
+
+    vec4 tint_color;
+    float depth;
+    vec4 uv_rect;
+} Sprite2D;
+
+
+
+
+
+
+
+
+
+
+
+void renderer_hud(Renderer *r, const char *fmt, ...) {
+    if (r->hud_count >= GAME_HUD_LINES)
+        return;
+
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(r->hud_text[r->hud_count], GAME_HUD_CHARS, fmt, ap);
+    va_end(ap);
+    r->hud_count++;
+}
+
 bool renderer_frame(Renderer *r) {
     TracyCFrameMark;
     platform_poll_events(r);
@@ -1458,6 +1487,19 @@ bool renderer_frame(Renderer *r) {
     if (!frame_start(r))
         return true; // swapchain out-of-date / minimized: nothing to record
     update_global_data(r);
+
+    if (r->game.frame) {
+        r->hud_count = 0;
+        GameFrame frame = {
+            .renderer     = r,
+            .sprites      = &r->sprites,
+            .input        = &r->input,
+            .dt           = r->dt,
+            .viewport_w   = r->vk.swapchain.extent.width,
+            .viewport_h   = r->vk.swapchain.extent.height,
+        };
+        r->game.frame(r->game.user, &frame);
+    }
 
     VkCommandBuffer cmd        = r->vk.frames[r->vk.current_frame].cmdbuf;
     GpuProfiler    *frame_prof = &r->vk.gpuprofiler[r->vk.current_frame];
@@ -1485,11 +1527,12 @@ bool renderer_frame(Renderer *r) {
             flush_barriers(&r->vk, cmd);
         }
     }
-    pass_fire(r, cmd);
+    pass_sprites(r, cmd);
     post_pass(r, cmd);
     pass_smaa(r, cmd);
     pass_ldr_to_swapchain(r, cmd);
     render_gpu_profiler_ui(r);
+    render_game_ui(r);
     render_capture_ui(r);
     pass_nuklear(r, cmd);
     capture_record(r, cmd);
@@ -1523,6 +1566,7 @@ void renderer_destroy(Renderer *r) {
         rt_destroy(&r->vk, &r->smaa_edges[i]);
         rt_destroy(&r->vk, &r->smaa_weights[i]);
     }
+    sprite_system_destroy(&r->sprites, &r->vk);
     forEach(i, MAX_FRAMES_IN_FLIGHT) destroy_buffer(&r->vk, &r->global_ubo[i]);
     destroy_buffer(&r->vk, &r->readback_buffer);
     pipeline_cache_save(r->vk.devc.device, r->vk.devc.physical_device, r->vk.devc.pipeline_cache, "pipeline_cache.bin");

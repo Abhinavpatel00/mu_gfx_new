@@ -230,9 +230,10 @@ float lp_norm(float2 v, float p)
 [shader("fragment")]
 float4 fs_main(VSOutput input) : SV_Target0
 {
-    float2 R = global_data.screen_params.xy;
+  float2 R = global_data.screen_params.xy;
     float  T = global_data.time;
-    float2 uv = pixel_to_uv(input.position.xy, R);
+      float2 uv = pixel_to_uv(input.position.xy, R);
+    uv.x *= R.x / R.y;
  //   float r = length(uv);
     //float color = dot(uv, uv) <=  0.2;
     //float color = abs(uv.x) +abs(uv.y) <= 0.4;
