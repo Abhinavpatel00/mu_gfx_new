@@ -19,11 +19,16 @@ typedef struct GameFrame {
 } GameFrame;
 
 /* The game lives outside the renderer — main.c owns the state and registers
-   these two entry points. Both are optional; a NULL hook is skipped. */
+   these entry points. All are optional; a NULL hook is skipped. */
 typedef struct GameHooks {
     void *user;
     void (*start)(void *user, SpriteSystem *sprites);  /* once, after sprite_system_init */
     void (*frame)(void *user, const GameFrame *frame); /* every frame, before the flush */
+    /* Every frame after the sprite pass, before post-processing. Record GPU
+       work here (it has the scene color/depth targets). */
+    void (*render)(void *user, VkCommandBuffer cmd, RenderTarget *color, RenderTarget *depth);
+    /* Once at shutdown, after wait_idle and delete-queue drain. */
+    void (*shutdown)(void *user);
 } GameHooks;
 
 Renderer *renderer_create(bool use_wayland, GameHooks game);

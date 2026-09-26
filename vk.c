@@ -240,6 +240,7 @@ typedef struct VkBackendCaps {
     bool bindless_textures;
 
     bool sampler_anisotropy;    // NEW
+    bool draw_indirect_first_instance;
     bool atomic_int64;          // NEW
     bool scalar_block_layout;   // NEW
     bool robustness2;           // NEW
@@ -257,6 +258,7 @@ static VkBackendCaps default_caps(void) {
         .timeline_semaphores       = true,
         .multi_draw_indirect       = true,
         .multi_draw_indirect_count = true,
+        .draw_indirect_first_instance = true,
         .buffer_device_address     = true,
         .maintenance4              = true,
         .bindless_textures         = true,
@@ -305,6 +307,7 @@ static void apply_caps(VkFeatureChain *f, const VkBackendCaps *caps) {
 
     TRY_ENABLE(sampler_anisotropy, f->core.features.samplerAnisotropy, "samplerAnisotropy");
     TRY_ENABLE(multi_draw_indirect, f->core.features.multiDrawIndirect, "multi-draw indirect");
+    TRY_ENABLE(draw_indirect_first_instance, f->core.features.drawIndirectFirstInstance, "draw indirect first instance");
     TRY_ENABLE(pipeline_statistics_query, f->core.features.pipelineStatisticsQuery, "pipeline statistics query");
     TRY_ENABLE(dynamic_rendering, f->v13.dynamicRendering, "dynamic rendering");
     TRY_ENABLE(sync2, f->v13.synchronization2, "synchronization2");
@@ -3399,6 +3402,60 @@ void destroy_texture(VkBackend *r, TextureID id) {
     *texture = (Texture){0};
     r->texture_system.info[id] = (TextureInfo){0};
     mu_id_pool_destroy_id(&r->texture_system.id_pool, id);
+}
+
+/* One synchronous staging round trip through the shared one-time pool. Fresh
+   textures start UNDEFINED; SHADER_READ_ONLY afterwards is the steady state. */
+bool texture_upload(VkBackend *r, TextureID id, uint32_t mip, uint32_t layer, VkOffset3D offset, VkExtent3D extent,
+                    ByteSpan data) {
+    assert(id < MAX_BINDLESS_TEXTURES && r->texture_system.textures[id].image);
+    if (!data.data || !data.size)
+        return false;
+    Texture *tex = &r->texture_system.textures[id];
+
+    Buffer staging;
+    if (!create_buffer(r, data.size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VMA_MEMORY_USAGE_CPU_ONLY, &staging))
+        return false;
+    memcpy(staging.mapping, data.data, data.size);
+
+    VkImageMemoryBarrier to_dst = {
+        .sType                = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .srcAccessMask        = 0,
+        .dstAccessMask        = VK_ACCESS_TRANSFER_WRITE_BIT,
+        .oldLayout            = VK_IMAGE_LAYOUT_UNDEFINED,
+        .newLayout            = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        .srcQueueFamilyIndex  = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex  = VK_QUEUE_FAMILY_IGNORED,
+        .image                = tex->image,
+        .subresourceRange     = {VK_IMAGE_ASPECT_COLOR_BIT, mip, 1, layer, 1},
+    };
+
+    VkCommandBuffer cmd = vk_begin_one_time_cmd(r->devc.device, r->one_time_gfx_pool);
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0,
+                         NULL, 1, &to_dst);
+
+    VkBufferImageCopy region = {
+        .bufferOffset      = 0,
+        .bufferRowLength   = 0,
+        .bufferImageHeight = 0,
+        .imageSubresource  = {VK_IMAGE_ASPECT_COLOR_BIT, mip, layer, 1},
+        .imageOffset       = offset,
+        .imageExtent       = extent,
+    };
+    vkCmdCopyBufferToImage(cmd, staging.buffer, tex->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+    VkImageMemoryBarrier to_read       = to_dst;
+    to_read.srcAccessMask             = VK_ACCESS_TRANSFER_WRITE_BIT;
+    to_read.dstAccessMask             = VK_ACCESS_SHADER_READ_BIT;
+    to_read.oldLayout                 = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    to_read.newLayout                 = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL,
+                         0, NULL, 1, &to_read);
+
+    vk_end_one_time_cmd(r->devc.device, r->devc.graphics_queue, r->one_time_gfx_pool, cmd);
+    destroy_buffer(r, &staging);
+    return true;
 }
 
 void sampler_destroy(VkBackend *r, SamplerID id) {
