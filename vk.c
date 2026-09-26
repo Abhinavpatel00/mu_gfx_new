@@ -2457,6 +2457,46 @@ void cmd_draw(VkBackend *r, VkCommandBuffer cmd, ByteSpan root, uint32_t vertex_
     vkCmdDraw(cmd, vertex_count, instance_count, 0, 0);
 }
 
+void cmd_draw_indirect(VkBackend *r, VkCommandBuffer cmd, ByteSpan root, BufferSlice indirect, uint32_t draw_count,
+                       uint32_t stride) {
+    assert(indirect.buffer && draw_count > 0);
+    assert(stride >= sizeof(VkDrawIndirectCommand) && stride % 4 == 0);
+    assert(indirect.size >= (VkDeviceSize)(draw_count - 1) * stride + sizeof(VkDrawIndirectCommand));
+    emit_root_data(r, cmd, root);
+    vkCmdDrawIndirect(cmd, indirect.buffer, indirect.offset, draw_count, stride);
+}
+
+void cmd_draw_indexed_indirect(VkBackend *r, VkCommandBuffer cmd, ByteSpan root, BufferSlice indirect,
+                               uint32_t draw_count, uint32_t stride) {
+    assert(indirect.buffer && draw_count > 0);
+    assert(stride >= sizeof(VkDrawIndexedIndirectCommand) && stride % 4 == 0);
+    assert(indirect.size >= (VkDeviceSize)(draw_count - 1) * stride + sizeof(VkDrawIndexedIndirectCommand));
+    emit_root_data(r, cmd, root);
+    vkCmdDrawIndexedIndirect(cmd, indirect.buffer, indirect.offset, draw_count, stride);
+}
+
+void cmd_draw_indirect_count(VkBackend *r, VkCommandBuffer cmd, ByteSpan root, BufferSlice indirect, BufferSlice count,
+                             uint32_t max_draw_count, uint32_t stride) {
+    assert(indirect.buffer && max_draw_count > 0);
+    assert(stride >= sizeof(VkDrawIndirectCommand) && stride % 4 == 0);
+    assert(indirect.size >= (VkDeviceSize)(max_draw_count - 1) * stride + sizeof(VkDrawIndirectCommand));
+    assert(count.buffer && count.size >= sizeof(uint32_t));
+    emit_root_data(r, cmd, root);
+    vkCmdDrawIndirectCount(cmd, indirect.buffer, indirect.offset, count.buffer, count.offset, max_draw_count, stride);
+}
+
+void cmd_draw_indexed_indirect_count(VkBackend *r, VkCommandBuffer cmd, ByteSpan root, BufferSlice indirect,
+                                     BufferSlice count, uint32_t max_draw_count, uint32_t stride) {
+    assert(indirect.buffer && max_draw_count > 0);
+    assert(stride >= sizeof(VkDrawIndexedIndirectCommand) && stride % 4 == 0);
+    assert(indirect.size >= (VkDeviceSize)(max_draw_count - 1) * stride + sizeof(VkDrawIndexedIndirectCommand));
+    assert(count.buffer && count.size >= sizeof(uint32_t));
+    emit_root_data(r, cmd, root);
+    vkCmdDrawIndexedIndirectCount(cmd, indirect.buffer, indirect.offset, count.buffer, count.offset, max_draw_count,
+                                  stride);
+}
+
+
 void dispatch_push(VkBackend *r, VkCommandBuffer cmd, ByteSpan root, uint32_t group_count_x,
                                 uint32_t group_count_y, uint32_t group_count_z) {
     emit_root_data(r, cmd, root);
@@ -3013,6 +3053,20 @@ void vk_backend_create(VkBackend *r, VkBackendDesc *desc) {
                                                    .descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
                                                    .descriptorCount = 1,
                                                    .stageFlags      = VK_SHADER_STAGE_ALL,
+                                               },
+                                               // sprite stream: sorted instances, cull scratch, indirect commands
+                                               {
+                                                   .binding         = SPRITE_CPU_BINDING,
+                                                   .descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                                                   .descriptorCount = 1,
+                                                   .stageFlags      = VK_SHADER_STAGE_ALL,
+                                               },
+                                               // compacted stream read by the sprite vertex shader
+                                               {
+                                                   .binding         = SPRITE_GPU_BINDING,
+                                                   .descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                                                   .descriptorCount = 1,
+                                                   .stageFlags      = VK_SHADER_STAGE_ALL,
                                                }};
     VkDescriptorBindingFlags     flags[ARRAY_COUNT(bindings)];
 
@@ -3042,6 +3096,7 @@ void vk_backend_create(VkBackend *r, VkBackendDesc *desc) {
         {VK_DESCRIPTOR_TYPE_SAMPLER, desc->bindless_sampler_count},
         {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, desc->bindless_storage_image_count},
         {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1},
+        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2},
     };
     VkDescriptorPoolCreateInfo cib = {
         .sType   = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,

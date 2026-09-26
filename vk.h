@@ -620,6 +620,17 @@ void push_constants(VkBackend *r, VkCommandBuffer cmd, ByteSpan data);
 void cmd_draw(VkBackend *r, VkCommandBuffer cmd, ByteSpan root, uint32_t vertex_count, uint32_t instance_count);
 void dispatch_push(VkBackend *r, VkCommandBuffer cmd, ByteSpan root, uint32_t group_count_x, uint32_t group_count_y,
                    uint32_t group_count_z);
+// GPU-driven draw helpers. The indirect and count buffer views must have been
+// created with VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT. The caller is responsible
+// for recording the producer-to-consumer buffer barrier before these commands.
+void cmd_draw_indirect(VkBackend *r, VkCommandBuffer cmd, ByteSpan root, BufferSlice indirect, uint32_t draw_count,
+                       uint32_t stride);
+void cmd_draw_indexed_indirect(VkBackend *r, VkCommandBuffer cmd, ByteSpan root, BufferSlice indirect,
+                               uint32_t draw_count, uint32_t stride);
+void cmd_draw_indirect_count(VkBackend *r, VkCommandBuffer cmd, ByteSpan root, BufferSlice indirect, BufferSlice count,
+                             uint32_t max_draw_count, uint32_t stride);
+void cmd_draw_indexed_indirect_count(VkBackend *r, VkCommandBuffer cmd, ByteSpan root, BufferSlice indirect,
+                                     BufferSlice count, uint32_t max_draw_count, uint32_t stride);
 void end_pass(VkCommandBuffer cmd);
 void begin_pass(VkBackend *r, VkCommandBuffer cmd, const PassDesc *desc);
 void delete_queue_defer(VkBackend *r, uint64_t retire_value, DeferredDestroyFn fn, void *user);
@@ -634,27 +645,12 @@ void cmd_buffer_barrier(VkCommandBuffer cmd, VkBuffer buffer, VkDeviceSize offse
                         VkAccessFlags2 dst_access);
 // Uploads texture data through the staging pool.
 // Handles row pitch, mip/layer regions, and transfer-to-sample barriers.
-bool texture_upload(
-    VkBackend *r,
-    TextureID id,
-    uint32_t mip,
-    uint32_t layer,
-    VkOffset3D offset,
-    VkExtent3D extent,
-    ByteSpan data
-);
+bool texture_upload(VkBackend *r, TextureID id, uint32_t mip, uint32_t layer, VkOffset3D offset, VkExtent3D extent,
+                    ByteSpan data);
 
 // Copies a texture region into a host-readable buffer.
 // Completion must be synchronized before CPU access.
-bool texture_readback(
-    VkBackend *r,
-    VkCommandBuffer cmd,
-    TextureID id,
-    BufferSlice dst,
-    VkImageSubresourceLayers region,
-    VkExtent3D extent
-);
-
-
+bool texture_readback(VkBackend *r, VkCommandBuffer cmd, TextureID id, BufferSlice dst, VkImageSubresourceLayers region,
+                      VkExtent3D extent);
 
 #endif

@@ -7,6 +7,10 @@
 #define BINDLESS_STORAGE_IMAGE_BINDING 2
 #define GLOBAL_DATA_BINDING 3
 #define GAME_STATE_BINDING 4
+// Sprite stream (sorted instances + cull scratch) and the compacted stream the
+// vertex shader reads. Must match the [[vk::binding]] lines in shaders/sprite*.slang.
+#define SPRITE_CPU_BINDING 5
+#define SPRITE_GPU_BINDING 6
 #define MAX_MIPS 16
 #define RT_MAX_MIPS 13
 #define MAX_SWAPCHAIN_IMAGES 8
@@ -30,7 +34,7 @@
 
 
 #define MAX_COLOR_ATTACHMENTS 8
-#define VALIDATION false
+#define VALIDATION true
 
 
 // Root capture directory. Everything user-facing goes under here.

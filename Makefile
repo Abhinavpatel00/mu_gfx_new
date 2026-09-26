@@ -40,6 +40,9 @@ GLFW_CMAKE_ARGS := \
 SRC_C := main.c vk.c ext.c renderer.c src/nuklear.c src/input.c \
          external/mu/offset_allocator.c \
          external/mu/mu.c \
+         src/two_d/sprite.c \
+         src/two_d/picture.c \
+
 
 SRC_CPP := vma.cpp
 
