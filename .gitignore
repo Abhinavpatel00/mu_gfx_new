@@ -2,6 +2,7 @@
 /build
 /pipeline_cache.bin
 /compiledshaders
+/data/threedassets
 *.o
 *.rdi
 *.mp4

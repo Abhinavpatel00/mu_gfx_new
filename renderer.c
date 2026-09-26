@@ -1528,6 +1528,10 @@ bool renderer_frame(Renderer *r) {
         }
     }
     pass_sprites(r, cmd);
+    if (r->game.render) {
+        uint32_t image = r->vk.swapchain.current_image;
+        r->game.render(r->game.user, cmd, &r->hdr_color[image], &r->depth[image]);
+    }
     post_pass(r, cmd);
     pass_smaa(r, cmd);
     pass_ldr_to_swapchain(r, cmd);
@@ -1552,6 +1556,8 @@ void renderer_destroy(Renderer *r) {
     dmon_deinit();
     wait_idle(&r->vk);
     delete_queue_drain(&r->vk);
+    if (r->game.shutdown)
+        r->game.shutdown(r->game.user);
     forEach(i, CAPTURE_SLOTS) {
         r->vk.current_frame = (i + 1) % CAPTURE_SLOTS;
         capture_consume(r);

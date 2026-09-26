@@ -1,4 +1,5 @@
 #include "../src/scene3d_shared.h"
+#include "common.slang"
 [[vk::push_constant]] ScenePush pc;
 
 [shader("compute")]
@@ -7,13 +8,11 @@ void cs_main(uint3 tid : SV_DispatchThreadID) {
     uint candidate_id = tid.x;
     if (candidate_id >= pc.instance_count) return;
     SceneCandidate candidate = pc.candidates[candidate_id];
-    float4 sphere = pc.bounds[candidate.instance];
+    float4 sphere = pc.instances[candidate.instance].bounds;
     float4 center = float4(sphere.xyz, 1);
-    for (uint axis = 0; axis < 3; ++axis) {
-        float4 low = axis == 2 ? pc.clip_rows[2] : pc.clip_rows[3] + pc.clip_rows[axis];
-        float4 high = pc.clip_rows[3] - pc.clip_rows[axis];
-        if (dot(low, center) < -sphere.w * length(low.xyz) ||
-            dot(high, center) < -sphere.w * length(high.xyz)) return;
+    for (uint p = 0; p < 6; ++p) {
+        float4 plane = pc.frustum.planes[p];
+        if (dot(plane, center) < -sphere.w) return;
     }
     uint offset;
     InterlockedAdd(pc.commands[candidate.batch].instance_count, 1, offset);
@@ -24,12 +23,13 @@ struct Varying {
     float4 position : SV_Position;
     float3 normal : TEXCOORD0;
     float3 color : COLOR0;
+    float2 uv : TEXCOORD1;
 };
 [shader("vertex")]
 Varying vs_main(uint vertex : SV_VertexID, uint instance : SV_InstanceID,
                 uint base_instance : SV_StartInstanceLocation) {
     SceneInstance item = pc.instances[pc.visible[base_instance + instance]];
-    ScenePackedVertex packed = item.vertices[vertex];
+    ScenePackedVertex packed = pc.vertex_stream[vertex];
     float4 local = float4(f16tof32(packed.position_xy & 65535), f16tof32(packed.position_xy >> 16),
                           f16tof32(packed.position_z & 65535), 1);
     float4 world = float4(dot(item.rows[0], local), dot(item.rows[1], local), dot(item.rows[2], local), 1);
@@ -47,11 +47,15 @@ Varying vs_main(uint vertex : SV_VertexID, uint instance : SV_InstanceID,
     output.position = float4(dot(pc.clip_rows[0], world), dot(pc.clip_rows[1], world),
                              dot(pc.clip_rows[2], world), dot(pc.clip_rows[3], world));
     output.normal = normalize(transformed);
-    output.color = pc.materials[item.material].xyz * tint.xyz;
+    output.color = pc.material.xyz * tint.xyz;
+    output.uv = float2(f16tof32(packed.uv & 65535), f16tof32(packed.uv >> 16));
     return output;
 }
 [shader("fragment")]
 float4 fs_main(Varying input) : SV_Target0 {
     float light = pc.sun.w + (1 - pc.sun.w) * max(dot(normalize(input.normal), normalize(pc.sun.xyz)), 0.0);
-    return float4(input.color * light, 1);
+    float3 albedo = input.color;
+    if (pc.material.w >= 0)
+        albedo *= textures[(uint)pc.material.w].Sample(samplers[pc.sampler], input.uv).rgb;
+    return float4(albedo * light, 1);
 }

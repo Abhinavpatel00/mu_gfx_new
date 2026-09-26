@@ -8,4 +8,5 @@
 - add twod and threed renderer which is moduler threed renderer inspired by fukuna
 - make a proc gen game like tiny glade
 - experiment with different proc gen techniques
-- experiment with sdf deformable engine 
+- experiment with sdf deformable engine
+- in threed engine we will improve perf with time like cmd draw count , occlusion culling ,
