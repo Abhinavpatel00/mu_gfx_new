@@ -4,27 +4,32 @@
 #include <stdint.h>
 
 #include "src/input.h"
-#include "src/two_d/sprite.h"
+#include "vk.h"
 
 typedef struct Renderer Renderer;
+struct SpriteSystem; /* defined by src/two_d/sprite.h, only for 2D apps */
 
-/* One frame of game work, handed over just before the sprite flush. */
+/* One frame of game work, handed over just before the scene pass. */
 typedef struct GameFrame {
-    Renderer     *renderer;
-    SpriteSystem *sprites;
-    const Input  *input;
-    float         dt;
-    uint32_t      viewport_w;
-    uint32_t      viewport_h;
+    Renderer            *renderer;
+    struct SpriteSystem *sprites; /* NULL when the app runs without the 2D stage */
+    const Input         *input;
+    float                dt;
+    uint32_t             viewport_w;
+    uint32_t             viewport_h;
 } GameFrame;
 
 /* The game lives outside the renderer — main.c owns the state and registers
    these entry points. All are optional; a NULL hook is skipped. */
 typedef struct GameHooks {
     void *user;
-    void (*start)(void *user, SpriteSystem *sprites);  /* once, after sprite_system_init */
-    void (*frame)(void *user, const GameFrame *frame); /* every frame, before the flush */
-    /* Every frame after the sprite pass, before post-processing. Record GPU
+    /* Opt into the 2D stage. When false the sprite system, its atlases, streams
+       and pipelines are never created and the sprite pass never opens — a 3D
+       app pays nothing for 2D. */
+    bool two_d;
+    void (*start)(void *user, Renderer *renderer); /* once, after the stages exist */
+    void (*frame)(void *user, const GameFrame *frame); /* every frame, before the passes */
+    /* Every frame after the 2D stage, before post-processing. Record GPU
        work here (it has the scene color/depth targets). */
     void (*render)(void *user, VkCommandBuffer cmd, RenderTarget *color, RenderTarget *depth);
     /* Once at shutdown, after wait_idle and delete-queue drain. */
@@ -34,6 +39,11 @@ typedef struct GameHooks {
 Renderer *renderer_create(bool use_wayland, GameHooks game);
 void      renderer_destroy(Renderer *renderer);
 bool      renderer_frame(Renderer *renderer);
+
+/* The backend the app allocates its own resources through, and the 2D stage's
+   sprite system (NULL when GameHooks.two_d is false). */
+VkBackend          *renderer_vk(Renderer *renderer);
+struct SpriteSystem *renderer_sprites(Renderer *renderer);
 
 /* Queue a line for the on-screen Game window. The queue clears every frame, so
    call it once per frame for each line you want. Silently drops overflow. */
