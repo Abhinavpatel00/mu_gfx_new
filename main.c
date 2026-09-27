@@ -903,46 +903,24 @@ static void pets_start(void *user, Renderer *renderer) {
     p->vk        = renderer_vk(renderer);
     p->instances = (SceneInstanceSource *)calloc(PETS_GRID * PETS_GRID, sizeof(SceneInstanceSource));
     p->count     = PETS_GRID * PETS_GRID;
-    p->yaw       = 0.7f;
-    p->pitch     = 0.6f;
-    p->dist      = 140.0f;
+    p->camera.mode        = CAM_FLY;
+    p->camera.yaw         = 0.7f;
+    p->camera.pitch       = 0.6f;
+    p->camera.fov_y       = 1.04719755f; /* 60 deg */
+    p->camera.near_z      = 0.1f;
+    p->camera.far_z       = 1000.0f;
+    p->camera.speed       = 30.0f;
+    p->camera.third_dist  = 140.0f;
+    p->camera.focus[0]    = 0.0f;
+    p->camera.focus[1]    = 0.0f;
+    p->camera.focus[2]    = 0.0f;
+    p->yaw   = p->camera.yaw;
+    p->pitch = p->camera.pitch;
+    p->dist  = p->camera.third_dist;
     if (!p->instances) {
         fprintf(stderr, "[pets] instance allocation failed\n");
         exit(EXIT_FAILURE);
     }
-}
-
-/* Orbit: LMB drag or arrow/WASD keys steer yaw/pitch, scroll zooms. */
-static void pets_orbit(CubePets *p, const Input *input, float dt) {
-    float turn = 1.6f * dt;
-
-    if (mouse_down(input, MOUSE_LEFT)) {
-        p->yaw += (float)input->mouse_dx * 0.006f;
-        p->pitch -= (float)input->mouse_dy * 0.006f;
-    }
-    if (key_down(input, KEY_LEFT) || key_down(input, KEY_A))
-        p->yaw -= turn;
-    if (key_down(input, KEY_RIGHT) || key_down(input, KEY_D))
-        p->yaw += turn;
-    if (key_down(input, KEY_UP) || key_down(input, KEY_W))
-        p->pitch += turn;
-    if (key_down(input, KEY_DOWN) || key_down(input, KEY_S))
-        p->pitch -= turn;
-    if (key_pressed(input, KEY_Q))
-        p->dist *= 1.15f;
-    if (key_pressed(input, KEY_E))
-        p->dist *= 0.87f;
-
-    p->dist *= 1.0f - (float)input->scroll_y * 0.08f;
-
-    if (p->pitch > 1.5f)
-        p->pitch = 1.5f;
-    if (p->pitch < -1.5f)
-        p->pitch = -1.5f;
-    if (p->dist < 6.0f)
-        p->dist = 6.0f;
-    if (p->dist > 500.0f)
-        p->dist = 500.0f;
 }
 
 /* GameHooks.frame: input, camera state, HUD (counters come from last frame's
@@ -951,7 +929,13 @@ static void pets_frame(void *user, const GameFrame *frame) {
     CubePets *p  = (CubePets *)user;
     float     dt = frame->dt > 0.1f ? 0.1f : frame->dt;
 
-    pets_orbit(p, frame->input, dt);
+    p->camera.yaw        = p->yaw;
+    p->camera.pitch      = p->pitch;
+    p->camera.third_dist = p->dist;
+    scene3d_camera_mode_update(&p->camera, CAM_FLY, frame->input, dt);
+    p->yaw   = p->camera.yaw;
+    p->pitch = p->camera.pitch;
+    p->dist  = p->camera.third_dist;
 
     renderer_hud(frame->renderer, "cubepets  %u instances   %u candidates   %u draws", p->scene.last_instances,
                  p->scene.last_candidates, p->scene.last_draws);
@@ -992,16 +976,8 @@ static void pets_render(void *user, VkCommandBuffer cmd, RenderTarget *color, Re
         p->ready = true;
     }
 
-    /* Orbit position; the camera then looks back at the origin. */
-    float cp = cosf(p->pitch), sp = sinf(p->pitch);
-    float cy = cosf(p->yaw), sy = sinf(p->yaw);
-    p->camera.position[0] = cp * sy * p->dist;
-    p->camera.position[1] = sp * p->dist;
-    p->camera.position[2] = -cp * cy * p->dist;
-    p->camera.yaw         = p->yaw + 3.14159265f;
-    p->camera.pitch       = -p->pitch;
-    p->camera.fov_y       = 1.04719755f; /* 60 deg */
-    p->camera.near_z      = 0.1f;
+    /* cam_orbit already places position from focus/yaw/pitch/dist; hand the
+       pose over untouched so the orbit mapping stays identical. */
     scene3d_camera_update(&p->camera, (float)color->width / (float)color->height);
 
     static const float sun[4] = {0.35f, 0.85f, 0.40f, 0.25f};

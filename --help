@@ -1,0 +1,28 @@
+#pragma once
+#include <stdint.h>
+#include <stddef.h>
+#include <string.h>
+
+typedef struct {
+    const char *path;
+    const uint32_t *data;
+    size_t size;
+} EmbeddedShader;
+
+static const EmbeddedShader embedded_shaders[] = {
+};
+
+static inline int embedded_shader_find(
+    const char *path, const void **code, size_t *size)
+{
+    for (size_t i = 0;
+         i < sizeof(embedded_shaders) / sizeof(embedded_shaders[0]);
+         ++i) {
+        if (strcmp(path, embedded_shaders[i].path) == 0) {
+            *code = embedded_shaders[i].data;
+            *size = embedded_shaders[i].size;
+            return 1;
+        }
+    }
+    return 0;
+}
