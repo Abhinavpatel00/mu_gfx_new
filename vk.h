@@ -468,6 +468,45 @@ typedef struct SamplerDesc {
     VkBorderColor        border_color;
 } SamplerDesc;
 
+/* --- device memory tracker -------------------------------------------------
+   Every VMA allocation is credited to the tag that was current when it was
+   created, so a report says who holds the memory. Swapchain images, pipelines
+   and descriptor heaps are not VMA allocations; the driver-reported heap line
+   covers those. */
+
+typedef enum MemTag {
+    MEM_TAG_CORE = 0, /* backend pools, UBOs, readback, engine textures */
+    MEM_TAG_POST,     /* HDR / depth / LDR / SMAA targets */
+    MEM_TAG_TWO_D,    /* sprite streams and atlases */
+    MEM_TAG_PICTURE,  /* picture atlas pages */
+    MEM_TAG_SCENE_3D, /* glTF geometry and textures */
+    MEM_TAG_COUNT
+} MemTag;
+
+typedef struct MemStats {
+    uint64_t bytes[MEM_TAG_COUNT];
+    uint32_t buffers[MEM_TAG_COUNT];
+    uint32_t images[MEM_TAG_COUNT];
+    uint64_t total_bytes;
+    uint64_t peak_bytes;
+    uint64_t heap_used;   /* driver-reported across heaps: includes what VMA does not own */
+    uint64_t heap_budget;
+} MemStats;
+
+/* Credit allocations created from here on to `tag`; returns the previous tag so
+   a subsystem can restore what it interrupted. Nesting is the caller's job. */
+MemTag vk_mem_set_tag(VkBackend *vk, MemTag tag);
+
+/* Live snapshot. Fills the heap fields with a VMA budget query, so call it at
+   reporting points rather than in a hot loop. */
+void vk_mem_stats(VkBackend *vk, MemStats *out);
+
+/* One summary line plus a line per non-empty tag. */
+void vk_mem_report(VkBackend *vk, const char *when);
+
+/* Tag names mirror MemTag indices; exported so the profiler UI can label. */
+extern const char *const kMemTagNames[MEM_TAG_COUNT];
+
 struct VkBackend {
     uint32_t               current_frame;
     FrameContext           frames[MAX_FRAMES_IN_FLIGHT];
@@ -495,6 +534,16 @@ struct VkBackend {
     BarrierBatch           barrierbatch;
     VkSemaphore            timeline;
     uint64_t               timeline_last_submitted;
+
+    /* Live device memory held through VMA, split by the tag each allocation was
+       created under. Zero-initialized: CORE is tag 0. */
+    struct MemTracker {
+        MemTag   tag;
+        uint64_t bytes[MEM_TAG_COUNT];
+        uint32_t buffers[MEM_TAG_COUNT];
+        uint32_t images[MEM_TAG_COUNT];
+        uint64_t peak_bytes;
+    } mem;
 };
 
 static inline ColorAttachmentBlend blend_disabled(void) {

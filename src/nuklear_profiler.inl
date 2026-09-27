@@ -135,6 +135,39 @@ static void render_gpu_profiler_ui(Renderer *r) {
             nk_labelf(ctx, NK_TEXT_LEFT, "    VS %s | FS %s | Clipping primitives %s", vs, fs, primitives);
         }
     }
+     /* ---- device memory ---- */
+     {
+         MemStats s;
+         vk_mem_stats(&r->vk, &s);
+
+         nk_layout_row_dynamic(ctx, 24, 1);
+         nk_label_colored(ctx, "Device Memory", NK_TEXT_LEFT, nk_rgb(75, 205, 255));
+         nk_layout_row_dynamic(ctx, 22, 3);
+         nk_label(ctx, "Tag", NK_TEXT_LEFT);
+         nk_label(ctx, "MB", NK_TEXT_LEFT);
+         nk_label(ctx, "Buf/Img", NK_TEXT_LEFT);
+
+         forEach(t, MEM_TAG_COUNT) {
+             if (!s.bytes[t])
+                 continue;
+             nk_label(ctx, kMemTagNames[t], NK_TEXT_LEFT);
+             nk_labelf(ctx, NK_TEXT_LEFT, "%.1f", (double)s.bytes[t] / 1048576.0);
+             char cnt[32];
+             snprintf(cnt, sizeof(cnt), "%u / %u", s.buffers[t], s.images[t]);
+             nk_label(ctx, cnt, NK_TEXT_LEFT);
+         }
+         nk_label(ctx, "TOTAL", NK_TEXT_LEFT);
+         nk_labelf(ctx, NK_TEXT_LEFT, "%.1f", (double)s.total_bytes / 1048576.0);
+         nk_label(ctx, "", NK_TEXT_LEFT);
+         nk_label(ctx, "peak", NK_TEXT_LEFT);
+         nk_labelf(ctx, NK_TEXT_LEFT, "%.1f", (double)s.peak_bytes / 1048576.0);
+         nk_label(ctx, "", NK_TEXT_LEFT);
+         nk_label(ctx, "driver heap", NK_TEXT_LEFT);
+         nk_labelf(ctx, NK_TEXT_LEFT, "%.1f / %.1f", (double)s.heap_used / 1048576.0,
+                   (double)s.heap_budget / 1048576.0);
+         nk_label(ctx, "MB", NK_TEXT_LEFT);
+     }
+
     nk_layout_row_dynamic(ctx, 22, 1);
     nk_labelf(ctx, NK_TEXT_LEFT, "Timestamp Period: %.2f ns | Query Pool Size: %d passes",
               (double)r->vk.info.properties.limits.timestampPeriod, MAX_GPU_PASSES);

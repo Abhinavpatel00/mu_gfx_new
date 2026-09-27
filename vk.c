@@ -899,6 +899,113 @@ static MU_INLINE VkImageAspectFlags get_image_aspect(VkFormat format) {
         return VK_IMAGE_ASPECT_COLOR_BIT;
     }
 }
+/* --- memory tracker ---------------------------------------------------------
+   The tag current at create time rides along in the allocation's user data, so
+   a destroy charges the same bucket without any resource having to remember it.
+   Sizes are what VMA handed out, which is what actually occupies a block. */
+
+const char *const kMemTagNames[MEM_TAG_COUNT] = {
+    [MEM_TAG_CORE]     = "core",
+    [MEM_TAG_POST]     = "post",
+    [MEM_TAG_TWO_D]    = "two_d",
+    [MEM_TAG_PICTURE]  = "picture",
+    [MEM_TAG_SCENE_3D] = "scene_3d",
+};
+
+MemTag vk_mem_set_tag(VkBackend *r, MemTag tag) {
+    MemTag prev = r->mem.tag;
+    r->mem.tag  = tag;
+    return prev;
+}
+
+/* Bucket 0 (core) is a valid bucket, so user data carries tag + 1 and NULL
+   means "not mine" - an allocation made outside these wrappers. */
+static void *mem_tag_data(VkBackend *r) { return (void *)(uintptr_t)(r->mem.tag + 1); }
+
+static uintptr_t mem_bucket(const VmaAllocationInfo *info) {
+    uintptr_t bucket = (uintptr_t)info->pUserData;
+    return (bucket == 0 || bucket > MEM_TAG_COUNT) ? 0 : bucket;
+}
+
+static void mem_note_create(VkBackend *r, const VmaAllocationInfo *info, bool is_image) {
+    uintptr_t bucket = mem_bucket(info);
+    if (!bucket)
+        return;
+
+    uint64_t *bytes = &r->mem.bytes[bucket - 1];
+    *bytes += info->size;
+    if (is_image)
+        r->mem.images[bucket - 1]++;
+    else
+        r->mem.buffers[bucket - 1]++;
+
+    uint64_t total = 0;
+    forEach(t, MEM_TAG_COUNT) total += r->mem.bytes[t];
+    if (total > r->mem.peak_bytes)
+        r->mem.peak_bytes = total;
+}
+
+static void mem_note_destroy(VkBackend *r, const VmaAllocationInfo *info, bool is_image) {
+    uintptr_t bucket = mem_bucket(info);
+    if (!bucket)
+        return;
+
+    uint64_t *bytes = &r->mem.bytes[bucket - 1];
+    *bytes          = info->size > *bytes ? 0 : *bytes - info->size;
+    if (is_image && r->mem.images[bucket - 1])
+        r->mem.images[bucket - 1]--;
+    else if (!is_image && r->mem.buffers[bucket - 1])
+        r->mem.buffers[bucket - 1]--;
+}
+
+static void mem_query(VkBackend *r, VmaAllocation allocation, VmaAllocationInfo *out) {
+    vmaGetAllocationInfo(r->devc.vmaallocator, allocation, out);
+}
+
+void vk_mem_stats(VkBackend *r, MemStats *out) {
+    *out = (MemStats){0};
+    forEach(t, MEM_TAG_COUNT) {
+        out->bytes[t]      = r->mem.bytes[t];
+        out->buffers[t]    = r->mem.buffers[t];
+        out->images[t]     = r->mem.images[t];
+        out->total_bytes  += r->mem.bytes[t];
+    }
+    out->peak_bytes = r->mem.peak_bytes;
+
+    /* Use only the heaps the device actually has, so a driver
+       unused entries dont inflate the total. */
+    VkPhysicalDeviceMemoryProperties props;
+    vkGetPhysicalDeviceMemoryProperties(r->devc.physical_device, &props);
+    VmaBudget budgets[VK_MAX_MEMORY_HEAPS];
+    vmaGetHeapBudgets(r->devc.vmaallocator, budgets);
+    forEach(h, props.memoryHeapCount) {
+        out->heap_used   += budgets[h].usage;
+        out->heap_budget += budgets[h].budget;
+    }
+}
+
+void vk_mem_report(VkBackend *r, const char *when) {
+    MemStats s;
+    vk_mem_stats(r, &s);
+
+    uint32_t buffers = 0, images = 0;
+    forEach(t, MEM_TAG_COUNT) {
+        buffers += s.buffers[t];
+        images += s.images[t];
+    }
+
+    log_info("[mem] %s: %.1f MB held, peak %.1f MB | %u buffers, %u images | driver heap %.1f / %.1f MB", when,
+             (double)s.total_bytes / 1048576.0, (double)s.peak_bytes / 1048576.0, buffers, images,
+             (double)s.heap_used / 1048576.0, (double)s.heap_budget / 1048576.0);
+
+    forEach(t, MEM_TAG_COUNT) {
+        if (!s.bytes[t])
+            continue;
+        log_info("[mem]   %-9s %7.1f MB  (%u buffers, %u images)", kMemTagNames[t], (double)s.bytes[t] / 1048576.0,
+                 s.buffers[t], s.images[t]);
+    }
+}
+
 TextureID create_texture(VkBackend *r, const TextureCreateDesc *desc) {
     TextureID    id;
     Texture     *tex;
@@ -1021,10 +1128,15 @@ TextureID create_texture(VkBackend *r, const TextureCreateDesc *desc) {
     */
 
     alloc_info = (VmaAllocationCreateInfo){
-        .usage = VMA_MEMORY_USAGE_GPU_ONLY,
+        .usage     = VMA_MEMORY_USAGE_GPU_ONLY,
+        .pUserData = mem_tag_data(r),
     };
 
     VK_CHECK(vmaCreateImage(r->devc.vmaallocator, &image_info, &alloc_info, &tex->image, &tex->allocation, NULL));
+
+    VmaAllocationInfo mem_info;
+    mem_query(r, tex->allocation, &mem_info);
+    mem_note_create(r, &mem_info, true);
 
     /*
         ------------------------------------------------------------
@@ -1256,8 +1368,9 @@ bool buffer_pool_init(VkBackend *r,
     };
 
     VmaAllocationCreateInfo alloc_info = {
-        .usage = memory_usage,
-        .flags = alloc_flags,
+        .usage     = memory_usage,
+        .flags     = alloc_flags,
+        .pUserData = mem_tag_data(r),
     };
 
     VmaAllocationInfo out_info = {0};
@@ -1267,6 +1380,7 @@ bool buffer_pool_init(VkBackend *r,
         log_error("[buffer_pool] vmaCreateBuffer failed: %d", res);
         return false;
     }
+    mem_note_create(r, &out_info, false);
 
     pool->size_bytes   = size_bytes;
     pool->usage        = usage;
@@ -1296,8 +1410,12 @@ void buffer_pool_destroy(VkBackend *r, BufferPool *pool) {
         oa_destroy(&pool->tlsf);
     }
 
-    if (pool->buffer != VK_NULL_HANDLE)
+    if (pool->buffer != VK_NULL_HANDLE) {
+        VmaAllocationInfo mem_info;
+        mem_query(r, pool->allocation, &mem_info);
+        mem_note_destroy(r, &mem_info, false);
         vmaDestroyBuffer(r->devc.vmaallocator, pool->buffer, pool->allocation);
+    }
 
     memset(pool, 0, sizeof(*pool));
 }
@@ -1435,9 +1553,10 @@ bool create_buffer(VkBackend *r, VkDeviceSize size, VkBufferUsageFlags usage, Vm
         .usage       = usage,
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
     };
-    VmaAllocationCreateInfo alloc_info = {.usage = memory_usage,
+    VmaAllocationCreateInfo alloc_info = {.usage     = memory_usage,
                                           .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
-                                                   VMA_ALLOCATION_CREATE_MAPPED_BIT};
+                                                   VMA_ALLOCATION_CREATE_MAPPED_BIT,
+                                          .pUserData = mem_tag_data(r)};
 
     if (vmaCreateBuffer(r->devc.vmaallocator, &buffer_info, &alloc_info, &out->buffer, &out->allocation, NULL) !=
         VK_SUCCESS) {
@@ -1448,6 +1567,8 @@ bool create_buffer(VkBackend *r, VkDeviceSize size, VkBufferUsageFlags usage, Vm
 
     VmaAllocationInfo info;
     vmaGetAllocationInfo(r->devc.vmaallocator, out->allocation, &info);
+
+    mem_note_create(r, &info, false);
 
     out->mapping = info.pMappedData;
 
@@ -1470,11 +1591,16 @@ bool create_device_buffer(VkBackend *r, VkDeviceSize size, VkBufferUsageFlags us
         .usage = usage,
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
     };
-    VmaAllocationCreateInfo alloc_info = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+    VmaAllocationCreateInfo alloc_info = {.usage     = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+                                          .pUserData = mem_tag_data(r)};
     if (vmaCreateBuffer(r->devc.vmaallocator, &buffer_info, &alloc_info,
                         &out->buffer, &out->allocation, NULL) != VK_SUCCESS)
         return false;
     out->buffer_size = size;
+
+    VmaAllocationInfo mem_info;
+    mem_query(r, out->allocation, &mem_info);
+    mem_note_create(r, &mem_info, false);
     if (usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT) {
         VkBufferDeviceAddressInfo address_info = {
             .sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO,
@@ -1502,6 +1628,9 @@ void destroy_buffer(VkBackend *r, Buffer *buffer) {
     */
 
     if (buffer->buffer != VK_NULL_HANDLE) {
+        VmaAllocationInfo mem_info;
+        mem_query(r, buffer->allocation, &mem_info);
+        mem_note_destroy(r, &mem_info, false);
         vmaDestroyBuffer(r->devc.vmaallocator, buffer->buffer, buffer->allocation);
     }
 
@@ -1572,8 +1701,9 @@ static bool rt_create_internal(VkBackend *r, RenderTarget *rt, const RenderTarge
     };
 
     VmaAllocationCreateInfo alloc_info = {
-        .usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
-        .flags = VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT,
+        .usage     = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+        .flags     = VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT,
+        .pUserData = mem_tag_data(r),
     };
 
     VkResult res = vmaCreateImage(r->devc.vmaallocator, &image_info, &alloc_info, &rt->image, &rt->allocation, NULL);
@@ -1581,6 +1711,10 @@ static bool rt_create_internal(VkBackend *r, RenderTarget *rt, const RenderTarge
         log_error("[rt_create] vmaCreateImage failed: %d", res);
         return false;
     }
+
+    VmaAllocationInfo mem_info;
+    mem_query(r, rt->allocation, &mem_info);
+    mem_note_create(r, &mem_info, true);
 
     // Full mip chain view (for sampling)
     VkImageViewCreateInfo view_info = {
@@ -1712,8 +1846,12 @@ static void rt_destroy_internal(VkBackend *r, RenderTarget *rt, bool release_id)
             vkDestroyImageView(r->devc.device, rt->mip_views[i], NULL);
     }
 
-    if (rt->image)
+    if (rt->image) {
+        VmaAllocationInfo mem_info;
+        mem_query(r, rt->allocation, &mem_info);
+        mem_note_destroy(r, &mem_info, true);
         vmaDestroyImage(r->devc.vmaallocator, rt->image, rt->allocation);
+    }
 
     memset(rt, 0, sizeof(*rt));
 }
@@ -3398,6 +3536,9 @@ void destroy_texture(VkBackend *r, TextureID id) {
     assert(id < MAX_BINDLESS_TEXTURES && r->texture_system.textures[id].image);
     Texture *texture = &r->texture_system.textures[id];
     vkDestroyImageView(r->devc.device, texture->view, r->vk_allocator_callbacks);
+    VmaAllocationInfo mem_info;
+    mem_query(r, texture->allocation, &mem_info);
+    mem_note_destroy(r, &mem_info, true);
     vmaDestroyImage(r->devc.vmaallocator, texture->image, texture->allocation);
     *texture = (Texture){0};
     r->texture_system.info[id] = (TextureInfo){0};

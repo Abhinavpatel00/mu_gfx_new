@@ -163,6 +163,7 @@ static void scene_normal_matrix(const float m[16], float out[3][3]) {
    skinned nodes render at rest pose (the spec ignores a skinned node's own
    transform) and their palette lands with the skinning dispatch. */
 uint32_t scene3d_load_model(Scene3d *s, const char *path) {
+    MemTag prev = vk_mem_set_tag(s->vk, MEM_TAG_SCENE_3D);
     assert(s->model_count < SCENE3D_MAX_MODELS);
     assert(s->mesh_slot_count + 1 <= SCENE3D_MAX_BATCHES);
 
@@ -426,6 +427,7 @@ uint32_t scene3d_load_model(Scene3d *s, const char *path) {
     cgltf_free(gltf);
     fprintf(stderr, "[scene3d] %s: %u verts, %u indices, %u draw slot %u, albedo %u\n", path, vert_total,
             index_total, s->model_count, a->draw_offset, albedo);
+    vk_mem_set_tag(s->vk, prev);
     return s->model_count++;
 }
 
