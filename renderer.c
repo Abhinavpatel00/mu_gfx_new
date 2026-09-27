@@ -480,6 +480,7 @@ static void capture_record(Renderer *r, VkCommandBuffer cmd) {
 #include "src/nuklear_renderer.inl"
 
 static void renderer_resources_create(Renderer *r, VkBackendDesc *desc) {
+    MemTag prev = vk_mem_set_tag(&r->vk, MEM_TAG_POST);
     VkFormat depth_format = pick_depth_format(r->vk.devc.physical_device);
     VkFormat hdr_format   = VK_FORMAT_R16G16B16A16_SFLOAT;
     capture_init(r, r->vk.swapchain.extent.width, r->vk.swapchain.extent.height);
@@ -673,6 +674,8 @@ static void renderer_resources_create(Renderer *r, VkBackendDesc *desc) {
         rt_create(&r->vk, &r->smaa_edges[i], &smaa_edge_spec);
         rt_create(&r->vk, &r->smaa_weights[i], &smaa_weight_spec);
     }
+
+    vk_mem_set_tag(&r->vk, MEM_TAG_CORE);
     {
         const char *path = "data/dummy_texture.png";
 
@@ -790,6 +793,7 @@ static void renderer_resources_create(Renderer *r, VkBackendDesc *desc) {
         r->two_d = two_d_create(&r->vk, &r->hdr_color[0].format);
     if (r->game.start)
         r->game.start(r->game.user, r);
+     vk_mem_report(&r->vk, "init");
 }
 
 Renderer *renderer_create(bool use_wayland, GameHooks game) {
@@ -1598,6 +1602,7 @@ void renderer_destroy(Renderer *r) {
     forEach(i, MAX_FRAMES_IN_FLIGHT) destroy_buffer(&r->vk, &r->global_ubo[i]);
     destroy_buffer(&r->vk, &r->readback_buffer);
     pipeline_cache_save(r->vk.devc.device, r->vk.devc.physical_device, r->vk.devc.pipeline_cache, "pipeline_cache.bin");
+     vk_mem_report(&r->vk, "shutdown");
     vk_backend_destroy(&r->vk);
     vkDestroySurfaceKHR(r->vk.instance.instance, r->vk.surface, NULL);
     vk_instance_destroy(&r->vk);

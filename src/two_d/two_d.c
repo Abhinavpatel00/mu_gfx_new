@@ -298,7 +298,9 @@ TwoD *two_d_create(VkBackend *vk, const VkFormat *hdr_format) {
         log_fatal("[two_d] out of memory for the sprite system");
         exit(EXIT_FAILURE);
     }
+    MemTag prev = vk_mem_set_tag(vk, MEM_TAG_TWO_D);
     sprite_system_init(&two_d->sprites, vk, hdr_format);
+    vk_mem_set_tag(vk, prev);
     return two_d;
 }
 
