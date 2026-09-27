@@ -41,6 +41,7 @@ SRC_C := main.c vk.c ext.c renderer.c src/nuklear.c src/input.c \
          external/mu/offset_allocator.c \
          external/mu/mu.c \
          src/two_d/sprite.c \
+         src/two_d/two_d.c \
          src/two_d/picture.c \
          src/three_d/scene3d.c \
          src/three_d/scene3d_asset.c \

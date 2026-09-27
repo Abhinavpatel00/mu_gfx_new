@@ -161,10 +161,6 @@ typedef struct SpriteLayout {
     uint32_t     padded_count;
 } SpriteLayout;
 
-/* sprite_init.inl */
-void sprite_system_init(SpriteSystem *s, VkBackend *vk, const VkFormat *color_format);
-void sprite_system_destroy(SpriteSystem *s, VkBackend *vk);
-
 /* picture.c */
 void      picture_system_init(SpriteSystem *s);
 void      picture_system_destroy(SpriteSystem *s);
@@ -176,7 +172,7 @@ void sprite_begin(SpriteSystem *s, const SpriteCamera *camera);
 void sprite_push(SpriteSystem *s, SpriteDraw draw);
 bool sprite_prepare(SpriteSystem *s, SpriteLayout *out);
 
-/* sprite_pass.inl */
+/* two_d.c */
 void sprite_flush(SpriteSystem *s, VkCommandBuffer cmd, RenderTarget *target, LoadOp load, const float clear[4]);
 
 #endif

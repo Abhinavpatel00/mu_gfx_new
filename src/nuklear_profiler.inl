@@ -60,24 +60,32 @@ static void render_gpu_profiler_ui(Renderer *r) {
     nk_label(ctx, "Metric", NK_TEXT_LEFT);
     nk_label(ctx, "Current", NK_TEXT_LEFT);
     nk_label(ctx, "Details", NK_TEXT_LEFT);
-    nk_label(ctx, "Sprites pushed", NK_TEXT_LEFT);
-    nk_labelf(ctx, NK_TEXT_LEFT, "%u", r->sprites.last_instances);
-    nk_labelf(ctx, NK_TEXT_LEFT, "cap %u", (uint32_t)SPRITE_MAX_INSTANCES);
-    nk_label(ctx, "Batches", NK_TEXT_LEFT);
-    nk_labelf(ctx, NK_TEXT_LEFT, "%u", r->sprites.last_batches);
-    nk_labelf(ctx, NK_TEXT_LEFT, "cap %u", (uint32_t)SPRITE_MAX_BATCHES);
-    nk_label(ctx, "Indirect draws", NK_TEXT_LEFT);
-    nk_labelf(ctx, NK_TEXT_LEFT, "%u", r->sprites.last_draws);
-    nk_labelf(ctx, NK_TEXT_LEFT, "1 per batch");
-    nk_label(ctx, "Dropped", NK_TEXT_LEFT);
-    nk_labelf(ctx, NK_TEXT_LEFT, "%u", r->sprites.dropped);
-    nk_labelf(ctx, NK_TEXT_LEFT, "over cap or region full");
-    nk_label(ctx, "Atlases", NK_TEXT_LEFT);
-    nk_labelf(ctx, NK_TEXT_LEFT, "%u", r->sprites.atlas_count);
-    nk_labelf(ctx, NK_TEXT_LEFT, "%u pictures", r->sprites.picture_count);
-    nk_label(ctx, "Camera", NK_TEXT_LEFT);
-    nk_labelf(ctx, NK_TEXT_LEFT, "%.0f, %.0f", r->sprites.origin_x, r->sprites.origin_y);
-    nk_labelf(ctx, NK_TEXT_LEFT, "zoom %.3f", r->sprites.zoom);
+    if (!r->two_d) {
+        nk_label(ctx, "2D stage", NK_TEXT_LEFT);
+        nk_label(ctx, "off", NK_TEXT_LEFT);
+        nk_label(ctx, "app opted out (GameHooks.two_d)", NK_TEXT_LEFT);
+    } else {
+        TwoDStats st;
+        two_d_stats(r->two_d, &st);
+        nk_label(ctx, "Sprites pushed", NK_TEXT_LEFT);
+        nk_labelf(ctx, NK_TEXT_LEFT, "%u", st.instances);
+        nk_labelf(ctx, NK_TEXT_LEFT, "cap %u", st.instance_cap);
+        nk_label(ctx, "Batches", NK_TEXT_LEFT);
+        nk_labelf(ctx, NK_TEXT_LEFT, "%u", st.batches);
+        nk_labelf(ctx, NK_TEXT_LEFT, "cap %u", st.batch_cap);
+        nk_label(ctx, "Indirect draws", NK_TEXT_LEFT);
+        nk_labelf(ctx, NK_TEXT_LEFT, "%u", st.draws);
+        nk_labelf(ctx, NK_TEXT_LEFT, "1 per batch");
+        nk_label(ctx, "Dropped", NK_TEXT_LEFT);
+        nk_labelf(ctx, NK_TEXT_LEFT, "%u", st.dropped);
+        nk_labelf(ctx, NK_TEXT_LEFT, "over cap or region full");
+        nk_label(ctx, "Atlases", NK_TEXT_LEFT);
+        nk_labelf(ctx, NK_TEXT_LEFT, "%u", st.atlases);
+        nk_labelf(ctx, NK_TEXT_LEFT, "%u pictures", st.pictures);
+        nk_label(ctx, "Camera", NK_TEXT_LEFT);
+        nk_labelf(ctx, NK_TEXT_LEFT, "%.0f, %.0f", st.camera_x, st.camera_y);
+        nk_labelf(ctx, NK_TEXT_LEFT, "zoom %.3f", st.zoom);
+    }
 
     nk_layout_row_dynamic(ctx, 24, 1);
     if (g_gpu_profiler_ui.show_pipeline_stats) {

@@ -26,7 +26,7 @@
 
 void scene3d_camera_update(SceneCamera *cam, float aspect) {
     vec3 fwd      = {cosf(cam->pitch) * sinf(cam->yaw), sinf(cam->pitch), -cosf(cam->pitch) * cosf(cam->yaw)};
-    vec3 world_up = {0.0f, 1.0f, 0.0f};
+    vec3 world_up = {0.0f, -1.0f, 0.0f};
     vec3 center;
     glm_vec3_add(cam->position, fwd, center);
 
@@ -310,8 +310,8 @@ void scene3d_render(Scene3d *s, VkCommandBuffer cmd, RenderTarget *color, Render
                        VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
 
     /* 4. One indexed indirect draw per mesh slot, inside our own pass.
-          Color loads (the sprite pass cleared it), depth clears to the
-          reverse-Z far plane. */
+          Color loads (the first stage on the target cleared it), depth clears
+          to the reverse-Z far plane. */
     GpuProfiler *frame_prof = &vk->gpuprofiler[vk->current_frame];
     uint32_t     draws      = 0;
     GPU_SCOPE(frame_prof, cmd, "Scene3D", VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT) {

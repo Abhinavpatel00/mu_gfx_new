@@ -1,6 +1,7 @@
 #include "renderer.h"
 
 #include "src/three_d/scene3d.h"
+#include "src/two_d/sprite.h" /* the farm demo below is the 2D stage's client */
 
 #include <math.h>
 #include <stdio.h>
@@ -233,9 +234,11 @@ static const FarmSpeciesDef k_species[] = {
     {.name = "goat", .frames = {0, 1, 2, 3}, .frame_count = 4, .sleep = -1, .size = 76.0f, .speed = 62.0f},
 };
 
-/* GameHooks.start: called once, after sprite_system_init has built the atlases. */
-static void farm_init(void *user, SpriteSystem *sprites) {
-    Farm *farm = (Farm *)user;
+/* GameHooks.start: called once, after the 2D stage has built its atlases. */
+static void farm_init(void *user, Renderer *renderer) {
+    Farm         *farm    = (Farm *)user;
+    SpriteSystem *sprites = renderer_sprites(renderer);
+    assert(sprites && "the farm demo needs GameHooks.two_d");
     memset(farm, 0, sizeof(*farm));
     farm->rng = 0xC0FFEE17u;
 
@@ -868,7 +871,7 @@ static void farm_update(void *user, const GameFrame *frame) {
  * under a GPU frustum cull, drawn with one indexed indirect draw per mesh
  * slot. The camera is a mouse/keyboard orbit around the grid origin. */
 
-#define PETS_GRID    64u                    /* 64 x 64 = 4096 instances */
+#define PETS_GRID    64u /* 64 x 64 = 4096 instances */
 #define PETS_SPACING 3.0f
 #define PETS_MODELS  6u
 
@@ -882,27 +885,27 @@ static const char *const pets_models[PETS_MODELS] = {
 };
 
 typedef struct CubePets {
-    Scene3d            scene;
-    SceneCamera        camera;
+    Scene3d              scene;
+    SceneCamera          camera;
     SceneInstanceSource *instances;
-    uint32_t            count;
-    uint32_t            model[PETS_MODELS];
+    uint32_t             count;
+    uint32_t             model[PETS_MODELS];
 
-    float yaw, pitch, dist; /* orbit state */
-    bool  ready;
+    float      yaw, pitch, dist; /* orbit state */
+    bool       ready;
     VkBackend *vk;
 } CubePets;
 
 static CubePets g_pets;
 
-static void pets_start(void *user, SpriteSystem *sprites) {
-    CubePets *p     = (CubePets *)user;
-    p->vk           = sprites->vk;
-    p->instances    = (SceneInstanceSource *)calloc(PETS_GRID * PETS_GRID, sizeof(SceneInstanceSource));
-    p->count         = PETS_GRID * PETS_GRID;
-    p->yaw           = 0.7f;
-    p->pitch         = 0.6f;
-    p->dist          = 140.0f;
+static void pets_start(void *user, Renderer *renderer) {
+    CubePets *p  = (CubePets *)user;
+    p->vk        = renderer_vk(renderer);
+    p->instances = (SceneInstanceSource *)calloc(PETS_GRID * PETS_GRID, sizeof(SceneInstanceSource));
+    p->count     = PETS_GRID * PETS_GRID;
+    p->yaw       = 0.7f;
+    p->pitch     = 0.6f;
+    p->dist      = 140.0f;
     if (!p->instances) {
         fprintf(stderr, "[pets] instance allocation failed\n");
         exit(EXIT_FAILURE);
@@ -945,13 +948,13 @@ static void pets_orbit(CubePets *p, const Input *input, float dt) {
 /* GameHooks.frame: input, camera state, HUD (counters come from last frame's
    build — the CPU never learns this frame's visible count). */
 static void pets_frame(void *user, const GameFrame *frame) {
-    CubePets *p = (CubePets *)user;
+    CubePets *p  = (CubePets *)user;
     float     dt = frame->dt > 0.1f ? 0.1f : frame->dt;
 
     pets_orbit(p, frame->input, dt);
 
-    renderer_hud(frame->renderer, "cubepets  %u instances   %u candidates   %u draws",
-                 p->scene.last_instances, p->scene.last_candidates, p->scene.last_draws);
+    renderer_hud(frame->renderer, "cubepets  %u instances   %u candidates   %u draws", p->scene.last_instances,
+                 p->scene.last_candidates, p->scene.last_draws);
     renderer_hud(frame->renderer, "yaw %.2f  pitch %.2f  dist %.0f", p->yaw, p->pitch, p->dist);
 }
 
@@ -974,16 +977,16 @@ static void pets_render(void *user, VkCommandBuffer cmd, RenderTarget *color, Re
         for (uint32_t gz = 0; gz < PETS_GRID; gz++) {
             for (uint32_t gx = 0; gx < PETS_GRID; gx++) {
                 SceneInstanceSource *inst = &p->instances[gz * PETS_GRID + gx];
-                inst->model    = p->model[(gx + gz) % PETS_MODELS];
-                inst->flags    = SCENE_INSTANCE_VISIBLE;
-                inst->position[0] = ((float)gx - half) * PETS_SPACING;
-                inst->position[1] = 0.0f;
-                inst->position[2] = ((float)gz - half) * PETS_SPACING;
-                inst->scale       = 1.0f;
-                inst->orientation[3] = 1.0f; /* identity quaternion */
-                inst->clip       = UINT32_MAX;
-                inst->time       = 0.0f;
-                inst->tint       = 0xFFFFFFFFu; /* textures carry the color */
+                inst->model               = p->model[(gx + gz) % PETS_MODELS];
+                inst->flags               = SCENE_INSTANCE_VISIBLE;
+                inst->position[0]         = ((float)gx - half) * PETS_SPACING;
+                inst->position[1]         = 0.0f;
+                inst->position[2]         = ((float)gz - half) * PETS_SPACING;
+                inst->scale               = 1.0f;
+                inst->orientation[3]      = 1.0f; /* identity quaternion */
+                inst->clip                = UINT32_MAX;
+                inst->time                = 0.0f;
+                inst->tint                = 0xFFFFFFFFu; /* textures carry the color */
             }
         }
         p->ready = true;
@@ -1029,7 +1032,12 @@ int main(int argc, char **argv) {
         }
     }
 
-    GameHooks game     = {.user = &g_pets, .start = pets_start, .frame = pets_frame, .render = pets_render, .shutdown = pets_shutdown};
+    GameHooks game     = {.user     = &g_pets,
+                          .two_d    = false,
+                          .start    = pets_start,
+                          .frame    = pets_frame,
+                          .render   = pets_render,
+                          .shutdown = pets_shutdown};
     Renderer *renderer = renderer_create(use_wayland, game);
     if (!renderer)
         return EXIT_FAILURE;

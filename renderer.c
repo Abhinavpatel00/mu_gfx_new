@@ -14,7 +14,7 @@
 static void install_callbacks(Renderer *r);
 
 #include "vk.h"
-#include "src/two_d/sprite.h"
+#include "src/two_d/two_d.h"
 
 /* How many HUD lines the game can queue per frame, and how long each may be. */
 #define GAME_HUD_LINES 12
@@ -95,7 +95,7 @@ struct Renderer {
     Buffer       global_ubo[MAX_FRAMES_IN_FLIGHT];
     Buffer       readback_buffer;
     CaptureState capture;
-    SpriteSystem sprites;
+    TwoD        *two_d; /* NULL unless GameHooks.two_d opted the stage in */
     GameHooks    game;
     uint32_t     hud_count;
     char         hud_text[GAME_HUD_LINES][GAME_HUD_CHARS];
@@ -478,7 +478,6 @@ static void capture_record(Renderer *r, VkCommandBuffer cmd) {
     }
 }
 #include "src/nuklear_renderer.inl"
-#include "src/two_d/sprite_init.inl"
 
 static void renderer_resources_create(Renderer *r, VkBackendDesc *desc) {
     VkFormat depth_format = pick_depth_format(r->vk.devc.physical_device);
@@ -787,9 +786,10 @@ static void renderer_resources_create(Renderer *r, VkBackendDesc *desc) {
         }
     }
 
-    sprite_system_init(&r->sprites, &r->vk, &r->hdr_color[0].format);
+    if (r->game.two_d)
+        r->two_d = two_d_create(&r->vk, &r->hdr_color[0].format);
     if (r->game.start)
-        r->game.start(r->game.user, &r->sprites);
+        r->game.start(r->game.user, r);
 }
 
 Renderer *renderer_create(bool use_wayland, GameHooks game) {
@@ -1253,8 +1253,6 @@ static void pass_ldr_to_swapchain(Renderer *r, VkCommandBuffer cmd) {
     }
 }
 
-#include "src/two_d/sprite_pass.inl"
-
 #include "src/nuklear_pass.inl"
 
 static Renderer *g_renderer;
@@ -1474,6 +1472,23 @@ void renderer_hud(Renderer *r, const char *fmt, ...) {
     r->hud_count++;
 }
 
+VkBackend *renderer_vk(Renderer *r) { return &r->vk; }
+
+struct SpriteSystem *renderer_sprites(Renderer *r) {
+    return r->two_d ? two_d_sprites(r->two_d) : NULL;
+}
+
+/* The scene background. Whoever runs first on the HDR target owns this clear:
+   the 2D stage through sprite_flush, or the core when 2D is opted out. */
+static const float kSceneClear[4] = {0.02f, 0.025f, 0.03f, 1.0f};
+
+static void pass_clear_hdr(Renderer *r, VkCommandBuffer cmd, RenderTarget *target) {
+    PassAttachment color = {.target = target, .load = LOAD_CLEAR, .store = STORE_KEEP};
+    forEach(i, 4) color.clear[i] = kSceneClear[i];
+    begin_pass(&r->vk, cmd, &(PassDesc){.colors = &color, .color_count = 1, .pipeline = 0});
+    end_pass(cmd);
+}
+
 bool renderer_frame(Renderer *r) {
     TracyCFrameMark;
     platform_poll_events(r);
@@ -1492,7 +1507,7 @@ bool renderer_frame(Renderer *r) {
         r->hud_count = 0;
         GameFrame frame = {
             .renderer     = r,
-            .sprites      = &r->sprites,
+            .sprites      = r->two_d ? two_d_sprites(r->two_d) : NULL,
             .input        = &r->input,
             .dt           = r->dt,
             .viewport_w   = r->vk.swapchain.extent.width,
@@ -1527,7 +1542,11 @@ bool renderer_frame(Renderer *r) {
             flush_barriers(&r->vk, cmd);
         }
     }
-    pass_sprites(r, cmd);
+    RenderTarget *hdr = &r->hdr_color[r->vk.swapchain.current_image];
+    if (r->two_d)
+        two_d_render(r->two_d, cmd, hdr, kSceneClear);
+    else
+        pass_clear_hdr(r, cmd, hdr);
     if (r->game.render) {
         uint32_t image = r->vk.swapchain.current_image;
         r->game.render(r->game.user, cmd, &r->hdr_color[image], &r->depth[image]);
@@ -1572,7 +1591,10 @@ void renderer_destroy(Renderer *r) {
         rt_destroy(&r->vk, &r->smaa_edges[i]);
         rt_destroy(&r->vk, &r->smaa_weights[i]);
     }
-    sprite_system_destroy(&r->sprites, &r->vk);
+    if (r->two_d) {
+        two_d_destroy(r->two_d);
+        r->two_d = NULL;
+    }
     forEach(i, MAX_FRAMES_IN_FLIGHT) destroy_buffer(&r->vk, &r->global_ubo[i]);
     destroy_buffer(&r->vk, &r->readback_buffer);
     pipeline_cache_save(r->vk.devc.device, r->vk.devc.physical_device, r->vk.devc.pipeline_cache, "pipeline_cache.bin");
