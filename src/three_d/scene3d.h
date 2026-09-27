@@ -15,6 +15,7 @@
 
 #include "../../vk.h"
 #include "../scene3d_shared.h"
+#include "../../renderer.h"
 
 #define SCENE3D_MAX_INSTANCES   65536u
 #define SCENE3D_MAX_SKIN_JOBS   256u
@@ -190,7 +191,17 @@ typedef struct Scene3d {
     uint32_t last_skinned;
 } Scene3d;
 
-/* ---- Camera (world space, y-up, reverse-Z) ---- */
+/* ===================================================================== camera
+ * One struct, two modes. The mode drives how scene3d_camera_mode_update
+ * advances the pose; scene3d_camera_update (called from the render hook)
+ * always builds the view-proj matrix. */
+
+typedef enum CameraMode {
+    CAM_ORBIT,
+    CAM_FLY,
+} CameraMode;
+
+/* World-space camera, y-up, reverse-Z. */
 
 typedef struct SceneCamera {
     float position[3];
@@ -202,9 +213,24 @@ typedef struct SceneCamera {
     /* cglm mat4: 16-byte aligned because glm_mat4_mul uses aligned SSE stores. */
     mat4  view_proj;
     float clip_rows[4][4];
+
+    /* ---- mode state ---- */
+    CameraMode mode;     /* current mode; drives the integrator below */
+    float      speed;    /* fly movement speed (units / sec) */
+    float      third_dist; /* orbit distance from the focus point */
+    float      focus[3]; /* the point the camera orbits / looks at */
 } SceneCamera;
 
+/* Build the view-proj matrix (and clip rows) from the current pose. Always
+   call this from the render hook after the mode integrator has updated the
+   pose. aspect is color->width / color->height. */
 void scene3d_camera_update(SceneCamera *cam, float aspect);
+
+/* Integrate the pose from input for one frame. Call from the game frame
+   hook (which has frame->input and frame->dt). The matrix build is a
+   separate, cheaper call in the render hook. */
+void scene3d_camera_mode_update(SceneCamera *cam, CameraMode mode,
+                                const Input *input, float dt);
 
 /* ---- Lifetime ---- */
 

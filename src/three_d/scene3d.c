@@ -22,20 +22,114 @@
     (VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |                           \
      VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT)
 
-/* ---- Camera ------------------------------------------------------------ */
+/* ===================================================================== camera
+ * scene3d_camera_mode_update  -- integrate the pose from input (game
+ *                                frame hook).
+ * scene3d_camera_update      -- build the view-proj matrix (render
+ *                                hook).  Kept as a separate, cheap call
+ *                                because the render hook has the aspect
+ *                                ratio but not dt or input.
+ * --------------------------------------------------------------------- */
+
+/* Spherical offset -> cartesian, yaw/pitch convention matching the
+   existing orbit code (yaw=0 -> -z, pitch=0 -> horizon). */
+static void cam_sphere_offset(const SceneCamera *cam, vec3 out_pos) {
+    float cp = cosf(cam->pitch), sp = sinf(cam->pitch);
+    float cy = cosf(cam->yaw),  sy = sinf(cam->yaw);
+    out_pos[0] = cam->focus[0] + cp * sy * cam->third_dist;
+    out_pos[1] = cam->focus[1] + sp * cam->third_dist;
+    out_pos[2] = cam->focus[2] - cp * cy * cam->third_dist;
+}
+
+static void cam_look_at(SceneCamera *cam, mat4 out_view, const vec3 target) {
+    vec3 dir;
+    glm_vec3_sub(target, cam->position, dir);
+    vec3 center;
+    glm_vec3_add(cam->position, dir, center);
+    vec3 world_up = {0.0f, -1.0f, 0.0f};
+    glm_lookat(cam->position, center, world_up, out_view);
+}
+
+/* Fly forward from yaw/pitch (yaw=0 -> -z, pitch=0 -> horizon). */
+static void cam_fly_forward(const SceneCamera *cam, vec3 out_fwd) {
+    out_fwd[0] = cosf(cam->pitch) * sinf(cam->yaw);
+    out_fwd[1] = sinf(cam->pitch);
+    out_fwd[2] = -cosf(cam->pitch) * cosf(cam->yaw);
+}
+
+/* Orbit: mouse-drag or arrow/WASD steer yaw/pitch, scroll zooms.
+   The camera orbits cam->focus at cam->third_dist. */
+static void cam_orbit(SceneCamera *cam, const Input *input, float dt) {
+    float turn = 1.6f * dt;
+    if (mouse_down(input, MOUSE_LEFT)) {
+        cam->yaw   += (float)input->mouse_dx * 0.006f;
+        cam->pitch -= (float)input->mouse_dy * 0.006f;
+    }
+    if (key_down(input, KEY_LEFT)  || key_down(input, KEY_A)) cam->yaw   -= turn;
+    if (key_down(input, KEY_RIGHT) || key_down(input, KEY_D)) cam->yaw   += turn;
+    if (key_down(input, KEY_UP)    || key_down(input, KEY_W)) cam->pitch += turn;
+    if (key_down(input, KEY_DOWN)  || key_down(input, KEY_S)) cam->pitch -= turn;
+    if (key_pressed(input, KEY_Q)) cam->third_dist *= 1.15f;
+    if (key_pressed(input, KEY_E)) cam->third_dist *= 0.87f;
+    cam->third_dist *= 1.0f - (float)input->scroll_y * 0.08f;
+
+    if (cam->pitch > 1.5f)  cam->pitch = 1.5f;
+    if (cam->pitch < -1.5f) cam->pitch = -1.5f;
+    if (cam->third_dist < 6.0f)  cam->third_dist = 6.0f;
+    if (cam->third_dist > 500.0f) cam->third_dist = 500.0f;
+
+    cam_sphere_offset(cam, cam->position);
+}
+
+/* Fly: mouse looks, WASD moves through world space. */
+static void cam_fly(SceneCamera *cam, const Input *input, float dt) {
+    float turn = 1.6f * dt;
+    if (mouse_down(input, MOUSE_LEFT)) {
+        cam->yaw   += (float)input->mouse_dx * 0.006f;
+        cam->pitch -= (float)input->mouse_dy * 0.006f;
+    }
+    if (cam->pitch > 1.5f)  cam->pitch = 1.5f;
+    if (cam->pitch < -1.5f) cam->pitch = -1.5f;
+
+    /* forward / right in the XZ plane, yaw=0 -> -z. */
+    vec3 fwd = {sinf(cam->yaw), 0.0f, -cosf(cam->yaw)};
+    vec3 right = {cosf(cam->yaw), 0.0f, sinf(cam->yaw)};
+    vec3 move = {0.0f};
+    if (key_down(input, KEY_W)) { float m[3]; glm_vec3_scale(fwd, 1.0f, m); glm_vec3_add(move, m, move); }
+    if (key_down(input, KEY_S)) { float m[3]; glm_vec3_scale(fwd, -1.0f, m); glm_vec3_add(move, m, move); }
+    if (key_down(input, KEY_D)) { float m[3]; glm_vec3_scale(right, 1.0f, m); glm_vec3_add(move, m, move); }
+    if (key_down(input, KEY_A)) { float m[3]; glm_vec3_scale(right, -1.0f, m); glm_vec3_add(move, m, move); }
+    if (key_down(input, KEY_SPACE) || key_down(input, KEY_E)) move[1] += cam->speed * dt;
+    if (key_down(input, KEY_LEFT_SHIFT) || key_down(input, KEY_Q)) move[1] -= cam->speed * dt;
+
+    if (glm_vec3_norm(move) > 0.001f) {
+        glm_vec3_normalize(move);
+        glm_vec3_scale(move, cam->speed * dt, move);
+        glm_vec3_add(cam->position, move, cam->position);
+    }
+}
+
+void scene3d_camera_mode_update(SceneCamera *cam, CameraMode mode,
+                                   const Input *input, float dt) {
+    cam->mode = mode;
+    switch (mode) {
+        case CAM_ORBIT: cam_orbit(cam, input, dt); break;
+        case CAM_FLY:   cam_fly(cam, input, dt);   break;
+        default:        cam_orbit(cam, input, dt); break;
+    }
+}
 
 void scene3d_camera_update(SceneCamera *cam, float aspect) {
-    vec3 fwd      = {cosf(cam->pitch) * sinf(cam->yaw), sinf(cam->pitch), -cosf(cam->pitch) * cosf(cam->yaw)};
-    vec3 world_up = {0.0f, -1.0f, 0.0f};
-    vec3 center;
-    glm_vec3_add(cam->position, fwd, center);
-
     mat4 view, proj;
-    glm_lookat(cam->position, center, world_up, view);
-
-    /* Reverse-Z infinite perspective: near maps to 1, infinity to 0, which is
-       what pipeline_config_default's GREATER compare expects. cglm stores
-       columns: [2][3] is row 3 (w = -z), [3][2] is row 2 (z = near). */
+    if (cam->mode == CAM_FLY) {
+        vec3 fwd;
+        cam_fly_forward(cam, fwd);
+        vec3 center;
+        glm_vec3_add(cam->position, fwd, center);
+        cam_look_at(cam, view, center);
+    } else {
+        cam_look_at(cam, view, cam->focus);
+    }
     float f = 1.0f / tanf(cam->fov_y * 0.5f);
     memset(proj, 0, sizeof(proj));
     proj[0][0] = f / aspect;
