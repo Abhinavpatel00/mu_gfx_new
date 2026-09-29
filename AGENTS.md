@@ -13,6 +13,8 @@ Optimize for simple, data-oriented, predictable code.
 7. Simplicity over abstraction
 8. keep gpu and cpu cache locality in mind 
 - work on principles of semantic compression 
+- avoid using globals and always ask before using globals
+- use shader printf option and compile shader with debug flag to debug shaders  
 ## Data-Oriented Design
 
 Data layout is a primary design decision. Design around access patterns, iteration, and lifetime.

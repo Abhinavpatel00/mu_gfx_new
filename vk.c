@@ -2676,9 +2676,12 @@ void begin_pass(VkBackend *r, VkCommandBuffer cmd, const PassDesc *desc) {
         area = desc->shader_reads[0];
     if (!area && desc->shader_write_count)
         area = desc->shader_writes[0];
-    VkExtent2D area_extent;
+    VkExtent2D area_extent = {1, 1};
     if (area) {
         area_extent = (VkExtent2D){.width = area->width, .height = area->height};
+    } else if (desc->color_count == 0 && !desc->depth && !desc->shader_read_count &&
+               !desc->shader_write_count) {
+        // Buffer-only compute pass: no render area needed, no rendering scope.
     } else {
         // Swapchain-only pass: render area comes from the swapchain extent.
         assert(desc->color_count && desc->colors[0].swapchain_view &&
@@ -2700,12 +2703,27 @@ void begin_pass(VkBackend *r, VkCommandBuffer cmd, const PassDesc *desc) {
                           VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
     }
 
+    forEach(i, desc->buf_read_count) {
+        const BufferAccess *b = &desc->buf_reads[i];
+        cmd_buffer_barrier(cmd, b->slice.buffer, b->slice.offset, b->slice.size,
+                           VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT, b->stage,
+                           b->access);
+    }
+    forEach(i, desc->buf_write_count) {
+        const BufferAccess *b = &desc->buf_writes[i];
+        cmd_buffer_barrier(cmd, b->slice.buffer, b->slice.offset, b->slice.size,
+                           VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT, b->stage,
+                           b->access);
+    }
+
     flush_barriers(r, cmd);
 
     if (desc->color_count == 0) {
         // Compute pass: no rendering scope, just the pipeline bind.
         if (desc->pipeline)
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, r->render_pipelines.pipelines[desc->pipeline - 1]);
+        if (desc->push.size)
+            push_constants(r, cmd, desc->push);
         return;
     }
 
@@ -2747,6 +2765,8 @@ void begin_pass(VkBackend *r, VkCommandBuffer cmd, const PassDesc *desc) {
     vk_cmd_set_viewport_scissor(cmd, area_extent);
     if (desc->pipeline)
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, r->render_pipelines.pipelines[desc->pipeline - 1]);
+    if (desc->push.size)
+        push_constants(r, cmd, desc->push);
 }
 
 // ============================================================
@@ -3385,10 +3405,10 @@ void vk_backend_create(VkBackend *r, VkBackendDesc *desc) {
                          VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT,
                          2048);
         buffer_pool_init(r, BUFFER_POOL_TLSF, &r->gpu_pool, desc->size_of_gpu_pool,
-                         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
-                             VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT |
-                             VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
-                         VMA_MEMORY_USAGE_GPU_ONLY, 0, 2048);
+                          VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+                              VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                              VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+                          VMA_MEMORY_USAGE_GPU_ONLY, 0, 2048);
         buffer_pool_init(r, BUFFER_POOL_RING, &r->staging_pool, desc->size_of_staging_pool,
                          VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VMA_MEMORY_USAGE_AUTO,
                          VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT,
@@ -3625,6 +3645,26 @@ void cmd_buffer_barrier(VkCommandBuffer cmd, VkBuffer buffer, VkDeviceSize offse
         .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
         .bufferMemoryBarrierCount = 1,
         .pBufferMemoryBarriers = &barrier,
+    };
+    vkCmdPipelineBarrier2(cmd, &dep_info);
+}
+
+// Queue submission order creates no memory dependency between frames in flight.
+// Prior frames' shader/indirect reads must execute before this frame's transfer
+// writes into the same persistent buffers, or the writes land mid-read.
+void cmd_memory_barrier(VkCommandBuffer cmd, VkPipelineStageFlags2 src_stage, VkAccessFlags2 src_access,
+                        VkPipelineStageFlags2 dst_stage, VkAccessFlags2 dst_access) {
+    VkMemoryBarrier2 barrier = {
+        .sType       = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+        .srcStageMask = src_stage,
+        .srcAccessMask = src_access,
+        .dstStageMask = dst_stage,
+        .dstAccessMask = dst_access,
+    };
+    VkDependencyInfo dep_info = {
+        .sType           = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+        .memoryBarrierCount = 1,
+        .pMemoryBarriers    = &barrier,
     };
     vkCmdPipelineBarrier2(cmd, &dep_info);
 }

@@ -848,7 +848,7 @@ Renderer *renderer_create(bool use_wayland, GameHooks game) {
         .swapchain_preferred_present_mode = VK_PRESENT_MODE_MAILBOX_KHR,
 
         .size_of_cpu_pool     = MB(32),
-        .size_of_gpu_pool     = MB(512),
+        .size_of_gpu_pool     = MB(256),
         .size_of_staging_pool = MB(128),
 
     };

@@ -1,0 +1,42 @@
+Q1: Use chunk-relative f16 position, not raw world-space f16. Keep the 20-B record. This gives you precision and preserves the compact layout.
+Q2: Quantized TRS. Keep it.
+Q3: Uniform per-instance scale. Keep it.
+Q4: AoS. Keep it.
+Q5: Use mirrored-plane frustum for normal perspective cameras, with the generic 6-plane path as a fallback for shadow/off-center/orthographic views. Main camera gets the fast path.
+
+Q6: Prefer derived dispatch IDs when mesh-set size is bounded, e.g. 4 or 8 meshes:
+
+iid     = tid / MAX_MESHES_PER_SET;
+local_m = tid % MAX_MESHES_PER_SET;
+
+This removes the CPU candidate upload while keeping candidate-level parallelism. Don't use it if mesh-set sizes become large or highly variable. Your current candidate upload is only ~197 KB/frame, so the motivation is mostly CPU work and keeping the GPU parallel, not bandwidth.
+
+Q7: Keep visible[] private.
+Q8: 32-B draw command stride. Keep.
+Q9: Require drawIndirectFirstInstance.
+Q10: Put LOD/cluster fields in the asset layout now, but allow lodCount=1 and clusterCount=0.
+Q11: Don't grow GpuInstance for TAA/motion vectors. Use a sidecar/history buffer.
+
+Q12: Don't waste 2 extra bytes. Use the existing spare byte as an 8-bit mesh-set ID, giving you 256 sets instead of 16 without increasing the record size.
+Q13: Keep skinning as an optional capability because we will use skinning for sure, but allocate skinning buffers only when a scene actually uses skinned meshes. A barbarian-style rigid/bone-part character does not need full vertex skinning.
+Q14: Runtime capacity passed to scene_create(), with a hard maximum. Allocate once, never resize during gameplay.
+Q15: Runtime view_count with a fixed MAX_VIEWS hard cap. Don't bake the renderer around 1/4/6 views.
+Q16: Previous-frame Hi-Z. Keep.
+Q17: Make Hi-Z a renderer service, but keep per-system buffers separate.
+Q18: Keep GPU counters, but debug/profiling only. They must never add a synchronization point to the render path. Your delayed readback design already heads in the right direction.
+Q19: Split into scene_assets.c, scene_instances.c, scene_pass.c.
+Q20: Keep 2D and 3D separate implementations. Share conventions, not buffers.
+Q21: Game owns explicit dirty lists. Don't diff all instances every frame.
+Q22: Static maximum draw capacity. GPU writes the actual count.
+Q23: GPU tables are authoritative. CPU can keep lightweight asset metadata for editor/debug tooling, but don't maintain a second mutable rendering state.
+Q24: scene_create() can fail, uploads return bool, internal invariant violations assert.
+Q25: Absolutely no wait_idle in the frame loop. Resize/reallocation happens through an explicit resource-lifetime path.
+Q26: Clamp at capacity and increment dropped_commands. Never silently overflow.
+Q27: Start with global atomic compaction for simplicity, but keep the shader structured so subgroup/workgroup compaction can replace it without changing the API. Don't hard-code "64-thread subgroup" assumptions.
+Q28: visible[] representation remains implementation-private.
+
+Q29: Rename it to:
+
+scene_disable_occlusion(frames);
+
+A camera cut is an occlusion-history problem, not an LOD problem
