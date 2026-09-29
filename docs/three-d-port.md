@@ -1,4 +1,12 @@
-# 3D port — one pass, GPU-driven
+# 3D port — one pass, GPU-driven (design history: pre-`Count` port plan)
+
+> The steady-state frame contract is now §9 of `gpu-driven-api-design.md`
+> (2026-09-27): GPU owns visibility, LOD, compaction, command generation, and
+> draw count; `scene_cull()` + one `vkCmdDrawIndexedIndirectCount` per view;
+> previous-frame Hi-Z by default. This file's "single
+> `vkCmdDrawIndexedIndirect` per batch group / no `Count` variant" language
+> (§0 rule 3, §2) is superseded (§9.1/§9.4); what still holds is one landing,
+> GPU-owned visibility, and the adaptation table.
 
 Source: `fukuna_engine/main.c` (3012 lines) + `fukuna_engine/shaders/gltf_minimal.slang`
 + `fukuna_engine/shaders/compute_skinning.slang`.
@@ -21,13 +29,17 @@ One landing, no phases, no compat flags, no `USE_GPU_CULL` ifdefs.
    `gpu_scene_release` + re-alloc (`:2515-2526`, `:2536`),
    `frame_build_gpu_instances` memcpy pass (`:2462-2489`). None of these land
    in the new tree, not even temporarily.
-3. What lands on day one is the steady state in section 2: persistent asset
-   buffers, triple-buffered frame buffers, skinning dispatch, cull dispatch
-   that writes `instanceCount` + `visible[]` directly, single
-   `vkCmdDrawIndexedIndirect` per batch group. No `Count` variant, no
-   per-instance commands (rationale in section 2).
+3. What lands on day one is the steady state in section 2, as updated by the
+   `Count` contract (`gpu-driven-api-design.md` §9.1/§9.4, 2026-09-27):
+   persistent asset buffers, triple-buffered frame buffers, skinning dispatch,
+   cull dispatch that writes compacted commands + `visible[]` + draw count
+   directly, single `vkCmdDrawIndexedIndirectCount` per view. No
+   per-instance commands (rationale in section 2); no static-bucket revival
+   (§9.4).
 4. Scope is cut by content, not by architecture: one model format (glTF/GLB,
-   triangles only), LOD0 only, CPU palette eval, no shadows, no occlusion, no
+   triangles only), LOD0-only geometry at bring-up (cull still selects per-pair
+   LOD, 9.5), CPU palette eval, no shadows, previous-frame Hi-Z occlusion on by
+   default (9.8), no
    texture streaming. The pipeline is final; only content coverage grows later.
 
 
@@ -53,10 +65,13 @@ One landing, no phases, no compat flags, no `USE_GPU_CULL` ifdefs.
 mu_gfx `vk.c:236-260` requests and `:293-314` enables: `multiDrawIndirect`,
 `drawIndirectCount`, `bufferDeviceAddress`, `shaderDrawParameters`
 (unconditional, v1.1). `drawIndirectFirstInstance` is not requested anywhere —
-assume absent, same as the 2D renderer. Consequence: every indirect command
-carries `firstInstance = 0`; the instance base travels in the push payload and
-the vertex shader indexes `visible[base + iid]`. This is already the shape of
-`shaders/scene3d.slang:29-31` (`pc.visible[base_instance + instance]`); keep it.
+assume absent, same as the 2D renderer. Consequence in this pre-Count plan:
+every indirect command carries `firstInstance = 0`; the instance base travels
+in the push payload and the vertex shader indexes `visible[base + iid]`. This
+is already the shape of `shaders/scene3d.slang:29-31`
+(`pc.visible[base_instance + instance]`). Under the Count contract the base
+travels per command (`firstInstance` into `visible[]`, 9.1/9.9); keep the
+indexed VS lookup either way.
 Do not port fukuna's `firstInstance = i` (`main.c:2738`) — invalid here, and
 the reason fukuna's draw path needs rework, not copying.
 
@@ -69,32 +84,31 @@ game writes RenderInstance TRS (dirty-flagged)
   -> upload compact instance records (mat3x4 rows + bounds + draw/material)
   -> skinning dispatch (per skin job x chunks of 64 verts)
   -> barrier: CS_WRITE -> CS_READ + VS_READ
-  -> cull dispatch (1 thread per candidate, frustum vs world bounds)
-       writes commands[batch].instanceCount (zeroed on upload)
-       writes visible[commands[batch].firstInstance + slot] (atomic slot)
+  -> cull dispatch (1 thread per candidate, frustum vs world bounds;
+     previous-frame Hi-Z; see `gpu-driven-api-design.md` §9)
+       writes compacted commands + draw-count buffer (GPU-owned)
+       writes visible[firstInstance + slot] (slot assignment private, §9.9)
   -> barrier: CS_WRITE -> DRAW_INDIRECT_READ + VS_READ
   -> begin_pass (depth + hdr_color[current_image], LOAD_CLEAR)
-  -> one cmd_draw_indexed_indirect per batch group, root = ScenePush
+  -> one vkCmdDrawIndexedIndirectCount per view, root empty (§9.1)
   -> end_pass -> existing post_pass / smaa / ldr_to_swapchain (untouched)
 ```
 
 Why this shape and not fukuna's:
 
-- One command per batch group (static group, skinned group — a handful per
-  model), not one per instance. Fukuna emits one `VkDrawIndirectCommand` per
-  frame instance (`main.c:2722-2742`) and draws them all (`:2803-2804`); at
+- GPU-compacted commands (initially one per surviving pair, batchable per
+  (mesh, LOD) later — §9.9), not one per instance built on the CPU. Fukuna
+  emits one `VkDrawIndirectCommand` per frame instance
+  (`main.c:2722-2742`) and draws them all (`:2803-2804`); at
   10k instances that is 10k commands rebuilt and uploaded on the CPU every
   frame, plus `firstInstance = i` per command, which this backend cannot
-  honor (section 1.2). A batch-group command has `firstInstance = 0`; the
-  vertex shader resolves `visible[push.base + iid]` from GPU-written
-  `visible[]` — the pattern `shaders/scene3d.slang:18-31` already
-  implements. The cull kernel owns `instanceCount`, so the CPU never knows
-  the visible count after upload-time zeroing.
-- No `IndirectCount` variant. The count lives in `commands[b].instanceCount`,
-  written by the same dispatch that writes `visible[]`; the draw consumes it
-  directly. A separate count buffer adds a buffer, a barrier, and a second
-  thing to get wrong for zero benefit here. Keep `drawIndirectCount` enabled
-  in caps for later; do not use it now.
+  honor (section 1.2). The cull kernel owns commands, `visible[]`, and the
+  draw count (private slot assignment and entry format, gpu-driven-api-design
+  9.9), so the CPU never knows the visible count after upload-time
+  zeroing.
+- `IndirectCount` variant: the draw count is GPU-written and consumed by
+  `vkCmdDrawIndexedIndirectCount` (§9.1); the old "no `Count` variant"
+  rationale below is pre-`Count` history.
 - Skinning stays a separate dispatch before culling, not fused: skin jobs
   are `(job_count, max_chunks, 1)` over vertices, cull is 1D over
   candidates. One grid cannot serve both without a branch in every thread.
@@ -139,8 +153,9 @@ Changed (same role, backend-shaped Buffers):
   triple-buffered `Buffer`s (one per `MAX_FRAMES_IN_FLIGHT`, worst-case
   sized, reused — the 2D `stream`/`out` pattern,
   `src/two_d/sprite_init.inl:74-85`); `indirect_cmd_buffer` becomes one
-  persistent `Buffer` of batch-group commands; `indirect_count_buffer` is
-  deleted; add `visible_buffer` (`uint` per instance slot, GPU-written).
+  persistent `Buffer` of compacted commands (32 B stride) plus one
+  GPU-written draw-count word (9.1); add `visible_buffer` (`uint` per
+  visible slot, GPU-written, format private per 9.9).
 
 Deleted (CPU owns nothing per-frame but dirty uploads):
 
@@ -161,7 +176,8 @@ Deleted (CPU owns nothing per-frame but dirty uploads):
   `pc.bounds[candidate.instance]` raw (`:10`). Upload world bounds (one
   `mat4 * vec4` per instance on CPU, cheap) and keep the shader as-is.
   `commands[].firstInstance` / `instanceCount` layout must match `SceneDraw`
-  in `src/scene3d_shared.h:37-43` exactly. Vertex entry (`:28-52`) already
+  in `src/scene3d_shared.h:37-43` exactly (initial shape; batching later per
+  9.9 keeps the same fields). Vertex entry (`:28-52`) already
   does `visible[base + iid] -> rows -> world -> clip` with cofactor normals;
   keep. Fragment (`:53-57`) is lambert placeholder — keep for bring-up; PBR
   material fetch (`gltf_minimal.slang`) ports later as content, not now.
@@ -195,9 +211,10 @@ Deleted (CPU owns nothing per-frame but dirty uploads):
   freed per frame.
 - Sizes are worst-case constants: instances = `MAX * 64 B`, visible =
   `MAX * 4 B`, skin jobs = `MAX_SKIN_JOBS * sizeof(SkinJob)`, indirect =
-  `MAX_BATCH_GROUPS * sizeof(VkDrawIndexedIndirectCommand)`. Starting
-  point: 65536 instances / 256 skin jobs / 64 batch groups as `#define` in
-  the new `scene3d.h`; raise on measurement. (262144 is the 2D cap; too
+  `MAX_CMDS * 32 B` (`MeshDrawCommand` stride, gpu-driven-api-design 9.1) +
+  one GPU-written draw-count word. Starting
+  point: 65536 instances / 256 skin jobs / 64k compacted commands as `#define`
+  in the new `scene3d.h`; raise on measurement. (262144 is the 2D cap; too
   many for skinned 3D.)
 - `ScenePush` (`src/scene3d_shared.h:44-55`) must fit 256 B: 6 addresses +
   counts + 4 clip rows + sun is near the limit; verify with `_Static_assert`
@@ -221,15 +238,15 @@ Deleted (CPU owns nothing per-frame but dirty uploads):
 2. One glTF model loads: mesh/material/draw counts logged, asset `Buffer`s
    filled, `draw_buffer` persistent. Size-check before any scene or frame
    loop.
-3. One instance draws: hardcode one compact record + one batch-group command
-   (`instanceCount = 1`), indexed draw, lambert fragment. Pixels beat
-   architecture.
+3. One instance draws: hardcode one compact record + one compacted command
+   (initial `instanceCount = 1` shape, 9.9), indexed draw, lambert fragment.
+   Pixels beat architecture.
 4. Skinning dispatch moves verts (checksum or visual). Palette upload
    barrier present (`TRANSFER -> COMPUTE`, cf. `main.c:2615-2639`).
 5. Cull dispatch: park the camera so half the instances are behind;
-   GPU-written `instanceCount` drops, CPU draw count untouched. Read back a
+   GPU-written draw count drops, CPU draw count untouched. Read back a
    `last_visible` counter for HUD only, never stall.
-6. Full frame: dirty-walk uploads, both dispatches, batch-group draws,
+6. Full frame: dirty-walk uploads, both dispatches, one `Count` draw per view,
    `begin_pass`/`end_pass`, post chain untouched. Validation clean
    (`VALIDATION true`, `src/constant.h:37`); no `vkCmdCopyBuffer` inside a
    pass (the bug `GPU_DRIVEN_RENDERING_PLAN.md` documents — do not
@@ -240,8 +257,11 @@ Deleted (CPU owns nothing per-frame but dirty uploads):
 
 ## 7. Explicit non-goals (out of scope, not deferred phases)
 
-No shadow pass, no occlusion culling, no LOD selection, no texture streaming
+No shadow pass, no texture streaming
 or eviction (load-time `mip_count = 1` like sprites), no PBR beyond lambert
-bring-up, no multi-model batching beyond per-model batch groups, no animation
-compression, no `drawIndirectFirstInstance` reliance ever. Each would be a new
-design doc, not a continuation of this port.
+bring-up, no multi-model batching beyond the compacted (mesh, LOD) command
+shape (9.9), no animation
+compression. Occlusion is previous-frame Hi-Z by default and LOD selection is
+per-pair in the cull kernel (gpu-driven-api-design 9.5/9.8), not non-goals.
+`firstInstance`-as-`visible[]`-base stays (9.9). Each remaining item would be a
+new design doc, not a continuation of this port.

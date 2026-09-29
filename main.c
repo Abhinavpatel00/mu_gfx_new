@@ -1,12 +1,16 @@
 #include "renderer.h"
 
-#include "src/three_d/scene3d.h"
+#include "src/three_d/scene.h"
 #include "src/two_d/sprite.h" /* the farm demo below is the 2D stage's client */
 
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* Probe-only: capture API is internal to renderer.c today; the auto-shot below
+   just needs the entry point. Remove together with the probe. */
+bool capture_take_screenshot(Renderer *renderer, const char *path);
 
 /* ===================================================================== game
  * Top-down paddock demo: a dog you steer around a fenced field, livestock
@@ -871,7 +875,7 @@ static void farm_update(void *user, const GameFrame *frame) {
  * under a GPU frustum cull, drawn with one indexed indirect draw per mesh
  * slot. The camera is a mouse/keyboard orbit around the grid origin. */
 
-#define PETS_GRID    64u /* 64 x 64 = 4096 instances */
+#define PETS_GRID    8u
 #define PETS_SPACING 3.0f
 #define PETS_MODELS  6u
 
@@ -884,16 +888,26 @@ static const char *const pets_models[PETS_MODELS] = {
     "data/threedassets/kaykitadventure/Characters/gltf/Rogue_Hooded.glb",
 };
 
-typedef struct CubePets {
-    Scene3d              scene;
-    SceneCamera          camera;
-    SceneInstanceSource *instances;
-    uint32_t             count;
-    uint32_t             model[PETS_MODELS];
+typedef struct PetInstance {
+    uint32_t mesh_set;
+    float    pos[3];
+    float    scale;
+} PetInstance;
 
-    float      yaw, pitch, dist; /* orbit state */
+typedef struct CubePets {
+    Scene        *scene;
+    SceneCamera   camera;
+    PetInstance  *instances;
+    uint32_t      count;
+    uint32_t      model[PETS_MODELS];
+
+    float      yaw, pitch, dist;
+    float      anim_time;
     bool       ready;
+    bool       uploaded;
+    bool       skins_live;
     VkBackend *vk;
+    Renderer  *renderer; /* probe only */
 } CubePets;
 
 static CubePets g_pets;
@@ -901,16 +915,21 @@ static CubePets g_pets;
 static void pets_start(void *user, Renderer *renderer) {
     CubePets *p  = (CubePets *)user;
     p->vk        = renderer_vk(renderer);
-    p->instances = (SceneInstanceSource *)calloc(PETS_GRID * PETS_GRID, sizeof(SceneInstanceSource));
+    p->renderer  = renderer;
+    p->instances = (PetInstance *)calloc(PETS_GRID * PETS_GRID, sizeof(PetInstance));
     p->count     = PETS_GRID * PETS_GRID;
     p->camera.mode        = CAM_FLY;
-    p->camera.yaw         = 0.7f;
-    p->camera.pitch       = 0.6f;
     p->camera.fov_y       = 1.04719755f; /* 60 deg */
     p->camera.near_z      = 0.1f;
     p->camera.far_z       = 1000.0f;
     p->camera.speed       = 30.0f;
-    p->camera.third_dist  = 140.0f;
+    p->camera.third_dist  = 32.0f;
+    /* Start outside the grid looking along -z at it. */
+    p->camera.position[0] = 0.0f;
+    p->camera.position[1] = 10.0f;
+    p->camera.position[2] = 90.0f;
+    p->camera.yaw         = 0.0f;
+    p->camera.pitch       = -0.1f;
     p->camera.focus[0]    = 0.0f;
     p->camera.focus[1]    = 0.0f;
     p->camera.focus[2]    = 0.0f;
@@ -926,68 +945,168 @@ static void pets_start(void *user, Renderer *renderer) {
 /* GameHooks.frame: input, camera state, HUD (counters come from last frame's
    build — the CPU never learns this frame's visible count). */
 static void pets_frame(void *user, const GameFrame *frame) {
-    CubePets *p  = (CubePets *)user;
+    CubePets *p = (CubePets *)user;
     float     dt = frame->dt > 0.1f ? 0.1f : frame->dt;
+    p->anim_time += dt;
 
     p->camera.yaw        = p->yaw;
     p->camera.pitch      = p->pitch;
     p->camera.third_dist = p->dist;
-    scene3d_camera_mode_update(&p->camera, CAM_FLY, frame->input, dt);
+    scene_camera_mode_update(&p->camera, CAM_FLY, frame->input, dt);
     p->yaw   = p->camera.yaw;
     p->pitch = p->camera.pitch;
     p->dist  = p->camera.third_dist;
 
-    renderer_hud(frame->renderer, "cubepets  %u instances   %u candidates   %u draws", p->scene.last_instances,
-                 p->scene.last_candidates, p->scene.last_draws);
+    static bool hiz_on = true;
+    if (key_pressed(frame->input, KEY_H))
+        hiz_on = !hiz_on;
+    if (p->scene)
+        scene_set_occlusion(p->scene, hiz_on ? OCCLUSION_HIZ_PREV_FRAME : OCCLUSION_OFF);
+
+    SceneCounters counters = {0};
+    if (p->scene && scene_counters_read(p->scene, &counters)) {
+        renderer_hud(frame->renderer, "cubepets  %u submitted   %u drawn   frustum %u   hiz %u   dropped %u",
+                     counters.submitted, counters.drawn, counters.culled_frustum, counters.culled_hiz,
+                     counters.dropped_commands);
+        renderer_hud(frame->renderer, "lod  L0 %u  L1 %u  L2 %u  L3 %u", counters.lod[0], counters.lod[1],
+                     counters.lod[2], counters.lod[3]);
+        static uint32_t log_tick = 0;
+        static uint32_t frame_no = 0;
+        frame_no++;
+        if (frame_no <= 10 || ++log_tick >= 120) {
+            log_tick = 0;
+            fprintf(stderr,
+                    "[pets] submitted=%u drawn=%u frustum=%u hiz=%u dropped=%u lod=%u/%u/%u/%u\n",
+                    counters.submitted, counters.drawn, counters.culled_frustum, counters.culled_hiz,
+                    counters.dropped_commands, counters.lod[0], counters.lod[1], counters.lod[2],
+                    counters.lod[3]);
+            scene_debug_dump(p->scene);
+        }
+    } else {
+        renderer_hud(frame->renderer, "cubepets  %u instances", p->count);
+    }
     renderer_hud(frame->renderer, "yaw %.2f  pitch %.2f  dist %.0f", p->yaw, p->pitch, p->dist);
+    renderer_hud(frame->renderer, "hiz %s (%u levels)   H toggles", hiz_on ? "on" : "off",
+                 p->scene ? p->scene->hiz_levels : 0);
 }
 
 /* GameHooks.render: lazy-init (needs the pass formats), then camera + pass. */
 static void pets_render(void *user, VkCommandBuffer cmd, RenderTarget *color, RenderTarget *depth) {
     CubePets *p = (CubePets *)user;
-
     if (!p->ready) {
-        scene3d_init(&p->scene, p->vk, &color->format, &depth->format);
+        SceneDesc desc = {
+            .max_instances = SCENE_MAX_INSTANCES,
+            .max_mesh_slots = SCENE_MAX_MESH_SLOTS,
+            .max_material = SCENE_MAX_MATERIALS,
+            .max_views = 1,
+        };
+        p->scene = scene_create(p->vk, &color->format, &depth->format, &desc);
+        if (!p->scene) {
+            fprintf(stderr, "[pets] scene_create failed\n");
+            exit(EXIT_FAILURE);
+        }
         for (uint32_t i = 0; i < PETS_MODELS; i++) {
-            p->model[i] = scene3d_load_model(&p->scene, pets_models[i]);
+            p->model[i] = scene_load_model(p->scene, cmd, pets_models[i]);
             if (p->model[i] == UINT32_MAX) {
                 fprintf(stderr, "[pets] model load failed: %s\n", pets_models[i]);
                 exit(EXIT_FAILURE);
             }
         }
-        assert(p->scene.model_count == PETS_MODELS);
+        if (scene_anim_load(
+                p->scene,
+                "data/threedassets/KayKit_Character_Animations_1.1/KayKit_Character_Animations_1.1/"
+                "Animations/gltf/Rig_Medium/Rig_Medium_MovementBasic.glb")) {
+            uint32_t walk = scene_anim_find("Walking_A");
+            uint32_t idle = scene_anim_find("Jump_Idle");
+            if (walk != UINT32_MAX && idle != UINT32_MAX) {
+                for (uint32_t i = 0; i < PETS_MODELS; i++)
+                    scene_skin_play_set(p->scene, p->model[i], walk, idle);
+                /* PETS_NOSKIN=1 keeps the bind-pose palette so the VS skin path
+                   still runs but samples T-pose; bisects pose sampler vs VS path. */
+                p->skins_live = getenv("PETS_NOSKIN") == NULL;
+            } else {
+                fprintf(stderr, "[pets] walk/idle clips not found\n");
+            }
+        } else {
+            fprintf(stderr, "[pets] anim pack load failed\n");
+        }
 
         float half = (float)PETS_GRID * 0.5f;
         for (uint32_t gz = 0; gz < PETS_GRID; gz++) {
             for (uint32_t gx = 0; gx < PETS_GRID; gx++) {
-                SceneInstanceSource *inst = &p->instances[gz * PETS_GRID + gx];
-                inst->model               = p->model[(gx + gz) % PETS_MODELS];
-                inst->flags               = SCENE_INSTANCE_VISIBLE;
-                inst->position[0]         = ((float)gx - half) * PETS_SPACING;
-                inst->position[1]         = 0.0f;
-                inst->position[2]         = ((float)gz - half) * PETS_SPACING;
-                inst->scale               = 1.0f;
-                inst->orientation[3]      = 1.0f; /* identity quaternion */
-                inst->clip                = UINT32_MAX;
-                inst->time                = 0.0f;
-                inst->tint                = 0xFFFFFFFFu; /* textures carry the color */
+                PetInstance *inst = &p->instances[gz * PETS_GRID + gx];
+                inst->mesh_set = p->model[(gx + gz) % PETS_MODELS];
+                inst->pos[0] = ((float)gx - half) * PETS_SPACING;
+                inst->pos[1] = 0.0f;
+                inst->pos[2] = ((float)gz - half) * PETS_SPACING;
+                inst->scale = 1.0f;
             }
         }
         p->ready = true;
     }
 
-    /* cam_orbit already places position from focus/yaw/pitch/dist; hand the
-       pose over untouched so the orbit mapping stays identical. */
-    scene3d_camera_update(&p->camera, (float)color->width / (float)color->height);
+    scene_camera_update(&p->camera, (float)color->width / (float)color->height);
 
     static const float sun[4] = {0.35f, 0.85f, 0.40f, 0.25f};
-    scene3d_render(&p->scene, cmd, color, depth, p->instances, p->count, &p->camera, sun);
+    scene_frame_begin(p->scene, cmd);
+
+    SceneViewDesc view_desc = {0};
+    memcpy(view_desc.rows, p->camera.clip_rows, sizeof(view_desc.rows));
+    memcpy(view_desc.sun, sun, sizeof(view_desc.sun));
+    view_desc.viewport_w = (float)color->width;
+    view_desc.viewport_h = (float)color->height;
+    scene_view_set(p->scene, 0, &view_desc);
+
+    if (!p->uploaded) {
+        uint32_t first = 0;
+        uint32_t n = p->count;
+        if (scene_instance_reserve(p->scene, n, &first)) {
+            InstanceUpdate *updates = (InstanceUpdate *)malloc(n * sizeof(InstanceUpdate));
+            for (uint32_t i = 0; i < n; i++) {
+                updates[i].slot = first + i;
+                updates[i].data.pos_xy =
+                    (uint32_t)mu_quantize_half(p->instances[i].pos[0]) |
+                    ((uint32_t)mu_quantize_half(p->instances[i].pos[1]) << 16);
+                updates[i].data.pos_z__scale =
+                    (uint32_t)mu_quantize_half(p->instances[i].pos[2]) |
+                    ((uint32_t)mu_quantize_half(p->instances[i].scale) << 16);
+                updates[i].data.spare = 0;
+                updates[i].data.quat = scene_pack_quat(0.0f, 0.0f, 0.0f, 1.0f);
+                updates[i].data.flags = 0x000000FFu | ((uint32_t)p->instances[i].mesh_set << 24);
+            }
+            if (scene_upload_instances(p->scene, cmd,
+                                       (ByteSpan){updates, (uint32_t)(n * sizeof(InstanceUpdate))}))
+                p->uploaded = true;
+            free(updates);
+        }
+    }
+
+    if (p->skins_live)
+        scene_skin_update(p->scene, cmd, p->anim_time);
+
+    scene_cull(p->scene, cmd, 0);
+    scene_draw(p->scene, cmd, color, depth, 0);
+
+    /* Auto-capture periodically once warmup is over, so a headless probe can
+       compare several frames for flicker without anyone watching the window. */
+    static int32_t probe_shot = -1;
+    if (probe_shot < 0)
+        probe_shot = 120;
+    else if (probe_shot > 0 && --probe_shot == 0) {
+        static int32_t probe_idx = 0;
+        if (probe_idx < 6) {
+            char path[64];
+            snprintf(path, sizeof(path), "capture_probe_%d.png", probe_idx++);
+            capture_take_screenshot(p->renderer, path);
+        }
+        probe_shot = 120;
+    }
 }
 
 static void pets_shutdown(void *user) {
     CubePets *p = (CubePets *)user;
     if (p->ready)
-        scene3d_destroy(&p->scene, p->vk);
+        scene_destroy(p->scene);
     free(p->instances);
     p->instances = NULL;
     p->ready     = false;

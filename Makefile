@@ -38,16 +38,21 @@ GLFW_CMAKE_ARGS := \
 # Sources
 # =========================================================
 SRC_C := main.c vk.c ext.c renderer.c src/nuklear.c src/input.c \
-         external/mu/offset_allocator.c \
-         external/mu/mu.c \
-         src/two_d/sprite.c \
-         src/two_d/two_d.c \
-         src/two_d/picture.c \
-         src/three_d/scene3d.c \
-         src/three_d/scene3d_asset.c \
+          external/mu/offset_allocator.c \
+          external/mu/mu.c \
+          src/two_d/sprite.c \
+          src/two_d/two_d.c \
+          src/two_d/picture.c \
+          src/three_d/scene.c \
+          src/three_d/scene_anim.c \
+          src/three_d/scene_assets.c \
+          src/three_d/scene_instances.c \
+          src/three_d/scene_pass.c \
 
 
-SRC_CPP := vma.cpp
+SRC_CPP := vma.cpp \
+          external/meshoptimizer/src/simplifier.cpp \
+          external/meshoptimizer/src/allocator.cpp
 
 # =========================================================
 # Optional Tracy Profiler

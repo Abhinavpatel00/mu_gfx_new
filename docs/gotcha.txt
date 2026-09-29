@@ -1,0 +1,1 @@
+non uniform scale isnt supported to save bytes this could be problem with loading some mesh 

@@ -435,17 +435,6 @@ typedef struct PassAttachment {
     float         clear[4]; // color rgba; depth clear value in clear[0]
 } PassAttachment;
 
-typedef struct PassDesc {
-    const PassAttachment *colors;       // NULL when compute-only
-    uint32_t              color_count;  // 0..MAX_COLOR_ATTACHMENTS
-    const PassAttachment *depth;        // NULL = no depth attachment
-    RenderTarget *const  *shader_reads; // sampled reads (sampled-read layout)
-    uint32_t              shader_read_count;
-    RenderTarget *const  *shader_writes; // storage image writes (GENERAL layout)
-    uint32_t              shader_write_count;
-    PipelineID            pipeline; // 1-based; 0 = caller binds later (e.g. Nuklear)
-} PassDesc;
-
 typedef struct BufferSlice {
     BufferPool   *pool;
     VkBuffer      buffer;
@@ -454,6 +443,29 @@ typedef struct BufferSlice {
     void         *mapped;
     OA_Allocation allocation;
 } BufferSlice;
+
+typedef struct BufferAccess {
+    BufferSlice            slice;
+    VkPipelineStageFlags2  stage;
+    VkAccessFlags2         access;
+} BufferAccess;
+
+typedef struct PassDesc {
+    const PassAttachment *colors;       // NULL when compute-only
+    uint32_t              color_count;  // 0..MAX_COLOR_ATTACHMENTS
+    const PassAttachment *depth;        // NULL = no depth attachment
+    RenderTarget *const  *shader_reads; // sampled reads (sampled-read layout)
+    uint32_t              shader_read_count;
+    RenderTarget *const  *shader_writes; // storage image writes (GENERAL layout)
+    uint32_t              shader_write_count;
+    const BufferAccess   *buf_reads; // buffer reads: full barrier into stage/access
+    uint32_t              buf_read_count;
+    const BufferAccess   *buf_writes; // buffer writes: full barrier into stage/access
+    uint32_t              buf_write_count;
+    ByteSpan              push; // bytes, <= 256, pushed once at bind; empty = none
+    PipelineID            pipeline; // 1-based; 0 = caller binds later (e.g. Nuklear)
+} PassDesc;
+
 typedef struct SamplerDesc {
     VkFilter             min_filter;
     VkFilter             mag_filter;
@@ -692,6 +704,11 @@ void vk_frame_submit(VkBackend *r);
 void cmd_buffer_barrier(VkCommandBuffer cmd, VkBuffer buffer, VkDeviceSize offset, VkDeviceSize size,
                         VkPipelineStageFlags2 src_stage, VkAccessFlags2 src_access, VkPipelineStageFlags2 dst_stage,
                         VkAccessFlags2 dst_access);
+// Global execution+memory dependency. Needed between frames in flight: queue
+// submission order alone does not order prior frames' reads against this
+// frame's transfer writes into shared persistent buffers.
+void cmd_memory_barrier(VkCommandBuffer cmd, VkPipelineStageFlags2 src_stage, VkAccessFlags2 src_access,
+                        VkPipelineStageFlags2 dst_stage, VkAccessFlags2 dst_access);
 // Uploads texture data through the staging pool.
 // Handles row pitch, mip/layer regions, and transfer-to-sample barriers.
 bool texture_upload(VkBackend *r, TextureID id, uint32_t mip, uint32_t layer, VkOffset3D offset, VkExtent3D extent,
