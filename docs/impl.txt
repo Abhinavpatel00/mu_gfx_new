@@ -1,0 +1,67 @@
+First cull the instance itself:
+
+// One bit per instance.
+// 1 = this instance survives coarse culling.
+uint instance_visible_bitset[(MAX_INSTANCES + 31) / 32];
+
+For each instance:
+
+uint visible = frustum_test(instance_bounds);
+
+// One bit = one boolean result.
+// We don't need a bool[N] stream.
+if (visible)
+    bitset_set(instance_visible_bitset, iid);
+
+bitset for streams instead of booleans 
+
+
+instead of having boolean visible just store visible  array 
+instead of having boolean dirty just store dirty_uploads array 
+sparse index list for sparse survivors
+instead of putting a type inside an object and switching on it, put the object into the table that represents the behavior
+
+uint32_t casts_shadow[(MAX_INSTANCES + 31) / 32];
+
+GpuInstance[]
+    │
+    ├── frustum predicate ──→ bitset
+    │
+    ├── state predicate ────→ bitset
+    │
+    └── pass predicate ─────→ bitset
+                │
+                ↓
+          bitwise AND
+                │
+                ↓
+         surviving IDs
+                │
+                ↓
+         sparse index list
+                │
+                ↓
+       Hi-Z / LOD / cluster
+                │
+                ↓
+       draw-command stream
+
+
+
+
+
+
+
+
+
+
+
+for (int i = 0; i < opaque_count; ++i)
+    render_opaque(...);
+
+for (int i = 0; i < skinned_count; ++i)
+    render_skinned(...);
+
+for (int i = 0; i < shadow_count; ++i)
+    render_shadow(...);
+

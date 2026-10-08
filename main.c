@@ -1,8 +1,8 @@
 #include "renderer.h"
 
-#include "src/three_d/scene3d.h"
-#include "src/two_d/sprite.h" /* the farm demo below is the 2D stage's client */
+#include "src/three_d/scene.h"
 
+#include "src/two_d/sprite.h" /* the farm demo below is the 2D stage's client */
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -871,7 +871,7 @@ static void farm_update(void *user, const GameFrame *frame) {
  * under a GPU frustum cull, drawn with one indexed indirect draw per mesh
  * slot. The camera is a mouse/keyboard orbit around the grid origin. */
 
-#define PETS_GRID    64u /* 64 x 64 = 4096 instances */
+#define PETS_GRID    8u
 #define PETS_SPACING 3.0f
 #define PETS_MODELS  6u
 
@@ -884,114 +884,44 @@ static const char *const pets_models[PETS_MODELS] = {
     "data/threedassets/kaykitadventure/Characters/gltf/Rogue_Hooded.glb",
 };
 
-typedef struct CubePets {
-    Scene3d              scene;
-    SceneCamera          camera;
-    SceneInstanceSource *instances;
-    uint32_t             count;
-    uint32_t             model[PETS_MODELS];
+typedef struct PetInstance {
+    uint32_t mesh_set;
+    float    pos[3];
+    float    scale;
+} PetInstance;
 
-    float      yaw, pitch, dist; /* orbit state */
+typedef struct CubePets {
+    PetInstance *instances;
+    uint32_t     count;
+    uint32_t     model[PETS_MODELS];
+
+    float      yaw, pitch, dist;
+    float      anim_time;
     bool       ready;
+    bool       uploaded;
+    bool       skins_live;
     VkBackend *vk;
+    Renderer  *renderer; /* probe only */
 } CubePets;
 
 static CubePets g_pets;
 
 static void pets_start(void *user, Renderer *renderer) {
-    CubePets *p  = (CubePets *)user;
-    p->vk        = renderer_vk(renderer);
-    p->instances = (SceneInstanceSource *)calloc(PETS_GRID * PETS_GRID, sizeof(SceneInstanceSource));
-    p->count     = PETS_GRID * PETS_GRID;
-    p->camera.mode        = CAM_FLY;
-    p->camera.yaw         = 0.7f;
-    p->camera.pitch       = 0.6f;
-    p->camera.fov_y       = 1.04719755f; /* 60 deg */
-    p->camera.near_z      = 0.1f;
-    p->camera.far_z       = 1000.0f;
-    p->camera.speed       = 30.0f;
-    p->camera.third_dist  = 140.0f;
-    p->camera.focus[0]    = 0.0f;
-    p->camera.focus[1]    = 0.0f;
-    p->camera.focus[2]    = 0.0f;
-    p->yaw   = p->camera.yaw;
-    p->pitch = p->camera.pitch;
-    p->dist  = p->camera.third_dist;
-    if (!p->instances) {
-        fprintf(stderr, "[pets] instance allocation failed\n");
-        exit(EXIT_FAILURE);
-    }
+    CubePets *p = (CubePets *)user;
+    p->vk       = renderer_vk(renderer);
+    exit(EXIT_FAILURE);
 }
 
 /* GameHooks.frame: input, camera state, HUD (counters come from last frame's
    build — the CPU never learns this frame's visible count). */
-static void pets_frame(void *user, const GameFrame *frame) {
-    CubePets *p  = (CubePets *)user;
-    float     dt = frame->dt > 0.1f ? 0.1f : frame->dt;
-
-    p->camera.yaw        = p->yaw;
-    p->camera.pitch      = p->pitch;
-    p->camera.third_dist = p->dist;
-    scene3d_camera_mode_update(&p->camera, CAM_FLY, frame->input, dt);
-    p->yaw   = p->camera.yaw;
-    p->pitch = p->camera.pitch;
-    p->dist  = p->camera.third_dist;
-
-    renderer_hud(frame->renderer, "cubepets  %u instances   %u candidates   %u draws", p->scene.last_instances,
-                 p->scene.last_candidates, p->scene.last_draws);
-    renderer_hud(frame->renderer, "yaw %.2f  pitch %.2f  dist %.0f", p->yaw, p->pitch, p->dist);
-}
+static void pets_frame(void *user, const GameFrame *frame) {}
 
 /* GameHooks.render: lazy-init (needs the pass formats), then camera + pass. */
 static void pets_render(void *user, VkCommandBuffer cmd, RenderTarget *color, RenderTarget *depth) {
     CubePets *p = (CubePets *)user;
-
-    if (!p->ready) {
-        scene3d_init(&p->scene, p->vk, &color->format, &depth->format);
-        for (uint32_t i = 0; i < PETS_MODELS; i++) {
-            p->model[i] = scene3d_load_model(&p->scene, pets_models[i]);
-            if (p->model[i] == UINT32_MAX) {
-                fprintf(stderr, "[pets] model load failed: %s\n", pets_models[i]);
-                exit(EXIT_FAILURE);
-            }
-        }
-        assert(p->scene.model_count == PETS_MODELS);
-
-        float half = (float)PETS_GRID * 0.5f;
-        for (uint32_t gz = 0; gz < PETS_GRID; gz++) {
-            for (uint32_t gx = 0; gx < PETS_GRID; gx++) {
-                SceneInstanceSource *inst = &p->instances[gz * PETS_GRID + gx];
-                inst->model               = p->model[(gx + gz) % PETS_MODELS];
-                inst->flags               = SCENE_INSTANCE_VISIBLE;
-                inst->position[0]         = ((float)gx - half) * PETS_SPACING;
-                inst->position[1]         = 0.0f;
-                inst->position[2]         = ((float)gz - half) * PETS_SPACING;
-                inst->scale               = 1.0f;
-                inst->orientation[3]      = 1.0f; /* identity quaternion */
-                inst->clip                = UINT32_MAX;
-                inst->time                = 0.0f;
-                inst->tint                = 0xFFFFFFFFu; /* textures carry the color */
-            }
-        }
-        p->ready = true;
-    }
-
-    /* cam_orbit already places position from focus/yaw/pitch/dist; hand the
-       pose over untouched so the orbit mapping stays identical. */
-    scene3d_camera_update(&p->camera, (float)color->width / (float)color->height);
-
-    static const float sun[4] = {0.35f, 0.85f, 0.40f, 0.25f};
-    scene3d_render(&p->scene, cmd, color, depth, p->instances, p->count, &p->camera, sun);
 }
 
-static void pets_shutdown(void *user) {
-    CubePets *p = (CubePets *)user;
-    if (p->ready)
-        scene3d_destroy(&p->scene, p->vk);
-    free(p->instances);
-    p->instances = NULL;
-    p->ready     = false;
-}
+static void pets_shutdown(void *user) {}
 
 /* ================================================================== boot */
 
