@@ -1,0 +1,18 @@
+[submodule "extern/glfw"]
+	path = extern/glfw
+	url = https://github.com/glfw/glfw
+[submodule "extern/volk"]
+	path = extern/volk
+	url = https://github.com/zeux/volk.git
+[submodule "extern/meshoptimizer"]
+	path = extern/meshoptimizer
+	url = https://github.com/zeux/meshoptimizer.git
+[submodule "extern/glm"]
+	path = extern/glm
+	url = https://github.com/g-truc/glm.git
+[submodule "extern/fast_obj"]
+	path = extern/fast_obj
+	url = https://github.com/thisistherk/fast_obj
+[submodule "extern/cgltf"]
+	path = extern/cgltf
+	url = https://github.com/jkuhlmann/cgltf
