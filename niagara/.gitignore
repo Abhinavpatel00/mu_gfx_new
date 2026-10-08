@@ -1,9 +1,0 @@
-.cache/
-spirv/*.spv
-
-CMakeFiles/
-CMakeCache.txt
-build.ninja
-.ninja_*
-compile_commands.json
-*.cmake
