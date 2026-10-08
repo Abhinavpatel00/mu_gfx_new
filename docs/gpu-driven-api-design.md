@@ -11,9 +11,7 @@ Doctrine: `AGENT.md` + `docs/mycstyle.md` + skills `dod-performance` and
 existence is state; IDs over pointers; preparation vs execution; measure
 everything claimed.
 
-Scope: compare `mu_gfx` against the two upstream machinery snapshots in-tree
-(`fukuna_engine/`, `threedgame/`), then specify the refined public API, the
-GPU-side data layouts, the sync model and the bandwidth budget that make the
+Scope: specify the  public API, the GPU-side data layouts, the sync model and the bandwidth budget that make the
 renderer both faster and more flexible than either.
 
 Numbers marked *(measured)* were printed by compiling the real headers
