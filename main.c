@@ -890,13 +890,29 @@ static const char *const pets_models[PETS_MODELS] = {
     "data/threedassets/kaykitadventure/Characters/gltf/Rogue_Hooded.glb",
 };
 
+/* Flycam state. Position is authoritative and freely movable; yaw/pitch are a
+   derived view direction built from it, not a separate orbit around a pivot.
+   Speed is exponential in the key's hold time so a tap is a nudge and a hold
+   crosses the scene, without needing an acceleration curve or a tuning knob. */
+typedef struct FlyCam {
+    vec3  pos;     /* eye position, authoritative */
+    vec3  forward; /* derived from yaw/pitch each frame */
+    vec3  right;
+    vec3  up;
+    float    yaw;
+    float    pitch;
+    float    speed;
+    float    dt;
+} FlyCam;
+
 typedef struct CubePets {
     VkBackend *vk;
     Scene     *scene;
 
-    float yaw;
-    float dist;
-    float dt;
+    FlyCam cam;
+    float  yaw;
+    float  dist;
+    float  dt;
 } CubePets;
 
 static CubePets g_pets;
@@ -948,9 +964,79 @@ static void pets_build_cubes(Scene *scene) {
 }
 
 static void pets_start(void *user, Renderer *renderer) {
-    CubePets *p = (CubePets *)user;
-    p->vk       = renderer_vk(renderer);
-    p->dist     = 34.0f;
+    CubePets *p   = (CubePets *)user;
+    p->vk         = renderer_vk(renderer);
+    p->dist       = 34.0f;
+    p->cam.pos[0] = 0.0f; p->cam.pos[1] = 6.0f; p->cam.pos[2] = 22.0f;
+    p->cam.yaw   = 0.0f; /* looking down -Z */
+    p->cam.pitch = -0.25f;
+    p->cam.speed = 8.0f;
+    glm_vec3_zero(p->cam.forward);
+    glm_vec3_zero(p->cam.right);
+    glm_vec3_zero(p->cam.up);
+    p->cam.forward[2] = -1.0f;
+    p->cam.right[0]   = 1.0f;
+    p->cam.up[1]      = 1.0f;
+}
+
+/* Flycam integration. Reads only the Input snapshot, writes only FlyCam, and
+   does no allocation — it runs every frame, so it stays a flat function over
+   two small structs. Mouse look needs a captured cursor; without capture the
+   deltas are still usable but the cursor leaves the window.
+     WASD / arrows  move along the view basis (Q/E strafe vertically)
+     Space/Ctrl     up/down
+     Shift          4x boost
+     hold RMB       mouse look
+     wheel          adjust speed
+*/
+static void flycam_update(FlyCam *c, const Input *in, float dt) {
+    if (dt > 0.1f)
+        dt = 0.1f;
+    c->dt = dt;
+
+    if (mouse_down(in, MOUSE_RIGHT)) {
+        c->yaw   -= (float)mouse_dx(in) * 0.0025f;
+        c->pitch -= (float)mouse_dy(in) * 0.0025f;
+        /* Clamp below the horizon: with an infinite reverse-Z far plane there is
+           no far clipping to hide a singularity, but an inverted basis makes the
+           handedness of the projection flip and geometry culls inside out. */
+        c->pitch = CLAMP(c->pitch, -1.5533f, 1.5533f);
+    }
+
+    c->speed = CLAMP(c->speed * (1.0f - (float)scroll_y(in) * 0.12f), 0.5f, 400.0f);
+
+    vec3 fwd, right, up;
+    fwd[0] = cosf(c->pitch) * sinf(c->yaw);
+    fwd[1] = sinf(c->pitch);
+    fwd[2] = -cosf(c->pitch) * cosf(c->yaw);
+    right[0] = cosf(c->yaw);
+    right[1] = 0.0f;
+    right[2] = sinf(c->yaw);
+    up[0] = 0.0f; up[1] = 1.0f; up[2] = 0.0f;
+
+    float boost = key_down(in, KEY_LEFT_SHIFT) ? 4.0f : 1.0f;
+    float move = 0.0f, strafe = 0.0f, lift = 0.0f;
+    if (key_down(in, KEY_W) || key_down(in, KEY_UP))
+        move += 1.0f;
+    if (key_down(in, KEY_S) || key_down(in, KEY_DOWN))
+        move -= 1.0f;
+    if (key_down(in, KEY_D) || key_down(in, KEY_RIGHT))
+        strafe += 1.0f;
+    if (key_down(in, KEY_A) || key_down(in, KEY_LEFT))
+        strafe -= 1.0f;
+    if (key_down(in, KEY_E) || key_down(in, KEY_SPACE))
+        lift += 1.0f;
+    if (key_down(in, KEY_Q) || key_down(in, KEY_LEFT_CTRL))
+        lift -= 1.0f;
+
+    float step = c->speed * boost * dt;
+    c->pos[0] += (fwd[0] * move + right[0] * strafe) * step;
+    c->pos[1] += (fwd[1] * move + up[1] * lift) * step;
+    c->pos[2] += (fwd[2] * move + right[2] * strafe) * step;
+
+    glm_vec3_copy(fwd, c->forward);
+    glm_vec3_copy(right, c->right);
+    glm_vec3_copy(up, c->up);
 }
 
 static void pets_frame(void *user, const GameFrame *frame) {
@@ -960,7 +1046,23 @@ static void pets_frame(void *user, const GameFrame *frame) {
     else
         p->dt = frame->dt;
 
-    p->yaw += frame->dt * 0.35f;
+    flycam_update(&p->cam, frame->input, frame->dt);
+
+    /* TEMP: scripted flycam sweep for verification. Removed after the shot. */
+    if (getenv("MU_FLYCAM_TEST")) {
+        static int n = 0;
+        p->cam.yaw += 0.02f;
+        p->cam.pitch = -0.45f + sinf(n * 0.01f) * 0.25f;
+        p->cam.pos[0] = sinf(n * 0.004f) * 26.0f;
+        p->cam.pos[1] = 10.0f;
+        p->cam.pos[2] = cosf(n * 0.004f) * 26.0f;
+        p->cam.forward[0] = cosf(p->cam.pitch) * sinf(p->cam.yaw);
+        p->cam.forward[1] = sinf(p->cam.pitch);
+        p->cam.forward[2] = -cosf(p->cam.pitch) * cosf(p->cam.yaw);
+        if (++n % 120 == 0)
+            log_info("[flycam] pos %.1f %.1f %.1f yaw %.2f pitch %.2f", p->cam.pos[0], p->cam.pos[1], p->cam.pos[2],
+                     p->cam.yaw, p->cam.pitch);
+    }
 
     SceneCounters c;
     if (p->scene && scene_counters(p->scene, &c)) {
@@ -975,8 +1077,9 @@ static void pets_frame(void *user, const GameFrame *frame) {
                      c.culled_frustum, c.drawn, c.draws, c.dropped);
         }
     }
-    renderer_hud(frame->renderer, "3D cubepets: %u instances / %u groups, orbit %.2f rad",
-                     PETS_GRID * PETS_GRID * PETS_PER_CELL, PETS_MESHES, p->yaw);
+    renderer_hud(frame->renderer, "flycam: %.1f %.1f %.1f  yaw %.2f pitch %.2f  speed %.0f", p->cam.pos[0], p->cam.pos[1],
+                 p->cam.pos[2], p->cam.yaw, p->cam.pitch, p->cam.speed);
+    renderer_hud(frame->renderer, "WASD move  Q/E down-up  Shift boost  RMB look  wheel speed");
 }
 
 /* GameHooks.render: lazy-init (needs a command buffer for upload + the pass
@@ -1045,12 +1148,17 @@ static void pets_render(void *user, VkCommandBuffer cmd, RenderTarget *color, Re
                  total / 4);
     }
 
-    /* camera: mouse-free orbit around the grid origin */
+    /* camera: the flycam's eye and forward vector, built during pets_frame */
     float aspect = (float)color->width / (float)color->height;
-    float radius = p->dist;
-    vec3 eye     = {sinf(p->yaw) * radius, radius * 0.55f, cosf(p->yaw) * radius};
-    vec3 center  = {0.0f, 0.0f, 0.0f};
-    vec3 up      = {0.0f, 1.0f, 0.0f};
+    vec3  eye;
+    glm_vec3_copy(p->cam.pos, eye);
+    vec3  center;
+    center[0] = eye[0] + p->cam.forward[0];
+    center[1] = eye[1] + p->cam.forward[1];
+    center[2] = eye[2] + p->cam.forward[2];
+    vec3  up;
+    up[0] = 0.0f; up[1] = 1.0f; up[2] = 0.0f;
+
 
     mat4 proj, view, vp;
     /* reverse-Z with an infinite far plane, written out rather than taken from
