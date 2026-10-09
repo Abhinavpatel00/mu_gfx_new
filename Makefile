@@ -90,16 +90,15 @@ WARNINGS := \
 # =========================================================
 # Base flags
 # =========================================================
-BASE_CFLAGS := \
-    -std=gnu99 \
-    $(INCLUDES) \
-  #  $(WARNINGS)
-
-BASE_CXXFLAGS := \
-    -std=c++17 \
+# Language-neutral base. Every variant below appends only optimisation and
+# warning flags, so a rule can pick its own -std without dragging the other's in.
+BASE_FLAGS := \
     -w \
     -fno-common \
     $(INCLUDES)
+
+BASE_CXXFLAGS := -std=c++17 $(BASE_FLAGS)
+BASE_CFLAGS   := -std=gnu99 $(BASE_FLAGS)
 
 # =========================================================
 # Debug / ASAN / Release flags
@@ -136,9 +135,9 @@ LIBS := \
 # =========================================================
 # Default = Debug
 # =========================================================
-CFLAGS   := $(BASE_CFLAGS) $(DEBUG_FLAGS)
-CXXFLAGS := $(BASE_CXXFLAGS) $(DEBUG_FLAGS)
-LDFLAGS  :=
+C_CXXFLAGS := $(BASE_CFLAGS) $(DEBUG_FLAGS)
+CXXFLAGS  := $(BASE_CXXFLAGS) $(DEBUG_FLAGS)
+LDFLAGS   :=
 
 # =========================================================
 # Targets
@@ -163,10 +162,13 @@ $(GLFW_LIB):
 # =========================================================
 # Compilation
 # =========================================================
+# C files use CXXFLAGS: every target variant below sets CXXFLAGS, and none set
+# CFLAGS, so the .c rule was silently compiling at -O0 -DDEBUG even under
+# `make release`.
 $(BUILD_DIR)/%.o: %.c
 	@mkdir -p $(dir $@)
 	@echo Compiling C $<
-	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
+	$(CC) $(C_CXXFLAGS) -MMD -MP -c $< -o $@
 
 $(BUILD_DIR)/%.o: %.cpp
 	@mkdir -p $(dir $@)
@@ -174,16 +176,16 @@ $(BUILD_DIR)/%.o: %.cpp
 	$(CXX) $(CXXFLAGS) -MMD -MP -c $< -o $@
 
 # Upstream code, not ours — silence it.
-$(BUILD_DIR)/external/tree-sitter/lib/src/lib.o: CFLAGS += -w
-$(BUILD_DIR)/external/tree-sitter-c/src/parser.o: CFLAGS += -w
+$(BUILD_DIR)/external/tree-sitter/lib/src/lib.o: C_CXXFLAGS += -w
+$(BUILD_DIR)/external/tree-sitter-c/src/parser.o: C_CXXFLAGS += -w
 
 -include $(OBJ:.o=.d)
 
 # =========================================================
 # Release
 # =========================================================
-release: CFLAGS   := $(BASE_CFLAGS) $(RELEASE_FLAGS)
-release: CXXFLAGS := $(BASE_CXXFLAGS) $(RELEASE_FLAGS)
+release: C_CXXFLAGS := $(BASE_CFLAGS) $(RELEASE_FLAGS)
+release: CXXFLAGS  := $(BASE_CXXFLAGS) $(RELEASE_FLAGS)
 release: LDFLAGS  := -O3
 release: GLFW_BUILD_TYPE := Release
 release: $(TARGET)
@@ -192,8 +194,8 @@ release: $(TARGET)
 # ASAN
 # =========================================================
 asan: TARGET := $(APP_ASAN)
-asan: CFLAGS   := $(BASE_CFLAGS) $(ASAN_FLAGS)
-asan: CXXFLAGS := $(BASE_CXXFLAGS) $(ASAN_FLAGS)
+asan: C_CXXFLAGS := $(BASE_CFLAGS) $(ASAN_FLAGS)
+asan: CXXFLAGS  := $(BASE_CXXFLAGS) $(ASAN_FLAGS)
 asan: LDFLAGS  := -fsanitize=address,undefined
 asan: $(TARGET)
 
