@@ -59,7 +59,8 @@ for file in "$SRC_DIR"/*.slang; do
 
     # Extra compute entry points. create_compute_pipeline() only ever binds
     # "main", so a file with several kernels needs one .spv per entry.
-    for entry in cs_count cs_prefix cs_compact cs_cull cs_hiz; do
+    for entry in cs_count cs_prefix cs_cull cs_hiz \
+                 cs_scan_block cs_scan_blocks cs_emit cs_scatter; do
         if grep -q "\b$entry\b" "$file"; then
             compile_stage compute  "$entry" "$file" "$OUT_DIR/$name.$entry.comp.spv"
         fi

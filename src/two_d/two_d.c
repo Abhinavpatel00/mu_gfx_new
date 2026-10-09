@@ -165,8 +165,9 @@ static void sprite_pass_clear_only(SpriteSystem *s, VkCommandBuffer cmd, RenderT
     if (clear) {
         forEach(i, 4) color.clear[i] = clear[i];
     }
-    begin_pass(s->vk, cmd, &(PassDesc){.colors = &color, .color_count = 1, .pipeline = 0});
-    end_pass(cmd);
+    PassDesc pd = {.colors = &color, .color_count = 1, .pipeline = 0};
+    begin_pass(s->vk, cmd, &pd);
+    end_pass(s->vk, cmd, &pd);
 
     s->last_instances = 0;
     s->last_batches   = 0;
@@ -248,7 +249,8 @@ void sprite_flush(SpriteSystem *s, VkCommandBuffer cmd, RenderTarget *target, Lo
         if (clear) {
             forEach(i, 4) color.clear[i] = clear[i];
         }
-        begin_pass(vk, cmd, &(PassDesc){.colors = &color, .color_count = 1, .pipeline = 0});
+        PassDesc pd = {.colors = &color, .color_count = 1, .pipeline = 0};
+        begin_pass(vk, cmd, &pd);
 
         VkPipeline    bound     = VK_NULL_HANDLE;
         VkDeviceSize  indir_off = layout.stream_base + SPRITE_INDIRECT_OFF(0, layout.block_count, layout.batch_count);
@@ -282,7 +284,7 @@ void sprite_flush(SpriteSystem *s, VkCommandBuffer cmd, RenderTarget *target, Lo
             draws++;
         }
 
-        end_pass(cmd);
+        end_pass(vk, cmd, &pd);
     }
 
     s->last_instances = s->count;

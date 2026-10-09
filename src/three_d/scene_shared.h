@@ -34,6 +34,8 @@ typedef struct SceneVec4 { float x, y, z, w; } SceneVec4;
 #define SCENE_I16 int16_t
 #define SCENE_U32 uint32_t
 #define SCENE_I32 int32_t
+typedef struct SceneU32x2 { uint32_t lo, hi; } SceneU32x2;
+#define SCENE_U32X2 SceneU32x2
 #else
 /* Slang side: vec4 is a real float4 so dot()/swizzles work; pointers are real
    device-space pointers in the push constant. */
@@ -43,6 +45,7 @@ typedef struct SceneVec4 { float x, y, z, w; } SceneVec4;
 #define SCENE_I16 int16_t
 #define SCENE_U32 uint
 #define SCENE_I32 int
+#define SCENE_U32X2 uint2
 #define SceneU16 uint16_t
 #define SceneI16 int16_t
 #define SceneU32 uint
@@ -142,7 +145,13 @@ struct ScenePush {
     SCENE_U32 counts[8]; /* 0 lod_count, 1 candidate_count, 2 max_survivors */
 };
 
-/* ---- compaction context (histogram / scan / scatter) ---- */
+/* ---- compaction context (histogram / scan / emit / scatter) ----
+   scan_aux is one slice carved into three regions of SCENE_SCAN_BLOCK entries:
+     [0*BLOCK)  per-block totals (count, emit), written by cs_scan_block
+     [1*BLOCK)  block offset for vis_base
+     [2*BLOCK)  block offset for the command index                        */
+#define SCENE_SCAN_THREADS 256u
+#define SCENE_SCAN_BLOCK   (SCENE_SCAN_THREADS * 4u)
 struct SceneCompactPush {
     SCENE_PTR(SCENE_U32)           survivors;
     SCENE_PTR(SCENE_U32)           survivor_count;
@@ -154,7 +163,8 @@ struct SceneCompactPush {
     SCENE_PTR(SceneGpuDraw) draws;
     SCENE_PTR(SceneGpuDraw) group_static;
     SCENE_PTR(SCENE_U32)           draw_count;
-    SCENE_U32 counts[8]; /* 0 lod_count, 1 group_count, 2 max_survivors */
+    SCENE_PTR(SCENE_U32X2)         scan_aux;
+    SCENE_U32 counts[8]; /* 0 lod_count, 1 group_count G, 2 max_survivors, 3 reserved, 4 blocks */
 };
 
 #undef SCENE_PTR
