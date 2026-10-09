@@ -968,11 +968,11 @@ static void pets_frame(void *user, const GameFrame *frame) {
                      c.culled_frustum, c.drawn);
         renderer_hud(frame->renderer, "groups %u  dropped %u  lod %u/%u/%u/%u", c.draws, c.dropped, c.lod[0], c.lod[1],
                      c.lod[2], c.lod[3]);
-        static int logged = 0;
+        static bool logged = false;
         if (!logged && c.drawn > 0) {
-            logged = 1;
-            log_info("[cubepets] scan check: submitted=%u frustum_culled=%u drawn=%u draws=%u dropped=%u",
-                     c.submitted, c.culled_frustum, c.drawn, c.draws, c.dropped);
+            logged = true;
+            log_info("[cubepets] counters: submitted=%u frustum_culled=%u drawn=%u draws=%u dropped=%u", c.submitted,
+                     c.culled_frustum, c.drawn, c.draws, c.dropped);
         }
     }
     renderer_hud(frame->renderer, "3D cubepets: %u instances / %u groups, orbit %.2f rad",

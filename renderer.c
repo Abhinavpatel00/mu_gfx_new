@@ -1495,24 +1495,8 @@ static void pass_clear_hdr(Renderer *r, VkCommandBuffer cmd, RenderTarget *targe
     end_pass(&r->vk, cmd, &pd);
 }
 
-/* TEMP verification hook: MU_SHOT=path captures one frame at MU_SHOT_FRAME. */
-static void temp_autoshot(Renderer *r) {
-    static int frame = 0;
-    static bool fired = false;
-    const char *path = getenv("MU_SHOT");
-    if (!path || fired || !r->capture.inited)
-        return;
-    int want = getenv("MU_SHOT_FRAME") ? atoi(getenv("MU_SHOT_FRAME")) : 60;
-    if (++frame < want || want <= 0)
-        return;
-    fired = true;
-    if (capture_take_screenshot(r, path))
-        log_info("[autoshot] requested %s at frame %d", path, frame);
-}
-
 bool renderer_frame(Renderer *r) {
     TracyCFrameMark;
-    temp_autoshot(r);
     platform_poll_events(r);
     if (glfwWindowShouldClose(r->window)) /* was RGFW_window_shouldClose */
         return false;
