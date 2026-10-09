@@ -3,6 +3,7 @@
 #include "external/mu/mu/mu_perf.h"
 #include "external/stb/stb_image.h"
 #include "external/stb/stb_image_write.h"
+#include "src/input.h"
 #include "src/input_glfw.h"
 #include "src/nuklear_ui.h"
 #include "src/platform.h"
@@ -1494,8 +1495,24 @@ static void pass_clear_hdr(Renderer *r, VkCommandBuffer cmd, RenderTarget *targe
     end_pass(&r->vk, cmd, &pd);
 }
 
+/* TEMP verification hook: MU_SHOT=path captures one frame at MU_SHOT_FRAME. */
+static void temp_autoshot(Renderer *r) {
+    static int frame = 0;
+    static bool fired = false;
+    const char *path = getenv("MU_SHOT");
+    if (!path || fired || !r->capture.inited)
+        return;
+    int want = getenv("MU_SHOT_FRAME") ? atoi(getenv("MU_SHOT_FRAME")) : 60;
+    if (++frame < want || want <= 0)
+        return;
+    fired = true;
+    if (capture_take_screenshot(r, path))
+        log_info("[autoshot] requested %s at frame %d", path, frame);
+}
+
 bool renderer_frame(Renderer *r) {
     TracyCFrameMark;
+    temp_autoshot(r);
     platform_poll_events(r);
     if (glfwWindowShouldClose(r->window)) /* was RGFW_window_shouldClose */
         return false;
@@ -1523,6 +1540,8 @@ bool renderer_frame(Renderer *r) {
 
     VkCommandBuffer cmd        = r->vk.frames[r->vk.current_frame].cmdbuf;
     GpuProfiler    *frame_prof = &r->vk.gpuprofiler[r->vk.current_frame];
+bool ui= false;
+    
 
     vk_cmd_begin(cmd, false);
     // This frame's queries complete with this frame's submission value; the
@@ -1556,12 +1575,23 @@ bool renderer_frame(Renderer *r) {
         uint32_t image = r->vk.swapchain.current_image;
         r->game.render(r->game.user, cmd, &r->hdr_color[image], &r->depth[image]);
     }
+
+if (key_down(&r->input, KEY_TAB)) {
+ui =!ui;
+}
+
     post_pass(r, cmd);
     pass_smaa(r, cmd);
     pass_ldr_to_swapchain(r, cmd);
     render_gpu_profiler_ui(r);
+
+if (ui) {
+
     render_game_ui(r);
+
+
     render_capture_ui(r);
+    }
     pass_nuklear(r, cmd);
     capture_record(r, cmd);
     image_transition_swapchain(&r->vk, cmd, &r->vk.swapchain, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,

@@ -871,8 +871,14 @@ static void farm_update(void *user, const GameFrame *frame) {
  * under a GPU frustum cull, drawn with one indexed indirect draw per mesh
  * slot. The camera is a mouse/keyboard orbit around the grid origin. */
 
-#define PETS_GRID    8u
+/* The grid exists to make the compaction pass do real work: PETS_MESHES is the
+   number of distinct (mesh,lod) groups, so PETS_MESHES above SCENE_SCAN_BLOCK
+   (1024) is what forces the two-level scan to use more than one block. A
+   single-group scene would prove the parallel scan nothing. */
+#define PETS_GRID    3u
 #define PETS_SPACING 3.0f
+#define PETS_MESHES  1200u
+#define PETS_PER_CELL 4u
 #define PETS_MODELS  6u
 
 static const char *const pets_models[PETS_MODELS] = {
@@ -896,7 +902,10 @@ typedef struct CubePets {
 static CubePets g_pets;
 
 /* One unit cube: 24 packed vertices (per-face normals) + 36 u16 indices. */
-static void pets_build_cube(Scene *scene) {
+/* Builds PETS_MESHES distinct meshes out of one cube topology. They differ only
+   in local radius and material, which is enough: what the compaction pass sees
+   is one group per mesh, so this is what makes G large. */
+static void pets_build_cubes(Scene *scene) {
     static const float face_n[6][3] = {{0, 0, 1}, {0, 0, -1}, {1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}};
     static const float face_v[6][4][3] = {
         {{-0.5f, -0.5f, 0.5f}, {0.5f, -0.5f, 0.5f}, {0.5f, 0.5f, 0.5f}, {-0.5f, 0.5f, 0.5f}},
@@ -923,13 +932,19 @@ static void pets_build_cube(Scene *scene) {
         indices[f * 6 + 5] = base + 3;
     }
 
-    scene_mesh_add(scene, &(SceneMeshDesc){.vertices      = verts,
-                                           .vertex_count  = 24,
-                                           .indices       = indices,
-                                           .index_count   = 36,
-                                           .local_center  = {0, 0, 0},
-                                           .local_radius  = 0.866f,
-                                           .material      = 0});
+    for (uint32_t m = 0; m < PETS_MESHES; ++m) {
+        /* Deterministic per-mesh variation. The u16 index arena caps a mesh at
+           64k vertices; each cube is 24, so PETS_MESHES is bounded by that. */
+        float k = 0.55f + (float)(m % 17u) * 0.06f;
+        scene_mesh_add(scene, &(SceneMeshDesc){.vertices      = verts,
+                                               .vertex_count  = 24,
+                                               .indices       = indices,
+                                               .index_count   = 36,
+                                               .local_center  = {0, 0, 0},
+                                               .local_radius  = 0.866f * k,
+                                               .material      = 0});
+    }
+    log_info("[cubepets] %u meshes registered", PETS_MESHES);
 }
 
 static void pets_start(void *user, Renderer *renderer) {
@@ -953,8 +968,15 @@ static void pets_frame(void *user, const GameFrame *frame) {
                      c.culled_frustum, c.drawn);
         renderer_hud(frame->renderer, "groups %u  dropped %u  lod %u/%u/%u/%u", c.draws, c.dropped, c.lod[0], c.lod[1],
                      c.lod[2], c.lod[3]);
+        static int logged = 0;
+        if (!logged && c.drawn > 0) {
+            logged = 1;
+            log_info("[cubepets] scan check: submitted=%u frustum_culled=%u drawn=%u draws=%u dropped=%u",
+                     c.submitted, c.culled_frustum, c.drawn, c.draws, c.dropped);
+        }
     }
-    renderer_hud(frame->renderer, "3D cubepets: %u instances, orbit %.2f rad", PETS_GRID * PETS_GRID, p->yaw);
+    renderer_hud(frame->renderer, "3D cubepets: %u instances / %u groups, orbit %.2f rad",
+                     PETS_GRID * PETS_GRID * PETS_PER_CELL, PETS_MESHES, p->yaw);
 }
 
 /* GameHooks.render: lazy-init (needs a command buffer for upload + the pass
@@ -963,23 +985,45 @@ static void pets_render(void *user, VkCommandBuffer cmd, RenderTarget *color, Re
     CubePets *p = (CubePets *)user;
 
     if (!p->scene) {
-        Scene *scene = scene_create(p->vk, &(SceneDesc){.max_instances = PETS_GRID * PETS_GRID,
-                                                        .max_meshes    = 4,
-                                                        .max_lod_rows  = 8,
-                                                        .max_materials = 4,
-                                                        .max_survivors = PETS_GRID * PETS_GRID});
+        /* Half the cells are static (written once, never again) and half are
+           dynamic (rewritten every frame). That split is what the C6 partition
+           exists for, and both kinds must land in the same slot space. */
+        uint32_t cells      = PETS_GRID * PETS_GRID;
+        uint32_t per_cell   = PETS_PER_CELL;
+        uint32_t total      = cells * per_cell;
+        uint32_t half       = total / 2;
+        Scene   *scene = scene_create(p->vk, &(SceneDesc){.max_instances    = total,
+                                                        .dynamic_capacity = half,
+                                                        .static_capacity  = total - half,
+                                                        .max_meshes       = PETS_MESHES,
+                                                        .max_lod_rows     = PETS_MESHES,
+                                                        .max_materials    = 4,
+                                                        .max_survivors    = total});
         if (!scene)
             return;
-        pets_build_cube(scene);
+        pets_build_cubes(scene);
 
-        const float half = (float)PETS_GRID * PETS_SPACING * 0.5f;
+        /* One instance per (cell, mesh) so every group has survivors and the
+           scan sees a densely populated histogram rather than a single bar. */
+        const float cell_half = (float)PETS_GRID * PETS_SPACING * 0.5f;
         for (uint32_t z = 0; z < PETS_GRID; ++z) {
             for (uint32_t x = 0; x < PETS_GRID; ++x) {
-                scene_instance_create(scene, &(SceneInstanceDesc){.pos   = {(float)x * PETS_SPACING - half, 0.0f,
-                                                                           (float)z * PETS_SPACING - half},
-                                                                  .quat  = {0, 0, 0, 0},
-                                                                  .scale = 1.0f,
-                                                                  .mesh  = 0});
+                for (uint32_t m = 0; m < PETS_MESHES; ++m) {
+                    if (m >= per_cell)
+                        break;
+                    float jx = (float)(m % 7u) * 0.31f;
+                    float jz = (float)(m % 11u) * 0.27f;
+                    SceneInstanceDesc d = {.pos   = {(float)x * PETS_SPACING - cell_half + jx, 0.0f,
+                                                       (float)z * PETS_SPACING - cell_half + jz},
+                                           .quat  = {0, 0, 0, 0},
+                                           .scale = 1.0f,
+                                           .mesh  = m};
+                    /* Alternate so both regions are populated in every row. */
+                    if (((x + z + m) & 1u) == 0u)
+                        scene_instance_create(scene, &d);
+                    else
+                        scene_instance_create_static(scene, &d);
+                }
             }
         }
 
@@ -989,6 +1033,16 @@ static void pets_render(void *user, VkCommandBuffer cmd, RenderTarget *color, Re
         }
         scene_set_sun(scene, (const float[3]){0.4f, 0.8f, 0.3f}, 0.18f);
         p->scene = scene;
+
+        /* Destroy every other instance and reclaim the holes. Exercises the
+           existence-based removal path (candidate rows go away, slots retire,
+           no death flag is ever tested) and proves compaction restores a dense
+           slot space afterwards. */
+        for (uint32_t i = 0; i < total; i += 2)
+            scene_instance_destroy(scene, i);
+        scene_compact_slots(scene);
+        log_info("[cubepets] after destroy+compact: %u instances, %u dynamic, %u static", total / 2, total / 4,
+                 total / 4);
     }
 
     /* camera: mouse-free orbit around the grid origin */
@@ -999,7 +1053,24 @@ static void pets_render(void *user, VkCommandBuffer cmd, RenderTarget *color, Re
     vec3 up      = {0.0f, 1.0f, 0.0f};
 
     mat4 proj, view, vp;
-    glm_perspective_rh_no(glm_rad(60.0f), aspect, 0.1f, 400.0f, proj);
+    /* reverse-Z with an infinite far plane, written out rather than taken from
+       cglm: the infinite_rh_zo entry point is behind a CLIPSPACE_INCLUDE_RH_ZO
+       guard this project does not enable, and it is in any case zero-to-one
+       rather than reverse-Z. The depth attachment compares GREATER and clears
+       to 0.0 to match — see scene.c. */
+    {
+        float t = 1.0f / tanf(glm_rad(60.0f) * 0.5f);
+        glm_mat4_zero(proj);
+        proj[0][0] = t / aspect;
+        proj[1][1] = t;
+        /* z_clip = near, w_clip = -z_view, so z_ndc = near/dist: 1.0 at the near
+           plane falling to 0 at infinity. That is the reverse-Z mapping, and it
+           is why [2][2] is 0 and [3][2] is +near. cglm's *_rh_zo infinite entry
+           point is zero-to-one, not reverse-Z — do not substitute it here. */
+        proj[2][2] = 0.0f;
+        proj[2][3] = -1.0f;
+        proj[3][2] = 0.1f; /* nearZ */
+    }
     glm_lookat(eye, center, up, view);
     glm_mat4_mul(proj, view, vp);
 

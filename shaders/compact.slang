@@ -151,7 +151,13 @@ void cs_scan_blocks(uint3 gid : SV_GroupID, uint3 lid : SV_GroupThreadID)
     }
 
     if (lid.x == 0u)
+    {
         pc.draw_count[0] = s_thread[SCAN_THREADS - 1u].y;
+        /* Mirror the command count into the counter ring so the lag-2 readback
+           reports it. This is the number a CPU reference can be checked
+           against: draw_count must equal the number of non-empty groups. */
+        pc.counters[SCENE_COUNTER_DRAWS] = s_thread[SCAN_THREADS - 1u].y;
+    }
 }
 
 [shader("compute")]
@@ -177,6 +183,11 @@ void cs_emit(uint3 gid : SV_GroupID, uint3 lid : SV_GroupThreadID)
             d.instance_count = pc.group_count[g];
             d.first_instance = pc.vis_base[g];
             pc.draws[cmd]    = d;
+            /* The VS has no DrawIndex in this Slang build, so it recovers the
+               group from the draw's own instance base. Both sides derive it from
+               vis_base[g], which is uniform across the draw — a broadcast, not
+               a per-lane gather. */
+            pc.group_base[pc.vis_base[g]] = g;
         }
     }
 }

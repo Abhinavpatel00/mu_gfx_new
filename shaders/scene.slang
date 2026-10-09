@@ -56,11 +56,27 @@ static bool frustum_visible(float3 c, float r)
     return true;
 }
 
+/* ---- dispatch args, written by the CPU and read by vkCmdDispatchIndirect ----
+   A VkDispatchIndirectCommand triple: x = workgroups, y = z = 1. The CPU only
+   touches it when the candidate roster changes (insert/destroy), never per
+   frame, so per-frame CPU work stays proportional to classes x views rather
+   than to entity count. */
+struct SceneDispatchArgs { SceneU32 x, y, z; };
+
 /* ---- T2: cull. One thread per candidate. ---- */
 [shader("compute")]
 [numthreads(64, 1, 1)]
-void cs_cull(uint3 tid : SV_DispatchThreadID)
+void cs_cull(uint3 gid : SV_GroupID, uint3 tid : SV_DispatchThreadID)
 {
+    /* The dispatch is indirect, so the CPU's idea of the workgroup count may
+       lag a roster change by a frame. Publishing the real high-water mark here
+       means the next frame's indirect dispatch is never short, whatever the
+       CPU last wrote. */
+    if (gid.x == 0u)
+        InterlockedMax(pc.cull_args[0], gid.x + 1u);
+    pc.cull_args[1] = 1u;
+    pc.cull_args[2] = 1u;
+
     if (tid.x >= pc.counts[1])
         return;
 
@@ -116,13 +132,21 @@ struct SceneVOut {
 };
 
 [shader("vertex")]
-SceneVOut vs_main(uint vid : SV_VertexID, uint iid : SV_InstanceID)
+SceneVOut vs_main(uint vid : SV_VertexID, uint iid : SV_InstanceID, uint base_inst : SV_StartInstanceLocation)
 {
+    /* Identity split, and which half each comes from is the whole point:
+         - mesh is uniform across the draw, so it comes from a per-draw row
+           addressed by the draw's own instance base (group_base[base_instance]),
+           read once and broadcast by the hardware;
+         - the instance slot is the only genuinely per-lane datum, so it is the
+           only thing read per-lane, out of vis_all[] which holds a plain slot.
+       vis_all[] therefore needs no packed key and no decode. */
+    SceneU32 group    = pc.group_base[base_inst];
+    SceneU32 mesh     = pc.group_mesh[group] & 0xFFFFu;
+
     /* iid is gl_InstanceIndex: absolute, already includes the group's
        firstInstance == vis base. */
-    SceneU32 entry = pc.vis[iid];
-    SceneU32 slot  = entry & 0xFFFFu;
-    SceneU32 mesh  = (entry >> 16) & 0x3FFFu;
+    SceneU32 slot     = pc.vis[iid];
 
     SceneInstance     inst = pc.instances[slot];
     SceneShadeMesh    sm   = pc.shade_meshes[mesh];
