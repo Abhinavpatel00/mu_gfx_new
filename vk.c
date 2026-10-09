@@ -1978,7 +1978,10 @@ static inline void pipeline_fill_blend_defaults(GraphicsPipelineConfig *cfg) {
 #include "build/generated/shaders.h" // Generated single header.
 
 
-bool read_shader(const char *path, const void **code, size_t *size) {
+bool read_shader(const char *path, void **code, size_t *size) {
+    /* The file path allocates a buffer the caller owns; the embedded path
+       returns static const data. void* is the honest common type because
+       shader_release() frees it, and the embedded branch simply never frees. */
     if (!path || !code || !size)
         return false;
 
@@ -1993,7 +1996,7 @@ bool read_shader(const char *path, const void **code, size_t *size) {
     *size = len;
     return true;
 #else
-    return embedded_shader_find(path, code, size);
+    return embedded_shader_find(path, (const void **)code, size);
 #endif
 }
 
@@ -2010,8 +2013,10 @@ VkPipeline create_graphics_pipeline(VkBackend *renderer, const GraphicsPipelineC
 
     assert(cfg->vert_path && cfg->frag_path && "pipeline needs both shader paths");
 
-    const void *vs_code = NULL;
-    const void *fs_code = NULL;
+    /* Not const: the caller owns this buffer and passes it to shader_release,
+       which frees it. */
+    void  *vs_code = NULL;
+    void  *fs_code = NULL;
 
     size_t vs_size = 0;
     size_t fs_size = 0;
@@ -2022,9 +2027,9 @@ VkPipeline create_graphics_pipeline(VkBackend *renderer, const GraphicsPipelineC
     if (!read_shader(cfg->frag_path, &fs_code, &fs_size))
         abort();
 
-    VkShaderModule vs = create_shader_module(renderer->devc.device, (void *)vs_code, vs_size);
+    VkShaderModule vs = create_shader_module(renderer->devc.device, vs_code, vs_size);
 
-    VkShaderModule fs = create_shader_module(renderer->devc.device, (void *)fs_code, fs_size);
+    VkShaderModule fs = create_shader_module(renderer->devc.device, fs_code, fs_size);
  
     VkPipelineShaderStageCreateInfo      stages[2] = {{
                                                           .sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
@@ -2528,23 +2533,25 @@ void cmd_transition_mip(VkBackend *r, VkCommandBuffer cmd, VkImage image, ImageS
 }
 void flush_barriers(VkBackend *r, VkCommandBuffer cmd) {
 
-    if (r->barrierbatch.image_count == 0)
+    if (r->barrierbatch.image_count == 0 && r->barrierbatch.buffer_count == 0)
         return;
 
     VkDependencyInfo dep = {.sType                   = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
                             .imageMemoryBarrierCount = r->barrierbatch.image_count,
-                            .pImageMemoryBarriers    = r->barrierbatch.image_barriers};
+                            .pImageMemoryBarriers    = r->barrierbatch.image_barriers,
+                            .bufferMemoryBarrierCount = r->barrierbatch.buffer_count,
+                            .pBufferMemoryBarriers    = r->barrierbatch.buffer_barriers};
 
     vkCmdPipelineBarrier2(cmd, &dep);
 
     if (r->barrierbatch.overflow_count != 0) {
-        log_error("[barriers] batch overflow: %u image barrier(s) dropped this flush "
-                  "(batch capacity: %u)",
+        log_error("[barriers] batch overflow: %u barrier(s) dropped this flush (batch capacity: %u)",
                   r->barrierbatch.overflow_count, (uint32_t)ARRAY_COUNT(r->barrierbatch.image_barriers));
         r->barrierbatch.overflow_count = 0;
     }
 
-    r->barrierbatch.image_count = 0;
+    r->barrierbatch.image_count   = 0;
+    r->barrierbatch.buffer_count  = 0;
 }
 
 void rt_transition_mip(VkBackend *r, VkCommandBuffer cmd, RenderTarget *rt, uint32_t mip,
@@ -2645,7 +2652,83 @@ void dispatch_push(VkBackend *r, VkCommandBuffer cmd, ByteSpan root, uint32_t gr
     vkCmdDispatch(cmd, group_count_x, group_count_y, group_count_z);
 }
 
-void end_pass(VkCommandBuffer cmd) { vkCmdEndRendering(cmd); }
+void dispatch_indirect(VkBackend *r, VkCommandBuffer cmd, ByteSpan root, BufferSlice args) {
+    assert(args.buffer && args.size >= sizeof(VkDispatchIndirectCommand));
+    emit_root_data(r, cmd, root);
+    vkCmdDispatchIndirect(cmd, args.buffer, args.offset);
+}
+
+// A declared read is "whatever wrote this before, make it visible to the stage
+// that is about to read it". The source side is deliberately conservative —
+// tracking the previous writer per slice would mean state keyed on (buffer,
+// offset) pairs that shift on every suballocation — while the range and the
+// destination are exact. That is strictly tighter than the whole-pool barrier
+// this replaces, which implicated every unrelated allocation in the pool.
+static void pass_push_buffer_reads(VkBackend *r, const BufferAccess *reads, uint32_t count) {
+    forEach(i, count) {
+        const BufferAccess *b = &reads[i];
+        if (!b->slice.buffer)
+            continue;
+        if (r->barrierbatch.buffer_count >= (uint32_t)ARRAY_COUNT(r->barrierbatch.buffer_barriers)) {
+            r->barrierbatch.overflow_count++;
+            continue;
+        }
+        r->barrierbatch.buffer_barriers[r->barrierbatch.buffer_count++] = (VkBufferMemoryBarrier2){
+            .sType               = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2,
+            .srcStageMask        = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+            .srcAccessMask       = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
+            .dstStageMask        = b->stage,
+            .dstAccessMask       = b->access,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .buffer              = b->slice.buffer,
+            .offset              = b->slice.offset,
+            .size                = b->slice.size,
+        };
+    }
+}
+
+// A declared write is the mirror: this pass's stage/access becomes visible to
+// everything that comes after. Emitted at end_pass, because a barrier recorded
+// before the writes it is meant to publish orders nothing.
+static void pass_push_buffer_writes(VkBackend *r, const BufferAccess *writes, uint32_t count) {
+    forEach(i, count) {
+        const BufferAccess *b = &writes[i];
+        if (!b->slice.buffer)
+            continue;
+        if (r->barrierbatch.buffer_count >= (uint32_t)ARRAY_COUNT(r->barrierbatch.buffer_barriers)) {
+            r->barrierbatch.overflow_count++;
+            continue;
+        }
+        r->barrierbatch.buffer_barriers[r->barrierbatch.buffer_count++] = (VkBufferMemoryBarrier2){
+            .sType               = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2,
+            .srcStageMask        = b->stage,
+            .srcAccessMask       = b->access,
+            .dstStageMask        = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+            .dstAccessMask       = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .buffer              = b->slice.buffer,
+            .offset              = b->slice.offset,
+            .size                = b->slice.size,
+        };
+    }
+}
+
+void end_pass(VkBackend *r, VkCommandBuffer cmd, const PassDesc *desc) {
+    // Publish the pass's declared writes before the scope closes, so the
+    // barrier is recorded after the work it describes.
+    pass_push_buffer_writes(r, desc->buf_writes, desc->buf_write_count);
+    flush_barriers(r, cmd);
+
+    // A compute pass declares no attachments, so begin_pass opened no
+    // rendering scope and there is nothing to end. Closing one that was never
+    // begun is a validation error, not a no-op.
+    if (desc->color_count == 0)
+        return;
+
+    vkCmdEndRendering(cmd);
+}
 
 static void pass_transition_attachment(VkBackend *r, VkCommandBuffer cmd, const PassAttachment *a) {
     if (!a->target) {
@@ -2671,22 +2754,6 @@ void begin_pass(VkBackend *r, VkCommandBuffer cmd, const PassDesc *desc) {
     assert(desc->color_count <= MAX_COLOR_ATTACHMENTS);
     assert((desc->colors && desc->color_count) || desc->color_count == 0);
 
-    const RenderTarget *area = desc->color_count && desc->colors[0].target ? desc->colors[0].target
-                               : (desc->depth ? desc->depth->target : NULL);
-    if (!area && desc->shader_read_count)
-        area = desc->shader_reads[0];
-    if (!area && desc->shader_write_count)
-        area = desc->shader_writes[0];
-    VkExtent2D area_extent;
-    if (area) {
-        area_extent = (VkExtent2D){.width = area->width, .height = area->height};
-    } else {
-        // Swapchain-only pass: render area comes from the swapchain extent.
-        assert(desc->color_count && desc->colors[0].swapchain_view &&
-               "begin_pass needs a target or a swapchain view to derive the render area");
-        area_extent = r->swapchain.extent;
-    }
-
     forEach(i, desc->color_count) pass_transition_attachment(r, cmd, &desc->colors[i]);
     if (desc->depth)
         pass_transition_attachment(r, cmd, desc->depth);
@@ -2701,14 +2768,26 @@ void begin_pass(VkBackend *r, VkCommandBuffer cmd, const PassDesc *desc) {
                           VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
     }
 
+    pass_push_buffer_reads(r, desc->buf_reads, desc->buf_read_count);
+
     flush_barriers(r, cmd);
 
     if (desc->color_count == 0) {
-        // Compute pass: no rendering scope, just the pipeline bind.
+        // Compute pass: no rendering scope, so no viewport or area to derive.
+        // This is reached before any area logic because a compute pass that
+        // declares only buffer dependencies has no image to size a viewport
+        // from — and needing one was a bug that only a buffer-only compute pass
+        // could reach.
         if (desc->pipeline)
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, r->render_pipelines.pipelines[desc->pipeline - 1]);
         return;
     }
+
+    const RenderTarget *area = desc->colors[0].target;
+    if (!area)
+        area = desc->depth ? desc->depth->target : NULL;
+    assert(area || desc->colors[0].swapchain_view);
+    VkExtent2D area_extent = area ? (VkExtent2D){.width = area->width, .height = area->height} : r->swapchain.extent;
 
     VkRenderingAttachmentInfo color_attachments[MAX_COLOR_ATTACHMENTS];
     forEach(i, desc->color_count) {

@@ -45,7 +45,8 @@ static void pass_nuklear(Renderer *r, VkCommandBuffer cmd) {
         GPU_SCOPE(frame_prof, cmd, "Nuklear Render", VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT) {
             PassAttachment color = {.swapchain_view = r->vk.swapchain.image_views[r->vk.swapchain.current_image],
                                      .load = LOAD_KEEP, .store = STORE_KEEP};
-            begin_pass(&r->vk, cmd, &(PassDesc){.colors = &color, .color_count = 1});
+            PassDesc pd = {.colors = &color, .color_count = 1};
+            begin_pass(&r->vk, cmd, &pd);
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, ui->pipeline);
             vkCmdBindIndexBuffer(cmd, upload->buffer, index_offset, VK_INDEX_TYPE_UINT32);
             UiPush push = {.vertices = upload->address,
@@ -68,7 +69,7 @@ static void pass_nuklear(Renderer *r, VkCommandBuffer cmd) {
                 }
                 first_index += draw->elem_count;
             }
-            end_pass(cmd);
+            end_pass(&r->vk, cmd, &pd);
         }
     }
     nk_clear(&ui->context);

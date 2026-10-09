@@ -11,7 +11,6 @@ and game roadmap, see the [Cozy Builder plan](../cozy-builder-plan.md). That pla
 is a specification, not an implemented game API.
 
 This document provides a comprehensive architectural breakdown of the Vulkan rendering engine. It is designed to quickly familiarize new developers and AI assistants with the design principles, codebase structure, memory layout, frame flow, bindless resource model, shader hot-reloading system, and extension patterns.
-
 ---
 
 ## 1. System Overview & Technology Stack

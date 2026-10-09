@@ -397,8 +397,15 @@ typedef struct VkBackendPipelines {
 
 typedef struct BarrierBatch {
     VkImageMemoryBarrier2 image_barriers[64];
-
     uint32_t image_count;
+
+    // Buffer dependencies declared through PassDesc.buf_reads / buf_writes.
+    // Both resolve to per-slice barriers: a read narrows to the pass's own
+    // stage/access, a write widens to ALL_COMMANDS. Neither ever names a range
+    // wider than the slice it was given.
+    VkBufferMemoryBarrier2 buffer_barriers[64];
+    uint32_t               buffer_count;
+
     // Number of barriers silently dropped when the batch was full. Flushed as
     // an error counter once per flush so API misuse surfaces as a loud,
     // once-per-frame log instead of a corrupt stack.
@@ -435,17 +442,6 @@ typedef struct PassAttachment {
     float         clear[4]; // color rgba; depth clear value in clear[0]
 } PassAttachment;
 
-typedef struct PassDesc {
-    const PassAttachment *colors;       // NULL when compute-only
-    uint32_t              color_count;  // 0..MAX_COLOR_ATTACHMENTS
-    const PassAttachment *depth;        // NULL = no depth attachment
-    RenderTarget *const  *shader_reads; // sampled reads (sampled-read layout)
-    uint32_t              shader_read_count;
-    RenderTarget *const  *shader_writes; // storage image writes (GENERAL layout)
-    uint32_t              shader_write_count;
-    PipelineID            pipeline; // 1-based; 0 = caller binds later (e.g. Nuklear)
-} PassDesc;
-
 typedef struct BufferSlice {
     BufferPool   *pool;
     VkBuffer      buffer;
@@ -454,6 +450,34 @@ typedef struct BufferSlice {
     void         *mapped;
     OA_Allocation allocation;
 } BufferSlice;
+
+// A buffer this pass touches, named by the stage and access the pass uses it
+// with. begin_pass turns a read into a make-visible-to-this-stage barrier before
+// the pass body, and end_pass turns a write into a make-visible-to-later-work
+// barrier after it. The far side is conservative (ALL_COMMANDS); the near side
+// is the exact stage/access and the range is the exact slice, so a pass that
+// names four 4 KB tables never implicates the rest of the pool.
+typedef struct BufferAccess {
+    BufferSlice           slice;
+    VkPipelineStageFlags2 stage;
+    VkAccessFlags2        access;
+} BufferAccess;
+
+typedef struct PassDesc {
+    const PassAttachment *colors;        // NULL when compute-only
+    uint32_t              color_count;   // 0..MAX_COLOR_ATTACHMENTS
+    const PassAttachment *depth;         // NULL = no depth attachment
+    RenderTarget *const  *shader_reads;  // sampled reads (sampled-read layout)
+    uint32_t              shader_read_count;
+    RenderTarget *const  *shader_writes; // storage image writes (GENERAL layout)
+    uint32_t              shader_write_count;
+    const BufferAccess   *buf_reads;     // NULL when none
+    uint32_t              buf_read_count;
+    const BufferAccess   *buf_writes;    // NULL when none
+    uint32_t              buf_write_count;
+    PipelineID            pipeline;      // 1-based; 0 = caller binds later (e.g. Nuklear)
+} PassDesc;
+
 typedef struct SamplerDesc {
     VkFilter             min_filter;
     VkFilter             mag_filter;
@@ -669,6 +693,10 @@ void push_constants(VkBackend *r, VkCommandBuffer cmd, ByteSpan data);
 void cmd_draw(VkBackend *r, VkCommandBuffer cmd, ByteSpan root, uint32_t vertex_count, uint32_t instance_count);
 void dispatch_push(VkBackend *r, VkCommandBuffer cmd, ByteSpan root, uint32_t group_count_x, uint32_t group_count_y,
                    uint32_t group_count_z);
+// Dispatch whose (x,y,z) group counts live in a device buffer the GPU wrote
+// itself. The slice must have been created with VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
+// the caller declares the dependency through PassDesc.
+void dispatch_indirect(VkBackend *r, VkCommandBuffer cmd, ByteSpan root, BufferSlice args);
 // GPU-driven draw helpers. The indirect and count buffer views must have been
 // created with VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT. The caller is responsible
 // for recording the producer-to-consumer buffer barrier before these commands.
@@ -680,7 +708,11 @@ void cmd_draw_indirect_count(VkBackend *r, VkCommandBuffer cmd, ByteSpan root, B
                              uint32_t max_draw_count, uint32_t stride);
 void cmd_draw_indexed_indirect_count(VkBackend *r, VkCommandBuffer cmd, ByteSpan root, BufferSlice indirect,
                                      BufferSlice count, uint32_t max_draw_count, uint32_t stride);
-void end_pass(VkCommandBuffer cmd);
+// Closes the rendering scope and resolves the pass's declared buffer writes.
+// Takes the same PassDesc begin_pass took: the write list must be visible here
+// to be turned into a make-visible-to-later-work barrier, and parking it in the
+// backend between the two calls would be hidden state.
+void end_pass(VkBackend *r, VkCommandBuffer cmd, const PassDesc *desc);
 void begin_pass(VkBackend *r, VkCommandBuffer cmd, const PassDesc *desc);
 void delete_queue_defer(VkBackend *r, uint64_t retire_value, DeferredDestroyFn fn, void *user);
 void delete_queue_tick(VkBackend *r);

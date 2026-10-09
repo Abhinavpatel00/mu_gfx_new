@@ -1137,14 +1137,14 @@ static void pass_smaa(Renderer *r, VkCommandBuffer cmd) {
             PassAttachment color   = {.target = &r->smaa_edges[image], .load = LOAD_CLEAR};
             RenderTarget  *reads[] = {&r->ldr_color[image]};
 
-            begin_pass(&r->vk, cmd,
-                       &(PassDesc){
-                           .colors            = &color,
-                           .color_count       = 1,
-                           .shader_reads      = reads,
-                           .shader_read_count = 1,
-                           .pipeline          = r->smaa_pipelines.smaa_edge,
-                       });
+            PassDesc pd = {
+                .colors            = &color,
+                .color_count       = 1,
+                .shader_reads      = reads,
+                .shader_read_count = 1,
+                .pipeline          = r->smaa_pipelines.smaa_edge,
+            };
+            begin_pass(&r->vk, cmd, &pd);
 
             EdgePush edge_push = {
                 .texture_id = r->ldr_color[image].bindless_index,
@@ -1152,7 +1152,7 @@ static void pass_smaa(Renderer *r, VkCommandBuffer cmd) {
             };
 
             cmd_draw(&r->vk, cmd, BYTE_SPAN(edge_push), 3, 1);
-            end_pass(cmd);
+            end_pass(&r->vk, cmd, &pd);
         }
     }
     {
@@ -1161,14 +1161,14 @@ static void pass_smaa(Renderer *r, VkCommandBuffer cmd) {
             PassAttachment color   = {.target = &r->smaa_weights[image], .load = LOAD_CLEAR};
             RenderTarget  *reads[] = {&r->smaa_edges[image]};
 
-            begin_pass(&r->vk, cmd,
-                       &(PassDesc){
-                           .colors            = &color,
-                           .color_count       = 1,
-                           .shader_reads      = reads,
-                           .shader_read_count = 1,
-                           .pipeline          = r->smaa_pipelines.smaa_weight,
-                       });
+            PassDesc pd = {
+                .colors            = &color,
+                .color_count       = 1,
+                .shader_reads      = reads,
+                .shader_read_count = 1,
+                .pipeline          = r->smaa_pipelines.smaa_weight,
+            };
+            begin_pass(&r->vk, cmd, &pd);
 
             WeightPush weight_push = {
                 .edge_tex   = r->smaa_edges[image].bindless_index,
@@ -1178,7 +1178,7 @@ static void pass_smaa(Renderer *r, VkCommandBuffer cmd) {
             };
 
             cmd_draw(&r->vk, cmd, BYTE_SPAN(weight_push), 3, 1);
-            end_pass(cmd);
+            end_pass(&r->vk, cmd, &pd);
         }
     }
     {
@@ -1187,14 +1187,14 @@ static void pass_smaa(Renderer *r, VkCommandBuffer cmd) {
             PassAttachment color   = {.target = &r->smaa_final[image], .load = LOAD_CLEAR};
             RenderTarget  *reads[] = {&r->ldr_color[image], &r->smaa_weights[image]};
 
-            begin_pass(&r->vk, cmd,
-                       &(PassDesc){
-                           .colors            = &color,
-                           .color_count       = 1,
-                           .shader_reads      = reads,
-                           .shader_read_count = 2,
-                           .pipeline          = r->smaa_pipelines.smaa_blend,
-                       });
+            PassDesc pd = {
+                .colors            = &color,
+                .color_count       = 1,
+                .shader_reads      = reads,
+                .shader_read_count = 2,
+                .pipeline          = r->smaa_pipelines.smaa_blend,
+            };
+            begin_pass(&r->vk, cmd, &pd);
 
             BlendPush blend_push = {
                 .color_tex  = r->ldr_color[image].bindless_index,
@@ -1203,7 +1203,7 @@ static void pass_smaa(Renderer *r, VkCommandBuffer cmd) {
             };
 
             cmd_draw(&r->vk, cmd, BYTE_SPAN(blend_push), 3, 1);
-            end_pass(cmd);
+            end_pass(&r->vk, cmd, &pd);
         }
     }
 }
@@ -1489,8 +1489,9 @@ static const float kSceneClear[4] = {0.02f, 0.025f, 0.03f, 1.0f};
 static void pass_clear_hdr(Renderer *r, VkCommandBuffer cmd, RenderTarget *target) {
     PassAttachment color = {.target = target, .load = LOAD_CLEAR, .store = STORE_KEEP};
     forEach(i, 4) color.clear[i] = kSceneClear[i];
-    begin_pass(&r->vk, cmd, &(PassDesc){.colors = &color, .color_count = 1, .pipeline = 0});
-    end_pass(cmd);
+    PassDesc pd = {.colors = &color, .color_count = 1, .pipeline = 0};
+    begin_pass(&r->vk, cmd, &pd);
+    end_pass(&r->vk, cmd, &pd);
 }
 
 bool renderer_frame(Renderer *r) {

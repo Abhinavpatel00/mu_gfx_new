@@ -14,7 +14,7 @@
 #define MAX_MIPS 16
 #define RT_MAX_MIPS 13
 #define MAX_SWAPCHAIN_IMAGES 8
-#define MAX_FRAMES_IN_FLIGHT 3
+#define MAX_FRAMES_IN_FLIGHT 2
 
 
 #define MAX_PIPELINES                256

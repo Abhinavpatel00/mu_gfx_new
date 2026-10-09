@@ -86,10 +86,12 @@ typedef struct SceneViewFrame {
     BufferSlice survivor_count;
     BufferSlice group_count;
     BufferSlice vis_base;
+    BufferSlice cmd_index;
     BufferSlice cursor;
     BufferSlice vis;
     BufferSlice draws;
     BufferSlice draw_count;
+    BufferSlice scan_aux; /* 4 * SCENE_SCAN_BLOCK u32x2: block totals + offsets */
 } SceneViewFrame;
 
 #define SCENE_MAX_LODS 4
@@ -159,7 +161,7 @@ struct Scene {
     bool          has_counters;
 
     /* pipelines */
-    PipelineID cs_cull, cs_count, cs_prefix, cs_compact;
+    PipelineID cs_cull, cs_count, cs_scan_block, cs_scan_blocks, cs_emit, cs_scatter;
     PipelineID draw_pipeline;
     bool       pipelines_ready;
     bool       uploaded;
@@ -235,10 +237,12 @@ Scene *scene_create(VkBackend *vk, const SceneDesc *desc) {
     s->cpu_rows         = calloc(s->max_instances, sizeof(struct SceneCullRow));
     s->cpu_group_static = calloc(s->max_meshes, sizeof(struct SceneGpuDraw));
 
-    s->cs_cull    = pipeline_create_compute(vk, "compiledshaders/scene.cs_cull.comp.spv");
-    s->cs_count   = pipeline_create_compute(vk, "compiledshaders/compact.cs_count.comp.spv");
-    s->cs_prefix  = pipeline_create_compute(vk, "compiledshaders/compact.cs_prefix.comp.spv");
-    s->cs_compact = pipeline_create_compute(vk, "compiledshaders/compact.cs_compact.comp.spv");
+    s->cs_cull         = pipeline_create_compute(vk, "compiledshaders/scene.cs_cull.comp.spv");
+    s->cs_count        = pipeline_create_compute(vk, "compiledshaders/compact.cs_count.comp.spv");
+    s->cs_scan_block   = pipeline_create_compute(vk, "compiledshaders/compact.cs_scan_block.comp.spv");
+    s->cs_scan_blocks  = pipeline_create_compute(vk, "compiledshaders/compact.cs_scan_blocks.comp.spv");
+    s->cs_emit         = pipeline_create_compute(vk, "compiledshaders/compact.cs_emit.comp.spv");
+    s->cs_scatter      = pipeline_create_compute(vk, "compiledshaders/compact.cs_scatter.comp.spv");
 
     log_info("[scene] created: max_instances=%u max_meshes=%u max_survivors=%u", s->max_instances, s->max_meshes,
              s->max_survivors);
@@ -270,10 +274,12 @@ void scene_destroy(Scene *s) {
         buffer_pool_free(vf->survivor_count);
         buffer_pool_free(vf->group_count);
         buffer_pool_free(vf->vis_base);
+        buffer_pool_free(vf->cmd_index);
         buffer_pool_free(vf->cursor);
         buffer_pool_free(vf->vis);
         buffer_pool_free(vf->draws);
         buffer_pool_free(vf->draw_count);
+        buffer_pool_free(vf->scan_aux);
     }
     free(s->staged_vertices);
     free(s->staged_indices);
@@ -454,10 +460,12 @@ bool scene_upload_scene(Scene *s, VkCommandBuffer cmd) {
             vf->survivor_count = alloc_slice(s, sizeof(uint32_t), 16);
             vf->group_count    = alloc_slice(s, (VkDeviceSize)G * sizeof(uint32_t), 16);
             vf->vis_base       = alloc_slice(s, (VkDeviceSize)G * sizeof(uint32_t), 16);
+            vf->cmd_index      = alloc_slice(s, (VkDeviceSize)G * sizeof(uint32_t), 16);
             vf->cursor         = alloc_slice(s, (VkDeviceSize)G * sizeof(uint32_t), 16);
             vf->vis            = alloc_slice(s, (VkDeviceSize)s->max_survivors * sizeof(uint32_t), 16);
             vf->draws          = alloc_slice(s, (VkDeviceSize)G * sizeof(struct SceneGpuDraw), 16);
             vf->draw_count     = alloc_slice(s, sizeof(uint32_t), 16);
+            vf->scan_aux       = alloc_slice(s, (VkDeviceSize)SCENE_SCAN_BLOCK * 3u * sizeof(uint32_t), 16);
         }
     }
     /* group templates (one GpuDraw per (mesh,lod) group) */
@@ -466,13 +474,14 @@ bool scene_upload_scene(Scene *s, VkCommandBuffer cmd) {
                                     (ByteSpan){s->cpu_group_static, s->group_count * sizeof(struct SceneGpuDraw)});
 
     s->dirty_count = s->instance_count; /* upload everything once */
-    cmd_buffer_barrier(cmd, vk->gpu_pool.buffer, 0, vk->gpu_pool.size_bytes, VK_PIPELINE_STAGE_2_TRANSFER_BIT,
-                       VK_ACCESS_2_TRANSFER_WRITE_BIT,
-                       VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT |
-                           VK_PIPELINE_STAGE_2_INDEX_INPUT_BIT | VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT,
-                       VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_INDEX_READ_BIT |
-                           VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT);
 
+    /* No barrier here on purpose. Every table uploaded above is declared as a
+       read by the pass that consumes it (T2 for instances/meshes/rows/lods,
+       T3b for group_static, T5 for the vertex and index arenas), and begin_pass
+       turns each declaration into a make-visible barrier whose source covers
+       TRANSFER. The old code emitted one whole-pool barrier here instead, which
+       ordered the same transfers while also implicating every unrelated
+       allocation in the pool. */
     s->uploaded = true;
     log_info("[scene] uploaded %u instances, %u meshes, %u groups", s->instance_count, s->mesh_count, G);
     return true;
@@ -581,77 +590,182 @@ void scene_frame(Scene *s, VkCommandBuffer cmd, RenderTarget *color, RenderTarge
     for (uint32_t view = 0; view < s->view_count; ++view) {
         SceneViewFrame *vf = &s->view_frame[view][lane];
 
-        /* zero the GPU-written counts (survivors, groups, cursors, counters, draws) */
+        /* Zero every GPU-written count before anything reads it. Declared as
+           reads on the cull pass below, so begin_pass publishes them. */
         vkCmdFillBuffer(cmd, vf->survivor_count.buffer, vf->survivor_count.offset, sizeof(uint32_t), 0u);
         vkCmdFillBuffer(cmd, vf->group_count.buffer, vf->group_count.offset, (VkDeviceSize)G * sizeof(uint32_t), 0u);
         vkCmdFillBuffer(cmd, vf->cursor.buffer, vf->cursor.offset, (VkDeviceSize)G * sizeof(uint32_t), 0u);
         vkCmdFillBuffer(cmd, vf->draw_count.buffer, vf->draw_count.offset, sizeof(uint32_t), 0u);
         vkCmdFillBuffer(cmd, s->counters[lane].buffer, s->counters[lane].offset, sizeof(uint32_t) * SCENE_COUNTERS, 0u);
 
-        cmd_buffer_barrier(cmd, vk->gpu_pool.buffer, 0, vk->gpu_pool.size_bytes, VK_PIPELINE_STAGE_2_TRANSFER_BIT,
-                           VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                           VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
-
         struct ScenePush sp;
         build_scene_push(s, view, lane, &sp);
 
-        /* T2: cull */
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vk->render_pipelines.pipelines[s->cs_cull - 1]);
-        dispatch_push(vk, cmd, (ByteSpan){&sp, (uint32_t)sizeof(sp)}, (s->candidate_count + 63u) / 64u, 1, 1);
-
-        cmd_buffer_barrier(cmd, vk->gpu_pool.buffer, 0, vk->gpu_pool.size_bytes, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                           VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                           VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
-
-        /* T3: compact */
         struct SceneCompactPush cp;
         memset(&cp, 0, sizeof(cp));
         cp.survivors      = slice_addr(vk, vf->survivors);
         cp.survivor_count = slice_addr(vk, vf->survivor_count);
         cp.group_count    = slice_addr(vk, vf->group_count);
         cp.vis_base       = slice_addr(vk, vf->vis_base);
+        cp.cmd_index      = slice_addr(vk, vf->cmd_index);
         cp.cursor         = slice_addr(vk, vf->cursor);
         cp.vis            = slice_addr(vk, vf->vis);
         cp.draws          = slice_addr(vk, vf->draws);
         cp.group_static   = slice_addr(vk, s->group_static);
         cp.draw_count     = slice_addr(vk, vf->draw_count);
+        cp.scan_aux       = slice_addr(vk, vf->scan_aux);
         cp.counts[0]      = 1;
         cp.counts[1]      = G;
         cp.counts[2]      = s->max_survivors;
+        cp.counts[4]      = (G + SCENE_SCAN_BLOCK - 1u) / SCENE_SCAN_BLOCK;
 
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vk->render_pipelines.pipelines[s->cs_count - 1]);
+        /* Every table is a slice of one buffer, so naming a slice names a byte
+           range. That is the whole point of declaring these instead of
+           barriering the pool: the previous code emitted four whole-pool
+           barriers per view, implicating 512 MB of unrelated allocations to
+           order 32 KB of counts. */
+        BufferAccess cull_reads[6] = {
+            {.slice = s->instances,     .stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, .access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT},
+            {.slice = s->cull_meshes,   .stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, .access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT},
+            {.slice = s->cull_rows,     .stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, .access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT},
+            {.slice = s->lod_rows,      .stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, .access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT},
+            {.slice = vf->survivor_count, .stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, .access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT},
+            {.slice = s->counters[lane], .stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, .access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT},
+        };
+        BufferAccess cull_writes[2] = {
+            {.slice = vf->survivors, .stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, .access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT},
+            {.slice = vf->survivor_count, .stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, .access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT},
+        };
+
+        /* T2: cull */
+        PassDesc cull_pass = {
+            .buf_reads      = cull_reads,
+            .buf_read_count = ARRAY_COUNT(cull_reads),
+            .buf_writes     = cull_writes,
+            .buf_write_count = ARRAY_COUNT(cull_writes),
+            .pipeline       = s->cs_cull,
+        };
+        begin_pass(vk, cmd, &cull_pass);
+        dispatch_push(vk, cmd, (ByteSpan){&sp, (uint32_t)sizeof(sp)}, (s->candidate_count + 63u) / 64u, 1, 1);
+        end_pass(vk, cmd, &cull_pass);
+
+        /* T3a: histogram survivors by (mesh,lod) group */
+        BufferAccess count_reads[2] = {
+            {.slice = vf->survivors, .stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, .access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT},
+            {.slice = vf->survivor_count, .stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, .access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT},
+        };
+        BufferAccess count_writes[1] = {
+            {.slice = vf->group_count, .stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, .access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT},
+        };
+        PassDesc count_pass = {
+            .buf_reads       = count_reads,
+            .buf_read_count  = ARRAY_COUNT(count_reads),
+            .buf_writes      = count_writes,
+            .buf_write_count = ARRAY_COUNT(count_writes),
+            .pipeline        = s->cs_count,
+        };
+        begin_pass(vk, cmd, &count_pass);
         dispatch_push(vk, cmd, (ByteSpan){&cp, (uint32_t)sizeof(cp)}, (s->max_survivors + 63u) / 64u, 1, 1);
+        end_pass(vk, cmd, &count_pass);
 
-        cmd_buffer_barrier(cmd, vk->gpu_pool.buffer, 0, vk->gpu_pool.size_bytes, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                           VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                           VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+        /* T3b: scan group_count -> vis_base + draw commands + draw_count */
+        /* T3b: two-level scan + emit. The old code ran this as one workgroup
+           of one thread looping over all G groups; it is now O(G/1024) wide.
+           scan_aux carries the per-block totals between the two levels. */
+        BufferAccess scan_reads[2] = {
+            {.slice = vf->group_count, .stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, .access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT},
+            {.slice = s->group_static,  .stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, .access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT},
+        };
+        BufferAccess scan_writes[6] = {
+            {.slice = vf->vis_base,   .stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, .access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT},
+            {.slice = vf->cmd_index,  .stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, .access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT},
+            {.slice = vf->cursor,     .stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, .access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT},
+            {.slice = vf->draws,      .stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, .access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT},
+            {.slice = vf->draw_count, .stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, .access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT},
+            {.slice = vf->scan_aux,   .stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, .access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT},
+        };
+        PassDesc scan_pass = {
+            .buf_reads       = scan_reads,
+            .buf_read_count  = ARRAY_COUNT(scan_reads),
+            .buf_writes      = scan_writes,
+            .buf_write_count = ARRAY_COUNT(scan_writes),
+            .pipeline        = s->cs_scan_block,
+        };
+        begin_pass(vk, cmd, &scan_pass);
+        dispatch_push(vk, cmd, (ByteSpan){&cp, (uint32_t)sizeof(cp)}, cp.counts[4], 1, 1);
+        end_pass(vk, cmd, &scan_pass);
 
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vk->render_pipelines.pipelines[s->cs_prefix - 1]);
+        PassDesc block_pass = {
+            .buf_writes      = scan_writes,
+            .buf_write_count = ARRAY_COUNT(scan_writes),
+            .pipeline        = s->cs_scan_blocks,
+        };
+        begin_pass(vk, cmd, &block_pass);
         dispatch_push(vk, cmd, (ByteSpan){&cp, (uint32_t)sizeof(cp)}, 1, 1, 1);
+        end_pass(vk, cmd, &block_pass);
 
-        cmd_buffer_barrier(cmd, vk->gpu_pool.buffer, 0, vk->gpu_pool.size_bytes, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                           VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                           VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+        PassDesc emit_pass = {
+            .buf_reads       = scan_reads,
+            .buf_read_count  = ARRAY_COUNT(scan_reads),
+            .buf_writes      = scan_writes,
+            .buf_write_count = ARRAY_COUNT(scan_writes),
+            .pipeline        = s->cs_emit,
+        };
+        begin_pass(vk, cmd, &emit_pass);
+        dispatch_push(vk, cmd, (ByteSpan){&cp, (uint32_t)sizeof(cp)}, cp.counts[4], 1, 1);
+        end_pass(vk, cmd, &emit_pass);
 
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vk->render_pipelines.pipelines[s->cs_compact - 1]);
+        /* T3c: scatter survivors into their group's contiguous vis range */
+        BufferAccess scatter_reads[4] = {
+            {.slice = vf->survivors, .stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, .access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT},
+            {.slice = vf->survivor_count, .stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, .access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT},
+            {.slice = vf->vis_base, .stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, .access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT},
+            {.slice = vf->cursor,   .stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, .access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT},
+        };
+        BufferAccess scatter_writes[1] = {
+            {.slice = vf->vis, .stage = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, .access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT},
+        };
+        PassDesc scatter_pass = {
+            .buf_reads       = scatter_reads,
+            .buf_read_count  = ARRAY_COUNT(scatter_reads),
+            .buf_writes      = scatter_writes,
+            .buf_write_count = ARRAY_COUNT(scatter_writes),
+            .pipeline        = s->cs_scatter,
+        };
+        begin_pass(vk, cmd, &scatter_pass);
         dispatch_push(vk, cmd, (ByteSpan){&cp, (uint32_t)sizeof(cp)}, (s->max_survivors + 63u) / 64u, 1, 1);
-
-        cmd_buffer_barrier(cmd, vk->gpu_pool.buffer, 0, vk->gpu_pool.size_bytes, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                           VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-                           VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT,
-                           VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT);
+        end_pass(vk, cmd, &scatter_pass);
 
         /* T5: draw */
         PassAttachment col = {.target = color, .load = LOAD_CLEAR, .store = STORE_KEEP};
         PassAttachment dep = {.target = depth, .load = LOAD_CLEAR, .store = STORE_KEEP};
         memcpy(col.clear, s->clear, sizeof(s->clear));
         dep.clear[0] = 1.0f;
-        begin_pass(vk, cmd, &(PassDesc){.colors = &col, .color_count = 1, .depth = &dep, .pipeline = s->draw_pipeline});
+
+        BufferAccess draw_reads[8] = {
+            {.slice = s->instances,   .stage = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT, .access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT},
+            {.slice = s->vertex_arena, .stage = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT, .access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT},
+            {.slice = s->shade_meshes, .stage = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT, .access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT},
+            {.slice = s->materials,   .stage = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, .access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT},
+            {.slice = vf->vis,        .stage = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT, .access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT},
+            {.slice = vf->draws,      .stage = VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT, .access = VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT},
+            {.slice = vf->draw_count, .stage = VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT, .access = VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT},
+            {.slice = s->index_arena, .stage = VK_PIPELINE_STAGE_2_INDEX_INPUT_BIT, .access = VK_ACCESS_2_INDEX_READ_BIT},
+        };
+        PassDesc draw_pass = {
+            .colors       = &col,
+            .color_count  = 1,
+            .depth        = &dep,
+            .buf_reads    = draw_reads,
+            .buf_read_count = ARRAY_COUNT(draw_reads),
+            .pipeline     = s->draw_pipeline,
+        };
+        begin_pass(vk, cmd, &draw_pass);
 
         vkCmdBindIndexBuffer(cmd, vk->gpu_pool.buffer, s->index_arena.offset, VK_INDEX_TYPE_UINT16);
         cmd_draw_indexed_indirect_count(vk, cmd, (ByteSpan){&sp, (uint32_t)sizeof(sp)}, vf->draws, vf->draw_count, G,
                                         (uint32_t)sizeof(struct SceneGpuDraw));
-        end_pass(cmd);
+        end_pass(vk, cmd, &draw_pass);
     }
 
     /* copy counters to the host-visible lane buffer for next time */
