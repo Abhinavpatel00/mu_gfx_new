@@ -884,44 +884,147 @@ static const char *const pets_models[PETS_MODELS] = {
     "data/threedassets/kaykitadventure/Characters/gltf/Rogue_Hooded.glb",
 };
 
-typedef struct PetInstance {
-    uint32_t mesh_set;
-    float    pos[3];
-    float    scale;
-} PetInstance;
-
 typedef struct CubePets {
-    PetInstance *instances;
-    uint32_t     count;
-    uint32_t     model[PETS_MODELS];
-
-    float      yaw, pitch, dist;
-    float      anim_time;
-    bool       ready;
-    bool       uploaded;
-    bool       skins_live;
     VkBackend *vk;
-    Renderer  *renderer; /* probe only */
+    Scene     *scene;
+
+    float yaw;
+    float dist;
+    float dt;
 } CubePets;
 
 static CubePets g_pets;
 
+/* One unit cube: 24 packed vertices (per-face normals) + 36 u16 indices. */
+static void pets_build_cube(Scene *scene) {
+    static const float face_n[6][3] = {{0, 0, 1}, {0, 0, -1}, {1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}};
+    static const float face_v[6][4][3] = {
+        {{-0.5f, -0.5f, 0.5f}, {0.5f, -0.5f, 0.5f}, {0.5f, 0.5f, 0.5f}, {-0.5f, 0.5f, 0.5f}},
+        {{0.5f, -0.5f, -0.5f}, {-0.5f, -0.5f, -0.5f}, {-0.5f, 0.5f, -0.5f}, {0.5f, 0.5f, -0.5f}},
+        {{0.5f, -0.5f, 0.5f}, {0.5f, -0.5f, -0.5f}, {0.5f, 0.5f, -0.5f}, {0.5f, 0.5f, 0.5f}},
+        {{-0.5f, -0.5f, -0.5f}, {-0.5f, -0.5f, 0.5f}, {-0.5f, 0.5f, 0.5f}, {-0.5f, 0.5f, -0.5f}},
+        {{-0.5f, 0.5f, 0.5f}, {0.5f, 0.5f, 0.5f}, {0.5f, 0.5f, -0.5f}, {-0.5f, 0.5f, -0.5f}},
+        {{-0.5f, -0.5f, -0.5f}, {0.5f, -0.5f, -0.5f}, {0.5f, -0.5f, 0.5f}, {-0.5f, -0.5f, 0.5f}},
+    };
+    static const float face_uv[4][2] = {{0, 1}, {1, 1}, {1, 0}, {0, 0}};
+
+    struct ScenePackedVertex verts[24];
+    uint16_t                 indices[36];
+    for (uint32_t f = 0; f < 6; ++f) {
+        for (uint32_t v = 0; v < 4; ++v) {
+            scene_pack_vertex(&verts[f * 4 + v], face_v[f][v], face_n[f], face_uv[v]);
+        }
+        uint16_t base = (uint16_t)(f * 4);
+        indices[f * 6 + 0] = base + 0;
+        indices[f * 6 + 1] = base + 1;
+        indices[f * 6 + 2] = base + 2;
+        indices[f * 6 + 3] = base + 0;
+        indices[f * 6 + 4] = base + 2;
+        indices[f * 6 + 5] = base + 3;
+    }
+
+    scene_mesh_add(scene, &(SceneMeshDesc){.vertices      = verts,
+                                           .vertex_count  = 24,
+                                           .indices       = indices,
+                                           .index_count   = 36,
+                                           .local_center  = {0, 0, 0},
+                                           .local_radius  = 0.866f,
+                                           .material      = 0});
+}
+
 static void pets_start(void *user, Renderer *renderer) {
     CubePets *p = (CubePets *)user;
     p->vk       = renderer_vk(renderer);
-    exit(EXIT_FAILURE);
+    p->dist     = 34.0f;
 }
 
-/* GameHooks.frame: input, camera state, HUD (counters come from last frame's
-   build — the CPU never learns this frame's visible count). */
-static void pets_frame(void *user, const GameFrame *frame) {}
+static void pets_frame(void *user, const GameFrame *frame) {
+    CubePets *p = (CubePets *)user;
+    if (frame->dt > 0.1f)
+        p->dt = 0.1f;
+    else
+        p->dt = frame->dt;
 
-/* GameHooks.render: lazy-init (needs the pass formats), then camera + pass. */
+    p->yaw += frame->dt * 0.35f;
+
+    SceneCounters c;
+    if (p->scene && scene_counters(p->scene, &c)) {
+        renderer_hud(frame->renderer, "scene: %u submitted  %u frustum-culled  %u drawn", c.submitted,
+                     c.culled_frustum, c.drawn);
+        renderer_hud(frame->renderer, "groups %u  dropped %u  lod %u/%u/%u/%u", c.draws, c.dropped, c.lod[0], c.lod[1],
+                     c.lod[2], c.lod[3]);
+    }
+    renderer_hud(frame->renderer, "3D cubepets: %u instances, orbit %.2f rad", PETS_GRID * PETS_GRID, p->yaw);
+}
+
+/* GameHooks.render: lazy-init (needs a command buffer for upload + the pass
+   formats for the pipeline), then set the view and record the scene. */
 static void pets_render(void *user, VkCommandBuffer cmd, RenderTarget *color, RenderTarget *depth) {
     CubePets *p = (CubePets *)user;
+
+    if (!p->scene) {
+        Scene *scene = scene_create(p->vk, &(SceneDesc){.max_instances = PETS_GRID * PETS_GRID,
+                                                        .max_meshes    = 4,
+                                                        .max_lod_rows  = 8,
+                                                        .max_materials = 4,
+                                                        .max_survivors = PETS_GRID * PETS_GRID});
+        if (!scene)
+            return;
+        pets_build_cube(scene);
+
+        const float half = (float)PETS_GRID * PETS_SPACING * 0.5f;
+        for (uint32_t z = 0; z < PETS_GRID; ++z) {
+            for (uint32_t x = 0; x < PETS_GRID; ++x) {
+                scene_instance_create(scene, &(SceneInstanceDesc){.pos   = {(float)x * PETS_SPACING - half, 0.0f,
+                                                                           (float)z * PETS_SPACING - half},
+                                                                  .quat  = {0, 0, 0, 0},
+                                                                  .scale = 1.0f,
+                                                                  .mesh  = 0});
+            }
+        }
+
+        if (!scene_upload_scene(scene, cmd)) {
+            scene_destroy(scene);
+            return;
+        }
+        scene_set_sun(scene, (const float[3]){0.4f, 0.8f, 0.3f}, 0.18f);
+        p->scene = scene;
+    }
+
+    /* camera: mouse-free orbit around the grid origin */
+    float aspect = (float)color->width / (float)color->height;
+    float radius = p->dist;
+    vec3 eye     = {sinf(p->yaw) * radius, radius * 0.55f, cosf(p->yaw) * radius};
+    vec3 center  = {0.0f, 0.0f, 0.0f};
+    vec3 up      = {0.0f, 1.0f, 0.0f};
+
+    mat4 proj, view, vp;
+    glm_perspective_rh_no(glm_rad(60.0f), aspect, 0.1f, 400.0f, proj);
+    glm_lookat(eye, center, up, view);
+    glm_mat4_mul(proj, view, vp);
+
+    SceneViewDesc vd = {0};
+    for (int r = 0; r < 4; ++r)
+        for (int c = 0; c < 4; ++c)
+            vd.clip_rows[r][c] = vp[c][r]; /* cglm is column-major */
+    vd.camera_pos[0] = eye[0];
+    vd.camera_pos[1] = eye[1];
+    vd.camera_pos[2] = eye[2];
+    vd.lod_target    = 1.0f;
+    vd.near_z        = 0.1f;
+    vd.far_z         = 400.0f;
+    scene_view_set(p->scene, 0, &vd);
+
+    scene_frame(p->scene, cmd, color, depth);
 }
 
-static void pets_shutdown(void *user) {}
+static void pets_shutdown(void *user) {
+    CubePets *p = (CubePets *)user;
+    if (p->scene) {
+        scene_destroy(p->scene);
+        p->scene = NULL;
+    }
+}
 
 /* ================================================================== boot */
 
