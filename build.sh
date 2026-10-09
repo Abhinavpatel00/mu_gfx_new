@@ -1,4 +1,4 @@
-bash compileslang.sh
+bash compileslang.sh debug
 mkdir -p build/generated
 python scripts/embed_shaders.py \
     build/generated/shaders.h \

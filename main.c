@@ -1,5 +1,6 @@
 #include "renderer.h"
 
+#include "src/input.h"
 #include "src/three_d/scene.h"
 
 #include "src/two_d/sprite.h" /* the farm demo below is the 2D stage's client */
@@ -875,11 +876,11 @@ static void farm_update(void *user, const GameFrame *frame) {
    number of distinct (mesh,lod) groups, so PETS_MESHES above SCENE_SCAN_BLOCK
    (1024) is what forces the two-level scan to use more than one block. A
    single-group scene would prove the parallel scan nothing. */
-#define PETS_GRID    3u
-#define PETS_SPACING 3.0f
-#define PETS_MESHES  1200u
+#define PETS_GRID     3u
+#define PETS_SPACING  3.0f
+#define PETS_MESHES   1200u
 #define PETS_PER_CELL 4u
-#define PETS_MODELS  6u
+#define PETS_MODELS   6u
 
 static const char *const pets_models[PETS_MODELS] = {
     "data/threedassets/kaykitadventure/Characters/gltf/Barbarian.glb",
@@ -899,10 +900,10 @@ typedef struct FlyCam {
     vec3  forward; /* derived from yaw/pitch each frame */
     vec3  right;
     vec3  up;
-    float    yaw;
-    float    pitch;
-    float    speed;
-    float    dt;
+    float yaw;
+    float pitch;
+    float speed;
+    float dt;
 } FlyCam;
 
 typedef struct CubePets {
@@ -922,7 +923,7 @@ static CubePets g_pets;
    in local radius and material, which is enough: what the compaction pass sees
    is one group per mesh, so this is what makes G large. */
 static void pets_build_cubes(Scene *scene) {
-    static const float face_n[6][3] = {{0, 0, 1}, {0, 0, -1}, {1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}};
+    static const float face_n[6][3]    = {{0, 0, 1}, {0, 0, -1}, {1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}};
     static const float face_v[6][4][3] = {
         {{-0.5f, -0.5f, 0.5f}, {0.5f, -0.5f, 0.5f}, {0.5f, 0.5f, 0.5f}, {-0.5f, 0.5f, 0.5f}},
         {{0.5f, -0.5f, -0.5f}, {-0.5f, -0.5f, -0.5f}, {-0.5f, 0.5f, -0.5f}, {0.5f, 0.5f, -0.5f}},
@@ -939,7 +940,7 @@ static void pets_build_cubes(Scene *scene) {
         for (uint32_t v = 0; v < 4; ++v) {
             scene_pack_vertex(&verts[f * 4 + v], face_v[f][v], face_n[f], face_uv[v]);
         }
-        uint16_t base = (uint16_t)(f * 4);
+        uint16_t base      = (uint16_t)(f * 4);
         indices[f * 6 + 0] = base + 0;
         indices[f * 6 + 1] = base + 1;
         indices[f * 6 + 2] = base + 2;
@@ -952,13 +953,13 @@ static void pets_build_cubes(Scene *scene) {
         /* Deterministic per-mesh variation. The u16 index arena caps a mesh at
            64k vertices; each cube is 24, so PETS_MESHES is bounded by that. */
         float k = 0.55f + (float)(m % 17u) * 0.06f;
-        scene_mesh_add(scene, &(SceneMeshDesc){.vertices      = verts,
-                                               .vertex_count  = 24,
-                                               .indices       = indices,
-                                               .index_count   = 36,
-                                               .local_center  = {0, 0, 0},
-                                               .local_radius  = 0.866f * k,
-                                               .material      = 0});
+        scene_mesh_add(scene, &(SceneMeshDesc){.vertices     = verts,
+                                               .vertex_count = 24,
+                                               .indices      = indices,
+                                               .index_count  = 36,
+                                               .local_center = {0, 0, 0},
+                                               .local_radius = 0.866f * k,
+                                               .material     = 0});
     }
     log_info("[cubepets] %u meshes registered", PETS_MESHES);
 }
@@ -967,10 +968,12 @@ static void pets_start(void *user, Renderer *renderer) {
     CubePets *p   = (CubePets *)user;
     p->vk         = renderer_vk(renderer);
     p->dist       = 34.0f;
-    p->cam.pos[0] = 0.0f; p->cam.pos[1] = 6.0f; p->cam.pos[2] = 22.0f;
-    p->cam.yaw   = 0.0f; /* looking down -Z */
-    p->cam.pitch = -0.25f;
-    p->cam.speed = 8.0f;
+    p->cam.pos[0] = 0.0f;
+    p->cam.pos[1] = 6.0f;
+    p->cam.pos[2] = 22.0f;
+    p->cam.yaw    = 0.0f; /* looking down -Z */
+    p->cam.pitch  = -0.25f;
+    p->cam.speed  = 8.0f;
     glm_vec3_zero(p->cam.forward);
     glm_vec3_zero(p->cam.right);
     glm_vec3_zero(p->cam.up);
@@ -995,7 +998,7 @@ static void flycam_update(FlyCam *c, const Input *in, float dt) {
     c->dt = dt;
 
     if (mouse_down(in, MOUSE_RIGHT)) {
-        c->yaw   -= (float)mouse_dx(in) * 0.0025f;
+        c->yaw -= (float)mouse_dx(in) * 0.0025f;
         c->pitch -= (float)mouse_dy(in) * 0.0025f;
         /* Clamp below the horizon: with an infinite reverse-Z far plane there is
            no far clipping to hide a singularity, but an inverted basis makes the
@@ -1006,13 +1009,15 @@ static void flycam_update(FlyCam *c, const Input *in, float dt) {
     c->speed = CLAMP(c->speed * (1.0f - (float)scroll_y(in) * 0.12f), 0.5f, 400.0f);
 
     vec3 fwd, right, up;
-    fwd[0] = cosf(c->pitch) * sinf(c->yaw);
-    fwd[1] = sinf(c->pitch);
-    fwd[2] = -cosf(c->pitch) * cosf(c->yaw);
+    fwd[0]   = cosf(c->pitch) * sinf(c->yaw);
+    fwd[1]   = sinf(c->pitch);
+    fwd[2]   = -cosf(c->pitch) * cosf(c->yaw);
     right[0] = cosf(c->yaw);
     right[1] = 0.0f;
     right[2] = sinf(c->yaw);
-    up[0] = 0.0f; up[1] = 1.0f; up[2] = 0.0f;
+    up[0]    = 0.0f;
+    up[1]    = 1.0f;
+    up[2]    = 0.0f;
 
     float boost = key_down(in, KEY_LEFT_SHIFT) ? 4.0f : 1.0f;
     float move = 0.0f, strafe = 0.0f, lift = 0.0f;
@@ -1052,10 +1057,10 @@ static void pets_frame(void *user, const GameFrame *frame) {
     if (getenv("MU_FLYCAM_TEST")) {
         static int n = 0;
         p->cam.yaw += 0.02f;
-        p->cam.pitch = -0.45f + sinf(n * 0.01f) * 0.25f;
-        p->cam.pos[0] = sinf(n * 0.004f) * 26.0f;
-        p->cam.pos[1] = 10.0f;
-        p->cam.pos[2] = cosf(n * 0.004f) * 26.0f;
+        p->cam.pitch      = -0.45f + sinf(n * 0.01f) * 0.25f;
+        p->cam.pos[0]     = sinf(n * 0.004f) * 26.0f;
+        p->cam.pos[1]     = 10.0f;
+        p->cam.pos[2]     = cosf(n * 0.004f) * 26.0f;
         p->cam.forward[0] = cosf(p->cam.pitch) * sinf(p->cam.yaw);
         p->cam.forward[1] = sinf(p->cam.pitch);
         p->cam.forward[2] = -cosf(p->cam.pitch) * cosf(p->cam.yaw);
@@ -1065,20 +1070,30 @@ static void pets_frame(void *user, const GameFrame *frame) {
     }
 
     SceneCounters c;
+
     if (p->scene && scene_counters(p->scene, &c)) {
-        renderer_hud(frame->renderer, "scene: %u submitted  %u frustum-culled  %u drawn", c.submitted,
-                     c.culled_frustum, c.drawn);
+        renderer_hud(frame->renderer, "scene: %u submitted  %u frustum-culled  %u drawn", c.submitted, c.culled_frustum,
+                     c.drawn);
         renderer_hud(frame->renderer, "groups %u  dropped %u  lod %u/%u/%u/%u", c.draws, c.dropped, c.lod[0], c.lod[1],
                      c.lod[2], c.lod[3]);
+
+        // log_info("[cubepets] counters: submitted=%u frustum_culled=%u drawn=%u draws=%u dropped=%u", c.submitted,
+        //                    c.culled_frustum, c.drawn, c.draws, c.dropped);
+        //
+
         static bool logged = false;
+        if (key_down(frame->input, KEY_L)) {
+            logged = !logged;
+        }
+
         if (!logged && c.drawn > 0) {
             logged = true;
             log_info("[cubepets] counters: submitted=%u frustum_culled=%u drawn=%u draws=%u dropped=%u", c.submitted,
                      c.culled_frustum, c.drawn, c.draws, c.dropped);
         }
     }
-    renderer_hud(frame->renderer, "flycam: %.1f %.1f %.1f  yaw %.2f pitch %.2f  speed %.0f", p->cam.pos[0], p->cam.pos[1],
-                 p->cam.pos[2], p->cam.yaw, p->cam.pitch, p->cam.speed);
+    renderer_hud(frame->renderer, "flycam: %.1f %.1f %.1f  yaw %.2f pitch %.2f  speed %.0f", p->cam.pos[0],
+                 p->cam.pos[1], p->cam.pos[2], p->cam.yaw, p->cam.pitch, p->cam.speed);
     renderer_hud(frame->renderer, "WASD move  Q/E down-up  Shift boost  RMB look  wheel speed");
 }
 
@@ -1091,17 +1106,17 @@ static void pets_render(void *user, VkCommandBuffer cmd, RenderTarget *color, Re
         /* Half the cells are static (written once, never again) and half are
            dynamic (rewritten every frame). That split is what the C6 partition
            exists for, and both kinds must land in the same slot space. */
-        uint32_t cells      = PETS_GRID * PETS_GRID;
-        uint32_t per_cell   = PETS_PER_CELL;
-        uint32_t total      = cells * per_cell;
-        uint32_t half       = total / 2;
-        Scene   *scene = scene_create(p->vk, &(SceneDesc){.max_instances    = total,
-                                                        .dynamic_capacity = half,
-                                                        .static_capacity  = total - half,
-                                                        .max_meshes       = PETS_MESHES,
-                                                        .max_lod_rows     = PETS_MESHES,
-                                                        .max_materials    = 4,
-                                                        .max_survivors    = total});
+        uint32_t cells    = PETS_GRID * PETS_GRID;
+        uint32_t per_cell = PETS_PER_CELL;
+        uint32_t total    = cells * per_cell;
+        uint32_t half     = total / 2;
+        Scene   *scene    = scene_create(p->vk, &(SceneDesc){.max_instances    = total,
+                                                             .dynamic_capacity = half,
+                                                             .static_capacity  = total - half,
+                                                             .max_meshes       = PETS_MESHES,
+                                                             .max_lod_rows     = PETS_MESHES,
+                                                             .max_materials    = 4,
+                                                             .max_survivors    = total});
         if (!scene)
             return;
         pets_build_cubes(scene);
@@ -1114,13 +1129,13 @@ static void pets_render(void *user, VkCommandBuffer cmd, RenderTarget *color, Re
                 for (uint32_t m = 0; m < PETS_MESHES; ++m) {
                     if (m >= per_cell)
                         break;
-                    float jx = (float)(m % 7u) * 0.31f;
-                    float jz = (float)(m % 11u) * 0.27f;
-                    SceneInstanceDesc d = {.pos   = {(float)x * PETS_SPACING - cell_half + jx, 0.0f,
-                                                       (float)z * PETS_SPACING - cell_half + jz},
-                                           .quat  = {0, 0, 0, 0},
-                                           .scale = 1.0f,
-                                           .mesh  = m};
+                    float             jx = (float)(m % 7u) * 0.31f;
+                    float             jz = (float)(m % 11u) * 0.27f;
+                    SceneInstanceDesc d  = {.pos   = {(float)x * PETS_SPACING - cell_half + jx, 0.0f,
+                                                      (float)z * PETS_SPACING - cell_half + jz},
+                                            .quat  = {0, 0, 0, 0},
+                                            .scale = 1.0f,
+                                            .mesh  = m};
                     /* Alternate so both regions are populated in every row. */
                     if (((x + z + m) & 1u) == 0u)
                         scene_instance_create(scene, &d);
@@ -1152,13 +1167,14 @@ static void pets_render(void *user, VkCommandBuffer cmd, RenderTarget *color, Re
     float aspect = (float)color->width / (float)color->height;
     vec3  eye;
     glm_vec3_copy(p->cam.pos, eye);
-    vec3  center;
+    vec3 center;
     center[0] = eye[0] + p->cam.forward[0];
     center[1] = eye[1] + p->cam.forward[1];
     center[2] = eye[2] + p->cam.forward[2];
-    vec3  up;
-    up[0] = 0.0f; up[1] = 1.0f; up[2] = 0.0f;
-
+    vec3 up;
+    up[0] = 0.0f;
+    up[1] = 1.0f;
+    up[2] = 0.0f;
 
     mat4 proj, view, vp;
     /* reverse-Z with an infinite far plane, written out rather than taken from

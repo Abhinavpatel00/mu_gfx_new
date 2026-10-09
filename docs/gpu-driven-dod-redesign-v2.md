@@ -923,6 +923,9 @@ step leaves a visible, correct frame.
 
 ### 16.1 Shared core — both profiles, in this order
 
+**Status: C1–C7 implemented and verified.** See §21 for what each landed and how
+it was proven.
+
 These are the corrections to the shipped build. Both profiles need all of them,
 and none of them depends on a profile choice, so they land first.
 
@@ -1056,3 +1059,61 @@ bounds, the two mesh tables split by reader, the three-buffer residency rule,
 same-frame two-phase occlusion, counters at lag 2, and the flag→table map. If
 you are looking for the doctrine rather than the delta, v1 §§2–5, 14, 16–18,
 21, 22 still stand.
+
+---
+
+## 21. C1–C7 implementation log
+
+What landed, and how each was proven. "Verified" means observed at runtime, not
+inferred: the app runs under `VK_LAYER_KHRONOS_validation` with zero errors, and
+each claim below came from a counter or a screenshot.
+
+| step | landed as | verified by |
+|---|---|---|
+| **C1** `BufferAccess` | `BufferAccess` in `PassDesc`; reads resolve at `begin_pass`, writes at `end_pass`. `end_pass` now takes the backend and the same `PassDesc` rather than parking pending state. Zero `cmd_buffer_barrier` calls remain in `scene_frame` — was 4 whole-pool barriers per view. | no Vulkan errors; the compute passes declare only buffers and run |
+| **C2** parallel scan | `cs_scan_block` → `cs_scan_blocks` → `cs_emit` replace one `[numthreads(1,1,1)]`. Scan-then-propagate over 256 aggregates × 4 strided elements, dual `(count, emit)` lanes, `scan_aux` carries block totals. | 1200 groups = 2 scan blocks: `submitted=36 drawn=36 draws=4`, and 4 is exactly the number of meshes holding instances |
+| **C3** indirect dispatch | `vkCmdDispatchIndirect` from `cull_args`; the kernel raises `x` to its true high-water mark so a stale CPU seed can never under-dispatch. Reseeded only when the roster changes. | counters unchanged vs. the CPU-dispatch path |
+| **C4** identity | `vis[]` is a plain slot. Mesh resolves through `group_base[firstInstance]` → `group_mesh[group]`, both uniform per draw. | renders identically; counters unchanged |
+| **C5** reverse-Z | `COMPARE_OP_GREATER`, clear `0.0`, infinite far. `ScenePush.misc` and `vertex_stream` (both unused) were reclaimed for the two new pointers, keeping the push at 240 B. | cubes self-occlude correctly under motion |
+| **C6** partition | `gpu_inst[]` split by `dynamic_capacity`; T1a rewrites the dense prefix as one span, T1b writes only static rows that changed. | 9 dynamic + 9 static in one slot space |
+| **C7** destroy | `scene_instance_destroy` swap-removes the candidate row via `row_of[slot]` and retires the slot; `scene_compact_slots` reclaims holes at load time. No death flag exists. | 36 → 18 instances, `draws` 4 → 2 |
+
+### 21.1 Three bugs found and fixed during C5–C7
+
+Worth recording because each was invisible in code review and only showed up at
+runtime:
+
+1. **Whole-table uploads packed instances densely.** `gpu_inst[]` is
+   *slot-indexed* and the static region lives at an offset, so packing put static
+   rows at the wrong indices. After compaction this produced **visibly
+   overlapping cubes**. Both upload sites now write at each instance's own slot
+   with holes zeroed.
+2. **`uploaded_dirty` was set in three places and never read.** A compaction
+   permutes the slot space, so the whole table must be re-uploaded once (T0).
+3. **`begin_pass` derived a render area before its compute early-return**, so a
+   compute pass declaring only buffer dependencies tripped an assert. Area and
+   viewport are meaningless without a rendering scope; the derivation now
+   happens after the return.
+
+### 21.2 Two things that needed a different route than the doc assumed
+
+- **`gl_DrawID` is unreachable from this Slang build.** No spelling of
+  `DrawIndex`/`GLDrawID`/`SV_DrawID` emits SPIR-V `BuiltIn DrawIndex`; they all
+  land as a plain `Input` at Location 0, which the zero-attribute pipeline
+  rejects. C4's *goal* — mesh uniform per draw rather than decoded per lane — is
+  met instead through `BaseInstance`, which Slang does emit correctly. Same data
+  movement, different address path.
+- **`end_pass` had to change signature.** Resolving declared writes requires the
+  backend and the same `PassDesc`; parking the write list in the backend between
+  the two calls would be exactly the hidden state the doctrine forbids. All 7
+  call sites were updated.
+
+### 21.3 Two pre-existing bugs fixed in passing
+
+- **`make release` compiled every `.c` file at `-O0 -DDEBUG`.** The `.c` rule used
+  `$(CFLAGS)`, which no variant set; only `CXXFLAGS` was configured. Every perf
+  number taken before this fix would have been meaningless. `BASE_CFLAGS` /
+  `BASE_CXXFLAGS` now share a language-neutral `BASE_FLAGS`.
+- **`read_shader` had a signature its callers could not satisfy**
+  (`const void**` vs `void**`). clang warned; gcc rejected it. Fixed at the
+  source, including the generator script so the header stays in sync.
