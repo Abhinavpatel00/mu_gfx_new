@@ -1,16 +1,5 @@
 #ifndef MU_GFX_VK_H
 #define MU_GFX_VK_H
-#define vkCmdCopyBuffer(cmd, src, dst, count, regions) \
-    do { \
-        for (uint32_t i = 0; i < (count); ++i) { \
-            const VkBufferCopy *r = &(regions)[i]; \
-            log_debug("[COPY] %s:%d dst=%p off=%llu size=%llu", \
-                __FILE__, __LINE__, (void *)(dst), \
-                (unsigned long long)r->dstOffset, \
-                (unsigned long long)r->size); \
-        } \
-        (vkCmdCopyBuffer)((cmd), (src), (dst), (count), (regions)); \
-    } while (0)
 #include "external/mu/mu/mu_span.h"
 #include "external/mu/offset_allocator.h"
 #include "src/helpers.h"
@@ -309,6 +298,8 @@ typedef struct BufferPool {
     VkDeviceSize  size_bytes;
 
     void *mapped;
+    struct BufferState *states;
+    uint32_t            state_count;
 
     BufferPoolType type;
     union {
@@ -322,6 +313,12 @@ typedef struct BufferPool {
     VmaMemoryUsage           memory_usage;
     VmaAllocationCreateFlags alloc_flags;
 } BufferPool;
+
+typedef struct BufferState {
+    VkPipelineStageFlags2 stage;
+    VkAccessFlags2        access;
+    bool                   valid;
+} BufferState;
 
 typedef enum PipelineType { PIPELINE_TYPE_GRAPHICS, PIPELINE_TYPE_COMPUTE } PipelineType;
 
@@ -459,6 +456,7 @@ typedef struct BufferSlice {
     VkDeviceSize  size;
     void         *mapped;
     OA_Allocation allocation;
+    BufferState  *state;
 } BufferSlice;
 
 // A buffer this pass touches, named by the stage and access the pass uses it
@@ -734,6 +732,8 @@ void vk_frame_submit(VkBackend *r);
 void cmd_buffer_barrier(VkCommandBuffer cmd, VkBuffer buffer, VkDeviceSize offset, VkDeviceSize size,
                         VkPipelineStageFlags2 src_stage, VkAccessFlags2 src_access, VkPipelineStageFlags2 dst_stage,
                         VkAccessFlags2 dst_access);
+void cmd_fill_buffer(VkCommandBuffer cmd, BufferSlice slice, VkDeviceSize size, uint32_t value);
+void cmd_copy_buffer(VkCommandBuffer cmd, BufferSlice src, VkBuffer dst, VkDeviceSize dst_offset, VkDeviceSize size);
 // Uploads texture data through the staging pool.
 // Handles row pitch, mip/layer regions, and transfer-to-sample barriers.
 bool texture_upload(VkBackend *r, TextureID id, uint32_t mip, uint32_t layer, VkOffset3D offset, VkExtent3D extent,

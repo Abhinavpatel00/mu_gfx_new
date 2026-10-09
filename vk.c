@@ -1388,6 +1388,9 @@ bool buffer_pool_init(VkBackend *r,
     pool->memory_usage = memory_usage;
     pool->alloc_flags  = alloc_flags;
     pool->mapped       = out_info.pMappedData;
+    pool->state_count  = type == BUFFER_POOL_TLSF ? max_allocs : 0;
+    if (pool->state_count)
+        pool->states = calloc(pool->state_count, sizeof(*pool->states));
 
     pool->type = type;
 
@@ -1417,6 +1420,8 @@ void buffer_pool_destroy(VkBackend *r, BufferPool *pool) {
         mem_note_destroy(r, &mem_info, false);
         vmaDestroyBuffer(r->devc.vmaallocator, pool->buffer, pool->allocation);
     }
+
+    free(pool->states);
 
     memset(pool, 0, sizeof(*pool));
 }
@@ -1470,6 +1475,10 @@ BufferSlice buffer_pool_alloc(BufferPool *pool, VkDeviceSize size_bytes, VkDevic
 
         offset           = a.offset;
         slice.allocation = a;
+        if (a.metadata < pool->state_count) {
+            slice.state = &pool->states[a.metadata];
+            *slice.state = (BufferState){0};
+        }
     } break;
     }
 
@@ -1490,6 +1499,8 @@ void buffer_pool_free(BufferSlice slice) {
     BufferPool *pool = slice.pool;
 
     if (pool->type == BUFFER_POOL_TLSF) {
+        if (slice.state)
+            *slice.state = (BufferState){0};
         oa_free(&pool->tlsf, slice.allocation);
     }
 }
@@ -1523,26 +1534,16 @@ bool renderer_upload_buffer_to_slice(VkBackend *r, VkCommandBuffer cmd, BufferSl
         .dstOffset = dst_slice.offset,
         .size      = data.size,
     };
+    if (dst_slice.state && dst_slice.state->valid) {
+        cmd_buffer_barrier(cmd, dst_slice.buffer, dst_slice.offset, dst_slice.size,
+                           dst_slice.state->stage, dst_slice.state->access,
+                           VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+    }
+
     vkCmdCopyBuffer(cmd, staging_slice.buffer, dst_slice.buffer, 1, &copy);
 
-    VkBufferMemoryBarrier2 copy_barrier = {
-        .sType               = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2,
-        .srcStageMask        = VK_PIPELINE_STAGE_2_COPY_BIT,
-        .srcAccessMask       = VK_ACCESS_2_TRANSFER_WRITE_BIT,
-        .dstStageMask        = VK_PIPELINE_STAGE_2_COPY_BIT,
-        .dstAccessMask       = VK_ACCESS_2_TRANSFER_WRITE_BIT,
-        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .buffer              = dst_slice.buffer,
-        .offset              = dst_slice.offset,
-        .size                = dst_slice.size,
-    };
-    VkDependencyInfo copy_dependency = {
-        .sType                    = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
-        .bufferMemoryBarrierCount = 1,
-        .pBufferMemoryBarriers    = &copy_barrier,
-    };
-    vkCmdPipelineBarrier2(cmd, &copy_dependency);
+    if (dst_slice.state)
+        *dst_slice.state = (BufferState){VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, true};
 
     return true;
 }
@@ -2690,28 +2691,34 @@ static void pass_push_buffer_reads(VkBackend *r, const BufferAccess *reads, uint
         const BufferAccess *b = &reads[i];
         if (!b->slice.buffer)
             continue;
-        if (r->barrierbatch.buffer_count >= (uint32_t)ARRAY_COUNT(r->barrierbatch.buffer_barriers)) {
-            r->barrierbatch.overflow_count++;
+        if (!b->slice.state)
             continue;
+        if (b->slice.state->valid &&
+            (b->slice.state->stage != b->stage || b->slice.state->access != b->access)) {
+            if (r->barrierbatch.buffer_count >= (uint32_t)ARRAY_COUNT(r->barrierbatch.buffer_barriers)) {
+                r->barrierbatch.overflow_count++;
+            } else {
+                r->barrierbatch.buffer_barriers[r->barrierbatch.buffer_count++] = (VkBufferMemoryBarrier2){
+                    .sType               = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2,
+                    .srcStageMask        = b->slice.state->stage,
+                    .srcAccessMask       = b->slice.state->access,
+                    .dstStageMask        = b->stage,
+                    .dstAccessMask        = b->access,
+                    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                    .buffer              = b->slice.buffer,
+                    .offset              = b->slice.offset,
+                    .size                = b->slice.size,
+                };
+            }
         }
-        r->barrierbatch.buffer_barriers[r->barrierbatch.buffer_count++] = (VkBufferMemoryBarrier2){
-            .sType               = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2,
-            .srcStageMask        = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
-            .srcAccessMask       = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
-            .dstStageMask        = b->stage,
-            .dstAccessMask       = b->access,
-            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .buffer              = b->slice.buffer,
-            .offset              = b->slice.offset,
-            .size                = b->slice.size,
-        };
+        *b->slice.state = (BufferState){b->stage, b->access, true};
     }
 }
 
-// A declared write is the mirror: this pass's stage/access becomes visible to
-// everything that comes after. Emitted at end_pass, because a barrier recorded
-// before the writes it is meant to publish orders nothing.
+// A declared write orders the previous access before this pass's write. The
+// state is updated immediately because command recording is linear; the
+// barrier itself is flushed before the pass body executes.
 static void pass_push_buffer_writes(VkBackend *r, const BufferAccess *writes, uint32_t count) {
     forEach(i, count) {
         const BufferAccess *b = &writes[i];
@@ -2721,27 +2728,32 @@ static void pass_push_buffer_writes(VkBackend *r, const BufferAccess *writes, ui
             r->barrierbatch.overflow_count++;
             continue;
         }
-        r->barrierbatch.buffer_barriers[r->barrierbatch.buffer_count++] = (VkBufferMemoryBarrier2){
-            .sType               = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2,
-            .srcStageMask        = b->stage,
-            .srcAccessMask       = b->access,
-            .dstStageMask        = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
-            .dstAccessMask       = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
-            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .buffer              = b->slice.buffer,
-            .offset              = b->slice.offset,
-            .size                = b->slice.size,
-        };
+        if (!b->slice.state)
+            continue;
+        if (b->slice.state->valid &&
+            (b->slice.state->stage != b->stage || b->slice.state->access != b->access)) {
+            if (r->barrierbatch.buffer_count >= (uint32_t)ARRAY_COUNT(r->barrierbatch.buffer_barriers)) {
+                r->barrierbatch.overflow_count++;
+            } else {
+                r->barrierbatch.buffer_barriers[r->barrierbatch.buffer_count++] = (VkBufferMemoryBarrier2){
+                    .sType               = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2,
+                    .srcStageMask        = b->slice.state->stage,
+                    .srcAccessMask       = b->slice.state->access,
+                    .dstStageMask        = b->stage,
+                    .dstAccessMask        = b->access,
+                    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                    .buffer              = b->slice.buffer,
+                    .offset              = b->slice.offset,
+                    .size                = b->slice.size,
+                };
+            }
+        }
+        *b->slice.state = (BufferState){b->stage, b->access, true};
     }
 }
 
 void end_pass(VkBackend *r, VkCommandBuffer cmd, const PassDesc *desc) {
-    // Publish the pass's declared writes before the scope closes, so the
-    // barrier is recorded after the work it describes.
-    pass_push_buffer_writes(r, desc->buf_writes, desc->buf_write_count);
-    flush_barriers(r, cmd);
-
     // A compute pass declares no attachments, so begin_pass opened no
     // rendering scope and there is nothing to end. Closing one that was never
     // begun is a validation error, not a no-op.
@@ -2790,6 +2802,7 @@ void begin_pass(VkBackend *r, VkCommandBuffer cmd, const PassDesc *desc) {
     }
 
     pass_push_buffer_reads(r, desc->buf_reads, desc->buf_read_count);
+    pass_push_buffer_writes(r, desc->buf_writes, desc->buf_write_count);
 
     flush_barriers(r, cmd);
 
@@ -3730,4 +3743,29 @@ void cmd_buffer_barrier(VkCommandBuffer cmd, VkBuffer buffer, VkDeviceSize offse
         .pBufferMemoryBarriers = &barrier,
     };
     vkCmdPipelineBarrier2(cmd, &dep_info);
+}
+
+void cmd_fill_buffer(VkCommandBuffer cmd, BufferSlice slice, VkDeviceSize size, uint32_t value) {
+    assert(slice.buffer && slice.offset % 4 == 0 && size % 4 == 0 && size <= slice.size);
+    if (slice.state && slice.state->valid) {
+        cmd_buffer_barrier(cmd, slice.buffer, slice.offset, size,
+                           slice.state->stage, slice.state->access,
+                           VK_PIPELINE_STAGE_2_CLEAR_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+    }
+    vkCmdFillBuffer(cmd, slice.buffer, slice.offset, size, value);
+    if (slice.state)
+        *slice.state = (BufferState){VK_PIPELINE_STAGE_2_CLEAR_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, true};
+}
+
+void cmd_copy_buffer(VkCommandBuffer cmd, BufferSlice src, VkBuffer dst, VkDeviceSize dst_offset, VkDeviceSize size) {
+    assert(src.buffer && dst && size <= src.size);
+    if (src.state && src.state->valid) {
+        cmd_buffer_barrier(cmd, src.buffer, src.offset, size,
+                           src.state->stage, src.state->access,
+                           VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+    }
+    VkBufferCopy copy = {.srcOffset = src.offset, .dstOffset = dst_offset, .size = size};
+    vkCmdCopyBuffer(cmd, src.buffer, dst, 1, &copy);
+    if (src.state)
+        *src.state = (BufferState){VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT, true};
 }

@@ -143,17 +143,19 @@ struct Scene {
     /* CPU truth. One slot space, split by a scene constant: [0, dynamic_count)
        is the dynamic prefix rewritten every frame, [dynamic_capacity, ...) is the
        static suffix uploaded once. No per-row region flag exists. */
-    SceneCpuInstance *cpu_instances;
-    uint32_t          dynamic_capacity;
-    uint32_t          static_capacity;
-    uint32_t          dynamic_count;   /* live dynamic slots, dense in [0, dynamic_count) */
-    uint32_t          static_count;    /* live static slots, dense in [dynamic_capacity, +static_count) */
-    uint32_t          instance_count;  /* dynamic_count + static_count                 */
-    uint32_t          candidate_count; /* == instance_count; candidates mirror slots   */
-    bool              uploaded_dirty;  /* static region changed; needs re-upload       */
-    bool              candidates_dirty; /* roster changed; candidate rows need re-upload  */
-    bool              cull_args_dirty; /* roster changed; reseed the indirect args */
-
+    SceneCpuInstance     *cpu_instances;
+    struct SceneInstance *instance_upload_scratch;
+    struct SceneCullRow  *candidate_upload_scratch;
+    uint32_t              dynamic_capacity;
+    uint32_t              static_capacity;
+    uint32_t              dynamic_count;    /* live dynamic slots, dense in [0, dynamic_count) */
+    uint32_t              static_count;     /* live static slots, dense in [dynamic_capacity, +static_count) */
+    uint32_t              instance_count;   /* dynamic_count + static_count                 */
+    uint32_t              candidate_count;  /* == instance_count; candidates mirror slots   */
+    bool                  uploaded_dirty;   /* static region changed; needs re-upload       */
+    bool                  candidates_dirty; /* roster changed; candidate rows need re-upload  */
+    /* in struct Scene */
+    bool      cull_args_dirty[MAX_FRAMES_IN_FLIGHT];
     uint32_t *dirty_slots;
     uint32_t  dirty_count;
 
@@ -256,17 +258,21 @@ Scene *scene_create(VkBackend *vk, const SceneDesc *desc) {
        would put two vkCmdCopyBuffer on the same 16 bytes in the first frame's
        command buffer (the seed, then the reseed this flag forces), with no
        barrier between them — a WRITE_AFTER_WRITE the validation layer flags. */
-    s->cull_args_dirty = true;
 
+    /* scene_create */
+    for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i)
+        s->cull_args_dirty[i] = true;
     s->staged_vertex_cap = 4096;
     s->staged_vertices   = malloc((size_t)s->staged_vertex_cap * sizeof(struct ScenePackedVertex));
     s->staged_index_cap  = 8192;
     s->staged_indices    = malloc((size_t)s->staged_index_cap * sizeof(uint16_t));
 
-    s->cpu_instances       = calloc(s->max_instances, sizeof(SceneCpuInstance));
-    s->dirty_slots         = calloc(s->max_instances, sizeof(uint32_t));
-    s->static_dirty_slots  = calloc(s->max_instances, sizeof(uint32_t));
-    s->row_of              = malloc((size_t)s->max_instances * sizeof(uint32_t));
+    s->cpu_instances            = calloc(s->max_instances, sizeof(SceneCpuInstance));
+    s->instance_upload_scratch  = calloc(s->max_instances, sizeof(struct SceneInstance));
+    s->candidate_upload_scratch = calloc(s->max_instances, sizeof(struct SceneCullRow));
+    s->dirty_slots              = calloc(s->max_instances, sizeof(uint32_t));
+    s->static_dirty_slots       = calloc(s->max_instances, sizeof(uint32_t));
+    s->row_of                   = malloc((size_t)s->max_instances * sizeof(uint32_t));
     for (uint32_t i = 0; i < s->max_instances; ++i)
         s->row_of[i] = UINT32_MAX;
 
@@ -309,7 +315,7 @@ void scene_destroy(Scene *s) {
         buffer_pool_free(s->counters[i]);
         destroy_buffer(vk, &s->counters_host[i]);
     }
-    forEach(v, s->view_count) forEach(i, MAX_FRAMES_IN_FLIGHT) {
+    forEach(v, SCENE_MAX_VIEWS) forEach(i, MAX_FRAMES_IN_FLIGHT) {
         SceneViewFrame *vf = &s->view_frame[v][i];
         buffer_pool_free(vf->survivors);
         buffer_pool_free(vf->survivor_count);
@@ -327,6 +333,8 @@ void scene_destroy(Scene *s) {
     free(s->staged_vertices);
     free(s->staged_indices);
     free(s->cpu_instances);
+    free(s->instance_upload_scratch);
+    free(s->candidate_upload_scratch);
     free(s->dirty_slots);
     free(s->static_dirty_slots);
     free(s->row_of);
@@ -413,8 +421,8 @@ static uint32_t instance_insert(Scene *s, const SceneInstanceDesc *desc, bool is
     }
 
     pack_instance(&s->cpu_instances[slot].gpu, desc);
-    s->cpu_instances[slot].mesh  = desc->mesh;
-    s->cpu_instances[slot].alive = 1;
+    s->cpu_instances[slot].mesh          = desc->mesh;
+    s->cpu_instances[slot].alive         = 1;
     s->cpu_rows[s->candidate_count].slot = slot;
     s->cpu_rows[s->candidate_count].mesh = (uint16_t)desc->mesh;
     s->row_of[slot]                      = s->candidate_count;
@@ -432,8 +440,12 @@ static uint32_t instance_insert(Scene *s, const SceneInstanceDesc *desc, bool is
        rows need re-uploading. Recorded here and applied at the next frame
        boundary, because writing a GPU slice needs the command buffer and
        inserting an instance does not have one. */
-    s->cull_args_dirty   = true;
-    s->candidates_dirty  = true;
+
+    /* whenever a roster change is recorded (instance_insert, instance_set,
+       instance_destroy, scene_compact_slots) */
+    for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i)
+        s->cull_args_dirty[i] = true;
+
     return slot;
 }
 
@@ -453,17 +465,16 @@ void scene_instance_set(Scene *s, uint32_t slot, const SceneInstanceDesc *desc) 
     if (!s || !desc || slot >= s->max_instances || !s->cpu_instances[slot].alive)
         return;
     pack_instance(&s->cpu_instances[slot].gpu, desc);
-    s->cpu_instances[slot].mesh = desc->mesh;
+    s->cpu_instances[slot].mesh       = desc->mesh;
     s->cpu_rows[s->row_of[slot]].mesh = (uint16_t)desc->mesh;
-    s->candidates_dirty = true;
+    s->candidates_dirty               = true;
     if (slot >= s->dynamic_capacity) {
         /* static: re-upload just this row rather than the whole region */
         s->static_dirty_slots[s->static_dirty_count++] = slot;
-        s->uploaded_dirty = true;
+        s->uploaded_dirty                              = true;
     } else {
         s->dirty_slots[s->dirty_count++] = slot;
     }
-    s->cull_args_dirty = true;
 }
 
 bool scene_instance_alive(const Scene *s, uint32_t slot) {
@@ -481,24 +492,33 @@ void scene_instance_destroy(Scene *s, uint32_t slot) {
     if (!s || slot >= s->max_instances || !s->cpu_instances[slot].alive)
         return;
 
-    uint32_t row  = s->row_of[slot];
-    uint32_t last = s->candidate_count - 1;
-    if (row != last) {
-        s->cpu_rows[row]            = s->cpu_rows[last];
-        s->row_of[s->cpu_rows[row].slot] = row; /* the moved row's owner */
+    uint32_t removed_row = s->row_of[slot];
+    uint32_t last_row    = s->candidate_count - 1;
+    if (removed_row != last_row) {
+        s->cpu_rows[removed_row]                 = s->cpu_rows[last_row];
+        s->row_of[s->cpu_rows[removed_row].slot] = removed_row;
     }
-    s->row_of[slot]     = UINT32_MAX;
-    s->candidate_count  = last;
+    s->candidate_count = last_row;
+    s->row_of[slot]    = UINT32_MAX;
+
+    bool     is_static = slot >= s->dynamic_capacity;
+    uint32_t last_slot = is_static ? s->dynamic_capacity + s->static_count - 1 : s->dynamic_count - 1;
+    if (slot != last_slot) {
+        uint32_t moved_row          = s->row_of[last_slot];
+        s->cpu_instances[slot]      = s->cpu_instances[last_slot];
+        s->row_of[slot]             = moved_row;
+        s->cpu_rows[moved_row].slot = slot;
+    }
+    memset(&s->cpu_instances[last_slot], 0, sizeof(s->cpu_instances[last_slot]));
     s->instance_count--;
+    s->candidates_dirty = true;
 
-    s->cpu_instances[slot].alive = 0;
-    s->candidates_dirty          = true;
-
-    if (slot >= s->dynamic_capacity)
+    if (is_static) {
         s->static_count--;
-    else
+        s->uploaded_dirty = true;
+    } else {
         s->dynamic_count--;
-    s->cull_args_dirty = true;
+    }
 }
 
 void scene_compact_slots(Scene *s) {
@@ -553,26 +573,25 @@ void scene_compact_slots(Scene *s) {
             continue;
         uint32_t to = dst[i];
         if (to != i) {
-            s->cpu_instances[to] = s->cpu_instances[i];
+            s->cpu_instances[to]      = s->cpu_instances[i];
             s->cpu_instances[i].alive = 0;
             s->row_of[i]              = UINT32_MAX;
         }
         s->cpu_rows[row].slot = to;
         s->cpu_rows[row].mesh = (uint16_t)s->cpu_instances[to].mesh;
-        s->row_of[to]        = row;
+        s->row_of[to]         = row;
         row++;
     }
     free(dst);
 
-    s->dynamic_count  = dyn;
-    s->static_count   = sta;
-    s->instance_count = dyn + sta;
-    s->candidate_count = row;
-    s->dirty_count      = 0;
+    s->dynamic_count      = dyn;
+    s->static_count       = sta;
+    s->instance_count     = dyn + sta;
+    s->candidate_count    = row;
+    s->dirty_count        = 0;
     s->static_dirty_count = 0;
-    s->uploaded_dirty  = true;
-    s->cull_args_dirty = true;
-    s->candidates_dirty = true;
+    s->uploaded_dirty     = true;
+    s->candidates_dirty   = true;
 }
 
 void scene_view_set(Scene *s, uint32_t view, const SceneViewDesc *vd) {
@@ -653,14 +672,14 @@ bool scene_upload_scene(Scene *s, VkCommandBuffer cmd) {
            slot-indexed and the static region lives at an offset, so packing would
            put static rows at the wrong indices. Holes are zeroed — a retired slot
            is never referenced, and zero is a defined pose rather than garbage. */
-        struct SceneInstance *tmp = calloc(s->max_instances, sizeof(struct SceneInstance));
+        memset(s->instance_upload_scratch, 0, (size_t)s->max_instances * sizeof(struct SceneInstance));
         for (uint32_t i = 0; i < s->max_instances; ++i) {
             if (s->cpu_instances[i].alive)
-                tmp[i] = s->cpu_instances[i].gpu;
+                s->instance_upload_scratch[i] = s->cpu_instances[i].gpu;
         }
-        renderer_upload_buffer_to_slice(vk, cmd, s->instances,
-                                        (ByteSpan){tmp, (uint32_t)s->max_instances * sizeof(struct SceneInstance)});
-        free(tmp);
+        renderer_upload_buffer_to_slice(
+            vk, cmd, s->instances,
+            (ByteSpan){s->instance_upload_scratch, (uint32_t)s->max_instances * sizeof(struct SceneInstance)});
         s->uploaded_dirty = false;
     }
 
@@ -682,9 +701,9 @@ bool scene_upload_scene(Scene *s, VkCommandBuffer cmd) {
                The stride must be uint2, not uint: cs_scan_block writes whole
                uint2 block totals into region 0, so a uint32 stride made every
                block total overlap the next and corrupted the scan input. */
-            vf->scan_aux = alloc_slice(s, (VkDeviceSize)SCENE_SCAN_BLOCK * 3u * sizeof(SceneU32x2), 16);
-            vf->cull_args      = alloc_slice(s, 16, 16);
-            vf->group_base     = alloc_slice(s, (VkDeviceSize)s->max_survivors * sizeof(uint32_t), 16);
+            vf->scan_aux   = alloc_slice(s, (VkDeviceSize)SCENE_SCAN_BLOCK * 3u * sizeof(SceneU32x2), 16);
+            vf->cull_args  = alloc_slice(s, 16, 16);
+            vf->group_base = alloc_slice(s, (VkDeviceSize)s->max_survivors * sizeof(uint32_t), 16);
         }
     }
     /* group templates (one GpuDraw per (mesh,lod) group) */
@@ -732,10 +751,10 @@ static void ensure_pipelines(Scene *s, RenderTarget *color, RenderTarget *depth)
     cfg.depth_format           = s->depth_format;
     /* reverse-Z: near is 1.0 and the far limit is 0.0, so nearer geometry has
        the greater depth. Any Hi-Z pyramid built from this must MAX-reduce. */
-    cfg.depth_compare_op       = VK_COMPARE_OP_GREATER;
-    cfg.blends[0]              = blend_disabled();
-    s->draw_pipeline           = pipeline_create_graphics(s->vk, &cfg);
-    s->pipelines_ready         = true;
+    cfg.depth_compare_op = VK_COMPARE_OP_GREATER;
+    cfg.blends[0]        = blend_disabled();
+    s->draw_pipeline     = pipeline_create_graphics(s->vk, &cfg);
+    s->pipelines_ready   = true;
 }
 
 static void build_scene_push(Scene *s, uint32_t view, uint32_t lane, struct ScenePush *p) {
@@ -806,16 +825,15 @@ void scene_frame(Scene *s, VkCommandBuffer cmd, RenderTarget *color, RenderTarge
 
     /* Apply a pending roster change to the indirect dispatch args. This is the
        only place the CPU writes them, and only when the roster actually grew. */
-    if (s->cull_args_dirty) {
+    /* scene_frame */
+    if (s->cull_args_dirty[lane]) {
         uint32_t args[4] = {(s->candidate_count + 63u) / 64u, 1u, 1u, 0u};
         if (args[0] == 0)
             args[0] = 1;
-        for (uint32_t v = 0; v < s->view_count; ++v) {
+        for (uint32_t v = 0; v < s->view_count; ++v)
             renderer_upload_buffer_to_slice(vk, cmd, s->view_frame[v][lane].cull_args, (ByteSpan){args, sizeof(args)});
-        }
-        s->cull_args_dirty = false;
+        s->cull_args_dirty[lane] = false;
     }
-
     /* T0: a slot-space rebuild (scene_compact_slots) permutes which instance
        lives in which slot, so every row the GPU holds is now wrong. This is the
        rare path and it re-uploads the whole table once; the per-region uploads
@@ -823,14 +841,14 @@ void scene_frame(Scene *s, VkCommandBuffer cmd, RenderTarget *color, RenderTarge
     if (s->uploaded_dirty) {
         /* Slot-indexed, same reason as the initial upload: after a compaction the
            survivors occupy different slots, and gpu_inst[] is addressed by slot. */
-        struct SceneInstance *rows = calloc(s->max_instances, sizeof(struct SceneInstance));
+        memset(s->instance_upload_scratch, 0, (size_t)s->max_instances * sizeof(struct SceneInstance));
         for (uint32_t i = 0; i < s->max_instances; ++i) {
             if (s->cpu_instances[i].alive)
-                rows[i] = s->cpu_instances[i].gpu;
+                s->instance_upload_scratch[i] = s->cpu_instances[i].gpu;
         }
-        renderer_upload_buffer_to_slice(vk, cmd, s->instances,
-                                        (ByteSpan){rows, (uint32_t)s->max_instances * sizeof(struct SceneInstance)});
-        free(rows);
+        renderer_upload_buffer_to_slice(
+            vk, cmd, s->instances,
+            (ByteSpan){s->instance_upload_scratch, (uint32_t)s->max_instances * sizeof(struct SceneInstance)});
         s->uploaded_dirty = false;
         /* the regions were just written wholesale; no per-row work needed */
         s->static_dirty_count = 0;
@@ -840,15 +858,13 @@ void scene_frame(Scene *s, VkCommandBuffer cmd, RenderTarget *color, RenderTarge
        every frame as one contiguous span — the app moves most of them, so a
        dirty list would degenerate to the same bytes plus the bookkeeping. */
     if (s->dynamic_count) {
-        struct SceneInstance *rows = malloc((size_t)s->dynamic_count * sizeof(struct SceneInstance));
         for (uint32_t i = 0; i < s->dynamic_count; ++i)
-            rows[i] = s->cpu_instances[i].gpu;
-        BufferSlice dyn                = s->instances;
+            s->instance_upload_scratch[i] = s->cpu_instances[i].gpu;
+        BufferSlice dyn = s->instances;
         dyn.offset += 0;
-        dyn.size    = (VkDeviceSize)s->dynamic_count * sizeof(struct SceneInstance);
-        renderer_upload_buffer_to_slice(vk, cmd, dyn,
-                                        (ByteSpan){rows, s->dynamic_count * sizeof(struct SceneInstance)});
-        free(rows);
+        dyn.size = (VkDeviceSize)s->dynamic_count * sizeof(struct SceneInstance);
+        renderer_upload_buffer_to_slice(
+            vk, cmd, dyn, (ByteSpan){s->instance_upload_scratch, s->dynamic_count * sizeof(struct SceneInstance)});
     }
     s->dirty_count = 0;
 
@@ -867,15 +883,12 @@ void scene_frame(Scene *s, VkCommandBuffer cmd, RenderTarget *color, RenderTarge
     /* Candidates mirror the live slot set; re-upload the prefix whenever the
        roster changed. This is a per-roster-change cost, not a per-frame one. */
     if (s->candidates_dirty) {
-        struct SceneCullRow *rows = malloc((size_t)(s->candidate_count ? s->candidate_count : 1) *
-                                           sizeof(struct SceneCullRow));
         for (uint32_t r = 0; r < s->candidate_count; ++r)
-            rows[r] = s->cpu_rows[r];
-        BufferSlice cand           = s->cull_rows;
-        cand.size = (VkDeviceSize)s->candidate_count * sizeof(struct SceneCullRow);
-        renderer_upload_buffer_to_slice(vk, cmd, cand,
-                                        (ByteSpan){rows, s->candidate_count * sizeof(struct SceneCullRow)});
-        free(rows);
+            s->candidate_upload_scratch[r] = s->cpu_rows[r];
+        BufferSlice cand = s->cull_rows;
+        cand.size        = (VkDeviceSize)s->candidate_count * sizeof(struct SceneCullRow);
+        renderer_upload_buffer_to_slice(
+            vk, cmd, cand, (ByteSpan){s->candidate_upload_scratch, s->candidate_count * sizeof(struct SceneCullRow)});
         s->candidates_dirty = false;
     }
 
@@ -886,11 +899,11 @@ void scene_frame(Scene *s, VkCommandBuffer cmd, RenderTarget *color, RenderTarge
 
         /* Zero every GPU-written count before anything reads it. Declared as
            reads on the cull pass below, so begin_pass publishes them. */
-        vkCmdFillBuffer(cmd, vf->survivor_count.buffer, vf->survivor_count.offset, sizeof(uint32_t), 0u);
-        vkCmdFillBuffer(cmd, vf->group_count.buffer, vf->group_count.offset, (VkDeviceSize)G * sizeof(uint32_t), 0u);
-        vkCmdFillBuffer(cmd, vf->cursor.buffer, vf->cursor.offset, (VkDeviceSize)G * sizeof(uint32_t), 0u);
-        vkCmdFillBuffer(cmd, vf->draw_count.buffer, vf->draw_count.offset, sizeof(uint32_t), 0u);
-        vkCmdFillBuffer(cmd, s->counters[lane].buffer, s->counters[lane].offset, sizeof(uint32_t) * SCENE_COUNTERS, 0u);
+        cmd_fill_buffer(cmd, vf->survivor_count, sizeof(uint32_t), 0u);
+        cmd_fill_buffer(cmd, vf->group_count, (VkDeviceSize)G * sizeof(uint32_t), 0u);
+        cmd_fill_buffer(cmd, vf->cursor, (VkDeviceSize)G * sizeof(uint32_t), 0u);
+        cmd_fill_buffer(cmd, vf->draw_count, sizeof(uint32_t), 0u);
+        cmd_fill_buffer(cmd, s->counters[lane], sizeof(uint32_t) * SCENE_COUNTERS, 0u);
 
         struct ScenePush sp;
         build_scene_push(s, view, lane, &sp);
@@ -916,10 +929,9 @@ void scene_frame(Scene *s, VkCommandBuffer cmd, RenderTarget *color, RenderTarge
         cp.counts[4]      = (G + SCENE_SCAN_BLOCK - 1u) / SCENE_SCAN_BLOCK;
         /* DEBUG: shader-side printf. Off by default; it serialises and floods
            the log, so it is opt-in per run. */
-     //   cp.counts[5]      = getenv("MU_SHADER_DEBUG") ? 1u : 0u;
-        // if (getenv("MU_SHADER_DEBUG") && view == 0 && lane == 0)
-        //     log_info("[dbg] shader printf enable = %u, G = %u", cp.counts[5], G);
-        //
+        cp.counts[5]      = getenv("MU_SHADER_DEBUG") ? 1u : 0u;
+        if (getenv("MU_SHADER_DEBUG") && view == 0 && lane == 0)
+            log_info("[dbg] shader printf enable = %u, G = %u", cp.counts[5], G);
         /* Every table is a slice of one buffer, so naming a slice names a byte
            range. That is the whole point of declaring these instead of
            barriering the pool: the previous code emitted four whole-pool
@@ -944,20 +956,15 @@ void scene_frame(Scene *s, VkCommandBuffer cmd, RenderTarget *color, RenderTarge
             {.slice  = s->counters[lane],
              .stage  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
              .access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT},
-              {.slice  = vf->cull_args,
-               .stage  = VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT,
-               .access = VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT},
+            {.slice  = vf->cull_args,
+             .stage  = VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT,
+             .access = VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT},
         };
-        BufferAccess cull_writes[3] = {
+        BufferAccess cull_writes[2] = {
             {.slice  = vf->survivors,
              .stage  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
              .access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT},
             {.slice  = vf->survivor_count,
-             .stage  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-             .access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT},
-            /* the kernel publishes its true workgroup high-water mark here, so
-               the next frame's indirect dispatch can never under-dispatch */
-            {.slice  = vf->cull_args,
              .stage  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
              .access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT},
         };
@@ -1183,9 +1190,7 @@ void scene_frame(Scene *s, VkCommandBuffer cmd, RenderTarget *color, RenderTarge
     }
 
     /* copy counters to the host-visible lane buffer for next time */
-    VkBufferCopy copy = {
-        .srcOffset = s->counters[lane].offset, .dstOffset = 0, .size = sizeof(uint32_t) * SCENE_COUNTERS};
-    vkCmdCopyBuffer(cmd, vk->gpu_pool.buffer, s->counters_host[lane].buffer, 1, &copy);
+    cmd_copy_buffer(cmd, s->counters[lane], s->counters_host[lane].buffer, 0, sizeof(uint32_t) * SCENE_COUNTERS);
 
     s->frame_serial++;
 }
