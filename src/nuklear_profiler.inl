@@ -13,13 +13,15 @@ static void render_gpu_profiler_ui(Renderer *r) {
         return;
     }
     if (!nk_begin(ctx, "GPU Profiler", nk_rect(280, 10, 820, 650),
-                  NK_WINDOW_BORDER | NK_WINDOW_MOVABLE | NK_WINDOW_SCALABLE | NK_WINDOW_TITLE | NK_WINDOW_MINIMIZABLE)) {
+                  NK_WINDOW_BORDER | NK_WINDOW_MOVABLE | NK_WINDOW_SCALABLE | NK_WINDOW_TITLE |
+                      NK_WINDOW_MINIMIZABLE)) {
         nk_end(ctx);
         return;
     }
     nk_layout_row_dynamic(ctx, 26, 4);
     g_gpu_profiler_ui.paused = nk_check_label(ctx, "Pause", g_gpu_profiler_ui.paused);
-    g_gpu_profiler_ui.show_pipeline_stats = nk_check_label(ctx, "Pipeline Stats", g_gpu_profiler_ui.show_pipeline_stats);
+    g_gpu_profiler_ui.show_pipeline_stats =
+        nk_check_label(ctx, "Pipeline Stats", g_gpu_profiler_ui.show_pipeline_stats);
     if (nk_button_label(ctx, "Reset Min/Max")) {
         forEach(i, MAX_RECORDED_PASSES) {
             g_gpu_profiler_ui.pass_stats[i].min_ms = g_gpu_profiler_ui.pass_stats[i].time_ms;
@@ -29,9 +31,9 @@ static void render_gpu_profiler_ui(Renderer *r) {
     if (nk_button_label(ctx, "Close"))
         g_gpu_profiler_ui.open = false;
 
-    double frame_ms = ns_to_ms(r->cpu_frame_ns);
+    double frame_ms  = ns_to_ms(r->cpu_frame_ns);
     double active_ms = ns_to_ms(r->cpu_active_ns);
-    double gpu_ms = g_gpu_profiler_ui.total_gpu_time_ms;
+    double gpu_ms    = g_gpu_profiler_ui.total_gpu_time_ms;
     nk_layout_row_dynamic(ctx, 24, 1);
     nk_label_colored(ctx, "Frame Metrics", NK_TEXT_LEFT, nk_rgb(75, 205, 255));
     nk_layout_row_dynamic(ctx, 22, 3);
@@ -101,12 +103,13 @@ static void render_gpu_profiler_ui(Renderer *r) {
         profiler_format_count(primitives, sizeof(primitives), total_primitives);
         nk_labelf(ctx, NK_TEXT_LEFT, "Vertices: %s | Fragments: %s | Clipping primitives: %s", vs, fs, primitives);
     }
-    nk_labelf(ctx, NK_TEXT_LEFT, "Total GPU: %.3f ms | Average: %.3f ms", gpu_ms, g_gpu_profiler_ui.avg_total_gpu_time_ms);
+    nk_labelf(ctx, NK_TEXT_LEFT, "Total GPU: %.3f ms | Average: %.3f ms", gpu_ms,
+              g_gpu_profiler_ui.avg_total_gpu_time_ms);
     nk_layout_row_dynamic(ctx, 65, 1);
     if (nk_chart_begin(ctx, NK_CHART_LINES, GPU_PROF_HISTORY_SIZE, 0.0f,
                        MAX(1.0f, (float)g_gpu_profiler_ui.avg_total_gpu_time_ms * 1.5f))) {
-        forEach(i, GPU_PROF_HISTORY_SIZE)
-            nk_chart_push(ctx, g_gpu_profiler_ui.total_history[(g_gpu_profiler_ui.total_history_idx + i) % GPU_PROF_HISTORY_SIZE]);
+        forEach(i, GPU_PROF_HISTORY_SIZE) nk_chart_push(
+            ctx, g_gpu_profiler_ui.total_history[(g_gpu_profiler_ui.total_history_idx + i) % GPU_PROF_HISTORY_SIZE]);
         nk_chart_end(ctx);
     }
     nk_layout_row_dynamic(ctx, 22, 5);
@@ -135,38 +138,37 @@ static void render_gpu_profiler_ui(Renderer *r) {
             nk_labelf(ctx, NK_TEXT_LEFT, "    VS %s | FS %s | Clipping primitives %s", vs, fs, primitives);
         }
     }
-     /* ---- device memory ---- */
-     {
-         MemStats s;
-         vk_mem_stats(&r->vk, &s);
+    /* ---- device memory ---- */
+    {
+        MemStats s;
+        vk_mem_stats(&r->vk, &s);
 
-         nk_layout_row_dynamic(ctx, 24, 1);
-         nk_label_colored(ctx, "Device Memory", NK_TEXT_LEFT, nk_rgb(75, 205, 255));
-         nk_layout_row_dynamic(ctx, 22, 3);
-         nk_label(ctx, "Tag", NK_TEXT_LEFT);
-         nk_label(ctx, "MB", NK_TEXT_LEFT);
-         nk_label(ctx, "Buf/Img", NK_TEXT_LEFT);
+        nk_layout_row_dynamic(ctx, 24, 1);
+        nk_label_colored(ctx, "Device Memory", NK_TEXT_LEFT, nk_rgb(75, 205, 255));
+        nk_layout_row_dynamic(ctx, 22, 3);
+        nk_label(ctx, "Tag", NK_TEXT_LEFT);
+        nk_label(ctx, "MB", NK_TEXT_LEFT);
+        nk_label(ctx, "Buf/Img", NK_TEXT_LEFT);
 
-         forEach(t, MEM_TAG_COUNT) {
-             if (!s.bytes[t])
-                 continue;
-             nk_label(ctx, kMemTagNames[t], NK_TEXT_LEFT);
-             nk_labelf(ctx, NK_TEXT_LEFT, "%.1f", (double)s.bytes[t] / 1048576.0);
-             char cnt[32];
-             snprintf(cnt, sizeof(cnt), "%u / %u", s.buffers[t], s.images[t]);
-             nk_label(ctx, cnt, NK_TEXT_LEFT);
-         }
-         nk_label(ctx, "TOTAL", NK_TEXT_LEFT);
-         nk_labelf(ctx, NK_TEXT_LEFT, "%.1f", (double)s.total_bytes / 1048576.0);
-         nk_label(ctx, "", NK_TEXT_LEFT);
-         nk_label(ctx, "peak", NK_TEXT_LEFT);
-         nk_labelf(ctx, NK_TEXT_LEFT, "%.1f", (double)s.peak_bytes / 1048576.0);
-         nk_label(ctx, "", NK_TEXT_LEFT);
-         nk_label(ctx, "driver heap", NK_TEXT_LEFT);
-         nk_labelf(ctx, NK_TEXT_LEFT, "%.1f / %.1f", (double)s.heap_used / 1048576.0,
-                   (double)s.heap_budget / 1048576.0);
-         nk_label(ctx, "MB", NK_TEXT_LEFT);
-     }
+        forEach(t, MEM_TAG_COUNT) {
+            if (!s.bytes[t])
+                continue;
+            nk_label(ctx, kMemTagNames[t], NK_TEXT_LEFT);
+            nk_labelf(ctx, NK_TEXT_LEFT, "%.1f", (double)s.bytes[t] / 1048576.0);
+            char cnt[32];
+            snprintf(cnt, sizeof(cnt), "%u / %u", s.buffers[t], s.images[t]);
+            nk_label(ctx, cnt, NK_TEXT_LEFT);
+        }
+        nk_label(ctx, "TOTAL", NK_TEXT_LEFT);
+        nk_labelf(ctx, NK_TEXT_LEFT, "%.1f", (double)s.total_bytes / 1048576.0);
+        nk_label(ctx, "", NK_TEXT_LEFT);
+        nk_label(ctx, "peak", NK_TEXT_LEFT);
+        nk_labelf(ctx, NK_TEXT_LEFT, "%.1f", (double)s.peak_bytes / 1048576.0);
+        nk_label(ctx, "", NK_TEXT_LEFT);
+        nk_label(ctx, "driver heap", NK_TEXT_LEFT);
+        nk_labelf(ctx, NK_TEXT_LEFT, "%.1f / %.1f", (double)s.heap_used / 1048576.0, (double)s.heap_budget / 1048576.0);
+        nk_label(ctx, "MB", NK_TEXT_LEFT);
+    }
 
     nk_layout_row_dynamic(ctx, 22, 1);
     nk_labelf(ctx, NK_TEXT_LEFT, "Timestamp Period: %.2f ns | Query Pool Size: %d passes",
