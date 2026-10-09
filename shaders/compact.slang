@@ -7,6 +7,8 @@
    cs_emit        apply block offsets, write draw commands, zero scatter cursors
    cs_scatter     scatter survivors into their group's contiguous vis range
 
+
+
    The scan carries two lanes because two exclusive scans fall out of one pass:
    vis_base wants the running sum of instance counts, cmd_index wants the
    running sum of "this group is non-empty". Scanning them together halves the

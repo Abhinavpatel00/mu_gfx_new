@@ -252,6 +252,12 @@ Scene *scene_create(VkBackend *vk, const SceneDesc *desc) {
             log_error("[scene] counters host buffer failed");
     }
 
+    /* cull_args has exactly one writer: scene_frame. Seeding it here as well
+       would put two vkCmdCopyBuffer on the same 16 bytes in the first frame's
+       command buffer (the seed, then the reseed this flag forces), with no
+       barrier between them — a WRITE_AFTER_WRITE the validation layer flags. */
+    s->cull_args_dirty = true;
+
     s->staged_vertex_cap = 4096;
     s->staged_vertices   = malloc((size_t)s->staged_vertex_cap * sizeof(struct ScenePackedVertex));
     s->staged_index_cap  = 8192;
@@ -500,23 +506,64 @@ void scene_compact_slots(Scene *s) {
         return;
     /* O(instances) at load time only. Rebuilds the dense slot space and the
        candidate rows from the surviving live records, so holes never accumulate
-       across a session. */
-    uint32_t dyn = 0, sta = 0, row = 0;
+       across a session.
+
+       This must NOT compact in place while scanning forward. The survivor is
+       always at a lower index than the slot being filled, so a forward copy
+       writes into slots the loop has not reached yet and then reads them back as
+       if they were originals — which duplicates live instances and leaves stale
+       ones behind. (That bug did exactly this: 9 of 18 survivors ended up
+       stored twice, which read as cubes overlapping.)
+
+       Two passes instead: one counts and marks, one moves. Still O(n), no
+       allocation, and the move pass only ever writes below the read cursor. */
+    uint32_t dyn = 0, sta = 0;
     for (uint32_t i = 0; i < s->max_instances; ++i) {
         if (!s->cpu_instances[i].alive)
             continue;
-        uint32_t dst = (i >= s->dynamic_capacity) ? (s->dynamic_capacity + sta) : dyn;
-        if (dst != i)
-            s->cpu_instances[dst] = s->cpu_instances[i];
-        s->cpu_rows[row].slot = dst;
-        s->cpu_rows[row].mesh = (uint16_t)s->cpu_instances[dst].mesh;
-        s->row_of[dst]        = row;
-        row++;
         if (i >= s->dynamic_capacity)
             sta++;
         else
             dyn++;
     }
+
+    /* dst[] is scratch. max_instances is a fixed capacity decided at
+       scene_create, so this is a bounded stack-free allocation made once per
+       compaction, which happens at load boundaries and never per event. */
+    uint32_t *dst = malloc((size_t)s->max_instances * sizeof(uint32_t));
+    if (!dst)
+        return;
+
+    uint32_t d = 0, t = 0, row = 0;
+    for (uint32_t i = 0; i < s->max_instances; ++i) {
+        if (!s->cpu_instances[i].alive)
+            continue;
+        dst[i] = (i >= s->dynamic_capacity) ? (s->dynamic_capacity + t) : d;
+        if (i >= s->dynamic_capacity)
+            t++;
+        else
+            d++;
+    }
+
+    /* Second pass: safe to move now, because every destination is known before
+       any copy happens, so no copy can clobber a record the move pass still
+       needs. dst is monotonically non-decreasing, so dst[i] <= i always. */
+    for (uint32_t i = 0; i < s->max_instances; ++i) {
+        if (!s->cpu_instances[i].alive)
+            continue;
+        uint32_t to = dst[i];
+        if (to != i) {
+            s->cpu_instances[to] = s->cpu_instances[i];
+            s->cpu_instances[i].alive = 0;
+            s->row_of[i]              = UINT32_MAX;
+        }
+        s->cpu_rows[row].slot = to;
+        s->cpu_rows[row].mesh = (uint16_t)s->cpu_instances[to].mesh;
+        s->row_of[to]        = row;
+        row++;
+    }
+    free(dst);
+
     s->dynamic_count  = dyn;
     s->static_count   = sta;
     s->instance_count = dyn + sta;
@@ -631,25 +678,15 @@ bool scene_upload_scene(Scene *s, VkCommandBuffer cmd) {
             vf->vis            = alloc_slice(s, (VkDeviceSize)s->max_survivors * sizeof(uint32_t), 16);
             vf->draws          = alloc_slice(s, (VkDeviceSize)G * sizeof(struct SceneGpuDraw), 16);
             vf->draw_count     = alloc_slice(s, sizeof(uint32_t), 16);
-            vf->scan_aux       = alloc_slice(s, (VkDeviceSize)SCENE_SCAN_BLOCK * 3u * sizeof(uint32_t), 16);
+            /* Three regions of uint2: block totals, visibility offsets, draw offsets.
+               The stride must be uint2, not uint: cs_scan_block writes whole
+               uint2 block totals into region 0, so a uint32 stride made every
+               block total overlap the next and corrupted the scan input. */
+            vf->scan_aux = alloc_slice(s, (VkDeviceSize)SCENE_SCAN_BLOCK * 3u * sizeof(SceneU32x2), 16);
             vf->cull_args      = alloc_slice(s, 16, 16);
             vf->group_base     = alloc_slice(s, (VkDeviceSize)s->max_survivors * sizeof(uint32_t), 16);
         }
     }
-    /* Seed each lane's indirect dispatch args. The kernel raises x to the true
-       high-water mark on every run, so this only has to be right once; it is
-       re-seeded whenever the roster changes (scene_instance_create/_destroy),
-       which is why per-frame CPU work does not scale with entity count. */
-    uint32_t seed[4] = {(s->candidate_count + 63u) / 64u, 1u, 1u, 0u};
-    for (uint32_t v = 0; v < SCENE_MAX_VIEWS; ++v) {
-        forEach(i, MAX_FRAMES_IN_FLIGHT) {
-            if (seed[0] == 0)
-                seed[0] = 1;
-            renderer_upload_buffer_to_slice(vk, cmd, s->view_frame[v][i].cull_args, (ByteSpan){seed, sizeof(seed)});
-            seed[0] = (s->candidate_count + 63u) / 64u;
-        }
-    }
-
     /* group templates (one GpuDraw per (mesh,lod) group) */
     s->group_static = alloc_slice(s, (VkDeviceSize)s->group_count * sizeof(struct SceneGpuDraw), 16);
     s->group_mesh   = alloc_slice(s, (VkDeviceSize)s->group_count * sizeof(uint32_t), 16);
@@ -877,13 +914,18 @@ void scene_frame(Scene *s, VkCommandBuffer cmd, RenderTarget *color, RenderTarge
         cp.counts[1]      = G;
         cp.counts[2]      = s->max_survivors;
         cp.counts[4]      = (G + SCENE_SCAN_BLOCK - 1u) / SCENE_SCAN_BLOCK;
-
+        /* DEBUG: shader-side printf. Off by default; it serialises and floods
+           the log, so it is opt-in per run. */
+     //   cp.counts[5]      = getenv("MU_SHADER_DEBUG") ? 1u : 0u;
+        // if (getenv("MU_SHADER_DEBUG") && view == 0 && lane == 0)
+        //     log_info("[dbg] shader printf enable = %u, G = %u", cp.counts[5], G);
+        //
         /* Every table is a slice of one buffer, so naming a slice names a byte
            range. That is the whole point of declaring these instead of
            barriering the pool: the previous code emitted four whole-pool
            barriers per view, implicating 512 MB of unrelated allocations to
            order 32 KB of counts. */
-        BufferAccess cull_reads[6] = {
+        BufferAccess cull_reads[7] = {
             {.slice  = s->instances,
              .stage  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
              .access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT},
@@ -902,6 +944,9 @@ void scene_frame(Scene *s, VkCommandBuffer cmd, RenderTarget *color, RenderTarge
             {.slice  = s->counters[lane],
              .stage  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
              .access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT},
+              {.slice  = vf->cull_args,
+               .stage  = VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT,
+               .access = VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT},
         };
         BufferAccess cull_writes[3] = {
             {.slice  = vf->survivors,
@@ -1007,7 +1052,19 @@ void scene_frame(Scene *s, VkCommandBuffer cmd, RenderTarget *color, RenderTarge
         dispatch_push(vk, cmd, (ByteSpan){&cp, (uint32_t)sizeof(cp)}, cp.counts[4], 1, 1);
         end_pass(vk, cmd, &scan_pass);
 
+        /* cs_scan_blocks READS scan_aux region 0 (the per-block totals cs_scan_block
+           just wrote) and writes regions 1 and 2. Declaring writes only left the
+           read unpublished, so it consumed stale/zero block offsets and every
+           vis_base and cmd_index came out wrong — visible as duplicated and
+           missing slots in vis[] that changed as the camera culled instances. */
+        BufferAccess block_reads[1] = {
+            {.slice  = vf->scan_aux,
+             .stage  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+             .access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT},
+        };
         PassDesc block_pass = {
+            .buf_reads       = block_reads,
+            .buf_read_count  = ARRAY_COUNT(block_reads),
             .buf_writes      = scan_writes,
             .buf_write_count = ARRAY_COUNT(scan_writes),
             .pipeline        = s->cs_scan_blocks,
@@ -1016,9 +1073,22 @@ void scene_frame(Scene *s, VkCommandBuffer cmd, RenderTarget *color, RenderTarge
         dispatch_push(vk, cmd, (ByteSpan){&cp, (uint32_t)sizeof(cp)}, 1, 1, 1);
         end_pass(vk, cmd, &block_pass);
 
+        /* cs_emit reads group_count, group_static and the block offsets in
+           scan_aux regions 1 and 2. */
+        BufferAccess emit_reads[3] = {
+            {.slice  = vf->group_count,
+             .stage  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+             .access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT},
+            {.slice  = s->group_static,
+             .stage  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+             .access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT},
+            {.slice  = vf->scan_aux,
+             .stage  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+             .access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT},
+        };
         PassDesc emit_pass = {
-            .buf_reads       = scan_reads,
-            .buf_read_count  = ARRAY_COUNT(scan_reads),
+            .buf_reads       = emit_reads,
+            .buf_read_count  = ARRAY_COUNT(emit_reads),
             .buf_writes      = scan_writes,
             .buf_write_count = ARRAY_COUNT(scan_writes),
             .pipeline        = s->cs_emit,

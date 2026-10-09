@@ -1,6 +1,16 @@
 #ifndef MU_GFX_VK_H
 #define MU_GFX_VK_H
-
+#define vkCmdCopyBuffer(cmd, src, dst, count, regions) \
+    do { \
+        for (uint32_t i = 0; i < (count); ++i) { \
+            const VkBufferCopy *r = &(regions)[i]; \
+            log_debug("[COPY] %s:%d dst=%p off=%llu size=%llu", \
+                __FILE__, __LINE__, (void *)(dst), \
+                (unsigned long long)r->dstOffset, \
+                (unsigned long long)r->size); \
+        } \
+        (vkCmdCopyBuffer)((cmd), (src), (dst), (count), (regions)); \
+    } while (0)
 #include "external/mu/mu/mu_span.h"
 #include "external/mu/offset_allocator.h"
 #include "src/helpers.h"

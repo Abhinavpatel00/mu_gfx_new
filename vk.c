@@ -1525,6 +1525,25 @@ bool renderer_upload_buffer_to_slice(VkBackend *r, VkCommandBuffer cmd, BufferSl
     };
     vkCmdCopyBuffer(cmd, staging_slice.buffer, dst_slice.buffer, 1, &copy);
 
+    VkBufferMemoryBarrier2 copy_barrier = {
+        .sType               = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2,
+        .srcStageMask        = VK_PIPELINE_STAGE_2_COPY_BIT,
+        .srcAccessMask       = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+        .dstStageMask        = VK_PIPELINE_STAGE_2_COPY_BIT,
+        .dstAccessMask       = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .buffer              = dst_slice.buffer,
+        .offset              = dst_slice.offset,
+        .size                = dst_slice.size,
+    };
+    VkDependencyInfo copy_dependency = {
+        .sType                    = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+        .bufferMemoryBarrierCount = 1,
+        .pBufferMemoryBarriers    = &copy_barrier,
+    };
+    vkCmdPipelineBarrier2(cmd, &copy_dependency);
+
     return true;
 }
 
@@ -2597,7 +2616,9 @@ static void emit_root_data(VkBackend *r, VkCommandBuffer cmd, ByteSpan root) {
     assert(root.size % 4 == 0 && "root payload must be a multiple of 4 bytes");
     assert(root.size <= 256 && "root payload exceeds the 256-byte push-constant range");
     assert(root.size > 0 && "empty root payload; pass a real struct or drop the argument");
-    push_constants(r, cmd, root);
+    uint32_t payload[256 / sizeof(uint32_t)] = {0};
+    memcpy(payload, root.data, root.size);
+    push_constants(r, cmd, (ByteSpan){payload, sizeof(payload)});
 }
 
 void cmd_draw(VkBackend *r, VkCommandBuffer cmd, ByteSpan root, uint32_t vertex_count,
@@ -3112,9 +3133,9 @@ void vk_backend_create(VkBackend *r, VkBackendDesc *desc) {
             tail                                     = (VkBaseOutStructure *)&r->info.feature_chain.maintenance5;
         }
 
-        if (desc->enable_debug_printf &&
-            device_has_extension(r->devc.physical_device, VK_KHR_SHADER_NON_SEMANTIC_INFO_EXTENSION_NAME)) {
-        }
+
+
+
 
         tail->pNext = NULL;
     }

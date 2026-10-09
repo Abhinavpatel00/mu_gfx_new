@@ -181,7 +181,8 @@ struct SceneCompactPush {
     SCENE_PTR(SCENE_U32X2) scan_aux;
     SCENE_PTR(SCENE_U32) counters;
     SCENE_PTR(SCENE_U32) group_base; /* vis_base -> group id, for the VS */
-    SCENE_U32 counts[8];             /* 0 lod_count, 1 group_count G, 2 max_survivors, 3 reserved, 4 blocks */
+    SCENE_U32 counts[8];             /* 0 lod_count, 1 group_count G, 2 max_survivors, 3 reserved, 4 blocks,
+                                        5 debug printf enable */
 };
 
 #undef SCENE_PTR

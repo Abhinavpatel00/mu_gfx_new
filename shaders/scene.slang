@@ -90,9 +90,20 @@ void cs_cull(uint3 gid : SV_GroupID, uint3 tid : SV_DispatchThreadID)
 
     if (!frustum_visible(c, r))
     {
+        if (tid.x == 0u) printf("[PROBE] cs_cull alive counts5=%u\n", pc.counts[5]);
+    if (pc.counts[5] != 0u) /* DEBUG: identity of the rejected candidate */
+            printf("[CULLED] cand=%u slot=%u mesh=%u center=(%.4f, %.4f, %.4f) r=%.4f\n",
+                   tid.x, cr.slot, cr.mesh, c.x, c.y, c.z, r);
+
         InterlockedAdd(pc.counters[SCENE_COUNTER_FRUSTUM], 1u);
         return;
     }
+
+    if (pc.counts[5] != 0u) /* DEBUG: sphere that passed, plus the true origin */
+        printf("[CULL] cand=%u slot=%u mesh=%u center=(%.4f, %.4f, %.4f) r=%.4f "
+               "origin=(%.4f, %.4f, %.4f)\n",
+               tid.x, cr.slot, cr.mesh, c.x, c.y, c.z, r,
+               float(inst.pos[0]), float(inst.pos[1]), float(inst.pos[2]));
 
     /* LOD is arithmetic on data the visibility test already produced. The
        ladder walk is a no-op until the asset carries rungs (lod_count == 1). */
@@ -156,6 +167,10 @@ SceneVOut vs_main(uint vid : SV_VertexID, uint iid : SV_InstanceID, uint base_in
     float  s     = f16tof32(inst.scale);
     float3 ipos  = float3(inst.pos[0], inst.pos[1], inst.pos[2]);
     float3 world = ipos + quat_rotate(inst.quat, local * s);
+
+    if (pc.counts[5] != 0u && iid == base_inst) /* DEBUG: one line per instance */
+        printf("[VS] base=%u iid=%u group=%u mesh=%u slot=%u pos=(%.4f, %.4f, %.4f)\n",
+               base_inst, iid, group, mesh, slot, world.x, world.y, world.z);
     float3 nrm   = quat_rotate(inst.quat, unpack_oct(v.normal_oct));
 
     SceneVOut o;

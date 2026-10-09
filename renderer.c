@@ -822,7 +822,7 @@ Renderer *renderer_create(bool use_wayland, GameHooks game) {
         .instance_layer_count        = 0,
         .instance_extension_count    = (uint32_t)platform_ext_count,
         .device_extension_count      = 2,
-        .enable_gpu_based_validation = false,
+        .enable_gpu_based_validation = true,
         .enable_validation           = VALIDATION,
 
         .validation_severity =
@@ -839,7 +839,7 @@ Renderer *renderer_create(bool use_wayland, GameHooks game) {
         .swapchain_extra_usage_flags =
             VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
         .vsync               = false,
-        .enable_debug_printf = false,
+        .enable_debug_printf = true ,
 
         .bindless_sampled_image_count     = MAX_BINDLESS_TEXTURES,
         .bindless_sampler_count           = MAX_BINDLESS_SAMPLERS,
