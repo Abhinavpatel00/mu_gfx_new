@@ -1,5 +1,6 @@
 #include "vk.h"
 #include "external/mu/mu/mu_perf.h"
+#include <vulkan/vulkan_core.h>
 
 static bool is_instance_extension_supported(const char *extension_name) {
     uint32_t extensionCount = 0;
@@ -3386,7 +3387,9 @@ void vk_backend_create(VkBackend *r, VkBackendDesc *desc) {
                          2048);
         buffer_pool_init(r, BUFFER_POOL_TLSF, &r->gpu_pool, desc->size_of_gpu_pool,
                          VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
-                             VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT |
+                     
+                             VK_BUFFER_USAGE_TRANSFER_SRC_BIT| 
+                         VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT |
                              VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
                          VMA_MEMORY_USAGE_GPU_ONLY, 0, 2048);
         buffer_pool_init(r, BUFFER_POOL_RING, &r->staging_pool, desc->size_of_staging_pool,
