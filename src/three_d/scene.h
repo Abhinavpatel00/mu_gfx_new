@@ -19,6 +19,10 @@ typedef struct SceneDesc {
     uint32_t max_lod_rows;
     uint32_t max_materials;
     uint32_t max_survivors; /* candidates-style upper bound on visible entries */
+
+
+
+
 } SceneDesc;
 
 typedef struct SceneMeshDesc {

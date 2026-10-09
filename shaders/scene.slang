@@ -56,27 +56,11 @@ static bool frustum_visible(float3 c, float r)
     return true;
 }
 
-/* ---- dispatch args, written by the CPU and read by vkCmdDispatchIndirect ----
-   A VkDispatchIndirectCommand triple: x = workgroups, y = z = 1. The CPU only
-   touches it when the candidate roster changes (insert/destroy), never per
-   frame, so per-frame CPU work stays proportional to classes x views rather
-   than to entity count. */
-struct SceneDispatchArgs { SceneU32 x, y, z; };
-
 /* ---- T2: cull. One thread per candidate. ---- */
 [shader("compute")]
 [numthreads(64, 1, 1)]
 void cs_cull(uint3 gid : SV_GroupID, uint3 tid : SV_DispatchThreadID)
 {
-    /* The dispatch is indirect, so the CPU's idea of the workgroup count may
-       lag a roster change by a frame. Publishing the real high-water mark here
-       means the next frame's indirect dispatch is never short, whatever the
-       CPU last wrote. */
-    if (gid.x == 0u)
-        InterlockedMax(pc.cull_args[0], gid.x + 1u);
-    pc.cull_args[1] = 1u;
-    pc.cull_args[2] = 1u;
-
     if (tid.x >= pc.counts[1])
         return;
 
@@ -90,8 +74,7 @@ void cs_cull(uint3 gid : SV_GroupID, uint3 tid : SV_DispatchThreadID)
 
     if (!frustum_visible(c, r))
     {
-        if (tid.x == 0u) printf("[PROBE] cs_cull alive counts5=%u\n", pc.counts[5]);
-    if (pc.counts[5] != 0u) /* DEBUG: identity of the rejected candidate */
+        if (pc.counts[5] != 0u) /* DEBUG: identity of the rejected candidate */
             printf("[CULLED] cand=%u slot=%u mesh=%u center=(%.4f, %.4f, %.4f) r=%.4f\n",
                    tid.x, cr.slot, cr.mesh, c.x, c.y, c.z, r);
 

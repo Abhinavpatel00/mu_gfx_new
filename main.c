@@ -909,6 +909,7 @@ typedef struct FlyCam {
 typedef struct CubePets {
     VkBackend *vk;
     Scene     *scene;
+    void      *renderer; /* TEMP: for the auto-screenshot probe */
 
     FlyCam cam;
     float  yaw;
@@ -967,6 +968,7 @@ static void pets_build_cubes(Scene *scene) {
 static void pets_start(void *user, Renderer *renderer) {
     CubePets *p   = (CubePets *)user;
     p->vk         = renderer_vk(renderer);
+    p->renderer   = renderer; /* TEMP */
     p->dist       = 34.0f;
     p->cam.pos[0] = 0.0f;
     p->cam.pos[1] = 6.0f;
@@ -1209,6 +1211,14 @@ static void pets_render(void *user, VkCommandBuffer cmd, RenderTarget *color, Re
     vd.near_z        = 0.1f;
     vd.far_z         = 400.0f;
     scene_view_set(p->scene, 0, &vd);
+
+    /* TEMP instrumentation: auto-screenshot once the scene has rendered. */
+    {
+        bool capture_take_screenshot(void *renderer, const char *path);
+        static int shot = 0;
+        if (++shot == 180)
+            capture_take_screenshot(p->renderer, "/tmp/kilo/cubepets_shot.png");
+    }
 
     scene_frame(p->scene, cmd, color, depth);
 }
