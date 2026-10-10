@@ -101,6 +101,13 @@ void scene_instance_set(Scene *s, uint32_t slot, const SceneInstanceDesc *desc);
 void scene_instance_destroy(Scene *s, uint32_t slot);
 bool scene_instance_alive(const Scene *s, uint32_t slot);
 
+/* Per-instance bloom. Strength rides HDR alpha into the bloom bright-pass:
+   0 (the default) excludes the instance, >0 includes it with that weight.
+   Membership is a mu_bitset plus a dense list rebuilt on upload; the GPU
+   table is uploaded whole when dirty. */
+void  scene_set_instance_bloom(Scene *s, uint32_t slot, float strength);
+float scene_instance_bloom(const Scene *s, uint32_t slot);
+
 /* Reclaims retired slots. O(instances); call at load time, never per event. */
 void scene_compact_slots(Scene *s);
 
@@ -162,6 +169,37 @@ typedef struct SceneAssetProbe {
     uint32_t index_count;
     uint32_t max_lod_count; /* deepest ladder any one mesh carries */
 } SceneAssetProbe;
+
+typedef struct EffectsTable{ 
+
+
+
+
+
+
+
+
+
+
+
+
+}EffectsTable;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 bool scene_asset_probe(const char *path, SceneAssetProbe *out, char *err, uint32_t err_cap);
 

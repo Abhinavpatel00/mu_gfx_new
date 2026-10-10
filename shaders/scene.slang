@@ -41,6 +41,7 @@ struct SceneVOut {
     float2               uv       : TEXCOORD1;
     nointerpolation uint material : TEXCOORD2;
     float3               world    : TEXCOORD3; /* the eye vector needs the world point, not the clip one */
+    nointerpolation float bloom  : TEXCOORD4; /* per-instance bloom strength, 0 = excluded */
 };
 
 [shader("vertex")]
@@ -79,6 +80,7 @@ SceneVOut vs_main(uint vid : SV_VertexID, uint iid : SV_InstanceID, uint base_in
     o.uv       = unpack_half2(v.uv);
     o.material = gs.material;
     o.world    = world;
+    o.bloom    = pc.bloom[slot];
     return o;
 }
 
@@ -120,7 +122,7 @@ float4 fs_main(SceneVOut i) : SV_Target0
         albedo *= textures[NonUniformResourceIndex(m.texture)].Sample(samplers[SCENE_SAMPLER], i.uv).rgb;
 
     if ((m.flags & SCENE_MAT_UNLIT) != 0u)
-        return float4(albedo, 1.0f);
+        return float4(albedo, i.bloom);
 
     float3 n = normalize(i.normal);
     float  ao = 1.0f;
@@ -175,6 +177,7 @@ float4 fs_main(SceneVOut i) : SV_Target0
 
     /* Linear HDR. Tonemapping and the output gamma live in the post pass now,
        so exposure, bloom and color grading all see the same linear values
-       instead of grading an already-encoded image. */
-    return float4(direct + ambient, 1.0f);
+       instead of grading an already-encoded image. Alpha carries the
+       per-instance bloom strength into the bloom bright-pass. */
+    return float4(direct + ambient, i.bloom);
 }
