@@ -173,9 +173,8 @@ float4 fs_main(SceneVOut i) : SV_Target0
        because kd -> 0 and there is no other light for it to reflect. */
     float3 ambient = (kd * albedo + f0) * pc.sun.w * ao;
 
-    /* ACES filmic (Narkowicz fit): a cheap curve that keeps a highlight
-       roll-off instead of Reinhard's washed-out shoulder. */
-    float3 color = direct + ambient;
-    color        = saturate((color * (2.51f * color + 0.03f)) / (color * (2.43f * color + 0.59f) + 0.14f));
-    return float4(pow(color, float3(1.0f / 2.2f)), 1.0f);
+    /* Linear HDR. Tonemapping and the output gamma live in the post pass now,
+       so exposure, bloom and color grading all see the same linear values
+       instead of grading an already-encoded image. */
+    return float4(direct + ambient, 1.0f);
 }

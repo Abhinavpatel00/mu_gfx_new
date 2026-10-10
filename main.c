@@ -250,6 +250,10 @@ static void pets_frame(void *user, const GameFrame *frame) {
 static void pets_render(void *user, VkCommandBuffer cmd, RenderTarget *color, RenderTarget *depth) {
     CubePets *p = (CubePets *)user;
 
+    /* The Color Grade window owns the toon switch; mirror it onto the scene. */
+    if (p->scene)
+        scene_set_toon(p->scene, renderer_toon(p->renderer));
+
     if (!p->scene) {
         /* Capacities come from the assets themselves rather than from a
            constant: mesh and LOD capacities are fixed at scene_create and

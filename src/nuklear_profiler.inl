@@ -193,3 +193,63 @@ static void render_game_ui(Renderer *r) {
         nk_label(ctx, r->hud_text[i], NK_TEXT_LEFT);
     nk_end(ctx);
 }
+
+/* Live color-grade controls. Every slider writes the same PostSettings the
+   post pass reads, so tweaks land on the next frame with no rebuild. */
+static void render_grade_ui(Renderer *r) {
+    struct nk_context *ctx = &r->ui.context;
+    PostSettings      *s   = &r->post;
+
+    if (!nk_begin(ctx, "Color Grade", nk_rect(440.0f, 10.0f, 320.0f, 640.0f),
+                  NK_WINDOW_BORDER | NK_WINDOW_MOVABLE | NK_WINDOW_TITLE | NK_WINDOW_SCROLL_AUTO_HIDE)) {
+        nk_end(ctx);
+        return;
+    }
+
+    nk_layout_row_dynamic(ctx, 24, 1);
+    int toon = s->toon ? 1 : 0;
+    nk_checkbox_label(ctx, "Toon shade", &toon);
+    s->toon = toon != 0;
+
+    static const char *modes[] = {"Neutral", "ACES", "Reinhard", "Reinhard2", "Filmic", "Uncharted2", "Unreal"};
+    nk_label(ctx, "Tonemap", NK_TEXT_LEFT);
+    s->tonemap_mode =
+        (uint32_t)nk_combo(ctx, modes, (int)(sizeof(modes) / sizeof(modes[0])), (int)s->tonemap_mode, 22, nk_vec2(220, 200));
+
+    nk_layout_row_dynamic(ctx, 22, 1);
+    nk_property_float(ctx, "Exposure", -4.0f, &s->exposure, 4.0f, 0.01f, 0.01f);
+    nk_property_float(ctx, "Gamma", 1.0f, &s->gamma, 3.0f, 0.01f, 0.01f);
+    nk_property_float(ctx, "Contrast", 0.0f, &s->contrast, 2.0f, 0.01f, 0.01f);
+    nk_property_float(ctx, "Saturation", 0.0f, &s->saturation, 3.0f, 0.01f, 0.01f);
+    nk_property_float(ctx, "Temperature", -0.5f, &s->temperature, 0.5f, 0.01f, 0.01f);
+    nk_property_float(ctx, "Tint", -0.5f, &s->tint, 0.5f, 0.01f, 0.01f);
+
+    nk_layout_row_dynamic(ctx, 22, 1);
+    nk_property_float(ctx, "Lift R", -0.3f, &s->lift[0], 0.3f, 0.01f, 0.01f);
+    nk_property_float(ctx, "Lift G", -0.3f, &s->lift[1], 0.3f, 0.01f, 0.01f);
+    nk_property_float(ctx, "Lift B", -0.3f, &s->lift[2], 0.3f, 0.01f, 0.01f);
+    nk_property_float(ctx, "Gain R", 0.0f, &s->gain[0], 2.0f, 0.01f, 0.01f);
+    nk_property_float(ctx, "Gain G", 0.0f, &s->gain[1], 2.0f, 0.01f, 0.01f);
+    nk_property_float(ctx, "Gain B", 0.0f, &s->gain[2], 2.0f, 0.01f, 0.01f);
+
+    nk_layout_row_dynamic(ctx, 22, 1);
+    nk_property_float(ctx, "Bloom", 0.0f, &s->bloom_strength, 3.0f, 0.01f, 0.01f);
+    nk_property_float(ctx, "Bloom threshold", 0.0f, &s->bloom_threshold, 3.0f, 0.01f, 0.01f);
+    nk_property_float(ctx, "Bloom knee", 0.001f, &s->bloom_knee, 1.0f, 0.001f, 0.001f);
+
+    nk_layout_row_dynamic(ctx, 22, 1);
+    nk_property_float(ctx, "Vignette", 0.0f, &s->vignette, 1.0f, 0.01f, 0.01f);
+    nk_property_float(ctx, "Vignette soft", 0.0f, &s->vignette_smoothness, 1.0f, 0.01f, 0.01f);
+    nk_property_float(ctx, "Sharpen", 0.0f, &s->sharpen, 2.0f, 0.01f, 0.01f);
+    nk_property_float(ctx, "Chromatic ab.", 0.0f, &s->ca, 2.0f, 0.01f, 0.01f);
+    nk_property_float(ctx, "Grain", 0.0f, &s->grain, 0.3f, 0.001f, 0.001f);
+    nk_property_float(ctx, "Sepia", 0.0f, &s->sepia, 1.0f, 0.01f, 0.01f);
+    nk_property_float(ctx, "Dither", 0.0f, &s->dither, 2.0f, 0.01f, 0.01f);
+    nk_property_float(ctx, "LUT strength", 0.0f, &s->lut_strength, 1.0f, 0.01f, 0.01f);
+
+    nk_layout_row_dynamic(ctx, 26, 1);
+    if (nk_button_label(ctx, "Reset (Cartoon)"))
+        r->post = post_settings_cartoon();
+
+    nk_end(ctx);
+}
