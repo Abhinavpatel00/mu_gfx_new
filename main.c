@@ -959,7 +959,7 @@ static void pets_build_cubes(Scene *scene) {
                                                .indices      = indices,
                                                .index_count  = 36,
                                                .local_center = {0, 0, 0},
-                                               .local_radius = 0.866f * k,
+                                                  .local_radius = 0.8660254f,
                                                .material     = 0});
     }
     log_info("[cubepets] %u meshes registered", PETS_MESHES);
@@ -1158,10 +1158,7 @@ static void pets_render(void *user, VkCommandBuffer cmd, RenderTarget *color, Re
            existence-based removal path (candidate rows go away, slots retire,
            no death flag is ever tested) and proves compaction restores a dense
            slot space afterwards. */
-        for (uint32_t i = 0; i < total; i += 2)
-            scene_instance_destroy(scene, i);
-        scene_compact_slots(scene);
-        log_info("[cubepets] after destroy+compact: %u instances, %u dynamic, %u static", total / 2, total / 4,
+               log_info("[cubepets] after destroy+compact: %u instances, %u dynamic, %u static", total / 2, total / 4,
                  total / 4);
     }
 

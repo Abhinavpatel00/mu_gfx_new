@@ -240,7 +240,7 @@ typedef struct VkBackendCaps {
     bool maintenance4;
     bool bindless_textures;
 
-    bool sampler_anisotropy;    // NEW
+    bool sampler_anisotropy; // NEW
     bool draw_indirect_first_instance;
     bool atomic_int64;          // NEW
     bool scalar_block_layout;   // NEW
@@ -253,16 +253,16 @@ typedef struct VkBackendCaps {
 
 static VkBackendCaps default_caps(void) {
     return (VkBackendCaps){
-        .dynamic_rendering         = true,
-        .sync2                     = true,
-        .descriptor_indexing       = true,
-        .timeline_semaphores       = true,
-        .multi_draw_indirect       = true,
-        .multi_draw_indirect_count = true,
+        .dynamic_rendering            = true,
+        .sync2                        = true,
+        .descriptor_indexing          = true,
+        .timeline_semaphores          = true,
+        .multi_draw_indirect          = true,
+        .multi_draw_indirect_count    = true,
         .draw_indirect_first_instance = true,
-        .buffer_device_address     = true,
-        .maintenance4              = true,
-        .bindless_textures         = true,
+        .buffer_device_address        = true,
+        .maintenance4                 = true,
+        .bindless_textures            = true,
 
         .sampler_anisotropy        = true,
         .atomic_int64              = true,
@@ -308,7 +308,8 @@ static void apply_caps(VkFeatureChain *f, const VkBackendCaps *caps) {
 
     TRY_ENABLE(sampler_anisotropy, f->core.features.samplerAnisotropy, "samplerAnisotropy");
     TRY_ENABLE(multi_draw_indirect, f->core.features.multiDrawIndirect, "multi-draw indirect");
-    TRY_ENABLE(draw_indirect_first_instance, f->core.features.drawIndirectFirstInstance, "draw indirect first instance");
+    TRY_ENABLE(draw_indirect_first_instance, f->core.features.drawIndirectFirstInstance,
+               "draw indirect first instance");
     TRY_ENABLE(pipeline_statistics_query, f->core.features.pipelineStatisticsQuery, "pipeline statistics query");
     TRY_ENABLE(dynamic_rendering, f->v13.dynamicRendering, "dynamic rendering");
     TRY_ENABLE(sync2, f->v13.synchronization2, "synchronization2");
@@ -553,11 +554,12 @@ static VkPipelineCache pipeline_cache_load_or_create(VkDevice device, VkPhysical
 
     if (res != VK_SUCCESS) {
 
-    fallback: {
-        VkPipelineCacheCreateInfo empty = {.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+    fallback:
+        {
+            VkPipelineCacheCreateInfo empty = {.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
 
-        vkCreatePipelineCache(device, &empty, NULL, &cache);
-    }
+            vkCreatePipelineCache(device, &empty, NULL, &cache);
+        }
     }
 
     return cache;
@@ -690,7 +692,7 @@ static VkExtent2D choose_extent(const VkSurfaceCapabilitiesKHR *caps, uint32_t d
 }
 
 static VkSurfaceFormatKHR select_surface_format(VkPhysicalDevice gpu, VkSurfaceKHR surface, VkFormat preferred,
-                                         VkColorSpaceKHR preferred_cs) {
+                                                VkColorSpaceKHR preferred_cs) {
     uint32_t count = 0;
     vkGetPhysicalDeviceSurfaceFormatsKHR(gpu, surface, &count, NULL);
 
@@ -846,7 +848,7 @@ void vk_swapchain_destroy(VkDevice device, FlowSwapchain *swapchain, mu_id_pool 
 }
 
 void vk_swapchain_recreate(VkDevice device, VkPhysicalDevice gpu, FlowSwapchain *sc, uint32_t new_w, uint32_t new_h,
-                           VkQueue graphics_queue, VkCommandPool one_time_pool, VkBackend *r){
+                           VkQueue graphics_queue, VkCommandPool one_time_pool, VkBackend *r) {
     if (new_w == 0 || new_h == 0)
         return;
 
@@ -861,8 +863,8 @@ void vk_swapchain_recreate(VkDevice device, VkPhysicalDevice gpu, FlowSwapchain 
     // reusing vk_swapchain_destroy. It destroys images views, semaphores,
     // frees id-pool entries and memsets its argument, so operate on a copy and
     // keep the old VkSwapchainKHR handle alive for oldSwapchain reuse.
-    VkSwapchainKHR   old       = sc->swapchain;
-    FlowSwapchain    old_state = *sc;
+    VkSwapchainKHR old       = sc->swapchain;
+    FlowSwapchain  old_state = *sc;
     // Keep the old VkSwapchainKHR alive for oldSwapchain reuse below; only
     // destroy its views/semaphores/bindless slots here.
     old_state.swapchain = VK_NULL_HANDLE;
@@ -906,11 +908,8 @@ static MU_INLINE VkImageAspectFlags get_image_aspect(VkFormat format) {
    Sizes are what VMA handed out, which is what actually occupies a block. */
 
 const char *const kMemTagNames[MEM_TAG_COUNT] = {
-    [MEM_TAG_CORE]     = "core",
-    [MEM_TAG_POST]     = "post",
-    [MEM_TAG_TWO_D]    = "two_d",
-    [MEM_TAG_PICTURE]  = "picture",
-    [MEM_TAG_SCENE_3D] = "scene_3d",
+    [MEM_TAG_CORE] = "core",       [MEM_TAG_POST] = "post",         [MEM_TAG_TWO_D] = "two_d",
+    [MEM_TAG_PICTURE] = "picture", [MEM_TAG_SCENE_3D] = "scene_3d",
 };
 
 MemTag vk_mem_set_tag(VkBackend *r, MemTag tag) {
@@ -966,10 +965,10 @@ static void mem_query(VkBackend *r, VmaAllocation allocation, VmaAllocationInfo 
 void vk_mem_stats(VkBackend *r, MemStats *out) {
     *out = (MemStats){0};
     forEach(t, MEM_TAG_COUNT) {
-        out->bytes[t]      = r->mem.bytes[t];
-        out->buffers[t]    = r->mem.buffers[t];
-        out->images[t]     = r->mem.images[t];
-        out->total_bytes  += r->mem.bytes[t];
+        out->bytes[t]   = r->mem.bytes[t];
+        out->buffers[t] = r->mem.buffers[t];
+        out->images[t]  = r->mem.images[t];
+        out->total_bytes += r->mem.bytes[t];
     }
     out->peak_bytes = r->mem.peak_bytes;
 
@@ -980,7 +979,7 @@ void vk_mem_stats(VkBackend *r, MemStats *out) {
     VmaBudget budgets[VK_MAX_MEMORY_HEAPS];
     vmaGetHeapBudgets(r->devc.vmaallocator, budgets);
     forEach(h, props.memoryHeapCount) {
-        out->heap_used   += budgets[h].usage;
+        out->heap_used += budgets[h].usage;
         out->heap_budget += budgets[h].budget;
     }
 }
@@ -1405,8 +1404,6 @@ bool buffer_pool_init(VkBackend *r,
     return true;
 }
 
-
-
 void buffer_pool_destroy(VkBackend *r, BufferPool *pool) {
     if (!r || !pool)
         return;
@@ -1476,7 +1473,7 @@ BufferSlice buffer_pool_alloc(BufferPool *pool, VkDeviceSize size_bytes, VkDevic
         offset           = a.offset;
         slice.allocation = a;
         if (a.metadata < pool->state_count) {
-            slice.state = &pool->states[a.metadata];
+            slice.state  = &pool->states[a.metadata];
             *slice.state = (BufferState){0};
         }
     } break;
@@ -1511,7 +1508,6 @@ void buffer_pool_free(BufferSlice slice) {
 // macro form is a compound literal, so the referenced value only needs to live
 // through the call. (Promote to external/mu when a second span type is needed.)
 
-
 // Staging-slot alignment is backend policy (256 covers noncoherent atom size and
 // keeps ring slots cache-line friendly); callers never pass it.
 #define STAGING_ALIGNMENT_DEFAULT 256
@@ -1535,9 +1531,8 @@ bool renderer_upload_buffer_to_slice(VkBackend *r, VkCommandBuffer cmd, BufferSl
         .size      = data.size,
     };
     if (dst_slice.state && dst_slice.state->valid) {
-        cmd_buffer_barrier(cmd, dst_slice.buffer, dst_slice.offset, dst_slice.size,
-                           dst_slice.state->stage, dst_slice.state->access,
-                           VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+        cmd_buffer_barrier(cmd, dst_slice.buffer, dst_slice.offset, dst_slice.size, dst_slice.state->stage,
+                           dst_slice.state->access, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
     }
 
     vkCmdCopyBuffer(cmd, staging_slice.buffer, dst_slice.buffer, 1, &copy);
@@ -1567,7 +1562,8 @@ BufferSlice renderer_upload_buffer(VkBackend *r, VkCommandBuffer cmd, ByteSpan d
 
     return dst_slice;
 }
-bool create_buffer(VkBackend *r, VkDeviceSize size, VkBufferUsageFlags usage, VmaMemoryUsage memory_usage, Buffer *out) {
+bool create_buffer(VkBackend *r, VkDeviceSize size, VkBufferUsageFlags usage, VmaMemoryUsage memory_usage,
+                   Buffer *out) {
     VkBufferCreateInfo buffer_info = {
         .sType       = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
         .size        = size,
@@ -1575,8 +1571,8 @@ bool create_buffer(VkBackend *r, VkDeviceSize size, VkBufferUsageFlags usage, Vm
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
     };
     VmaAllocationCreateInfo alloc_info = {.usage     = memory_usage,
-                                          .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
-                                                   VMA_ALLOCATION_CREATE_MAPPED_BIT,
+                                          .flags     = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
+                                                       VMA_ALLOCATION_CREATE_MAPPED_BIT,
                                           .pUserData = mem_tag_data(r)};
 
     if (vmaCreateBuffer(r->devc.vmaallocator, &buffer_info, &alloc_info, &out->buffer, &out->allocation, NULL) !=
@@ -1605,17 +1601,16 @@ bool create_buffer(VkBackend *r, VkDeviceSize size, VkBufferUsageFlags usage, Vm
     return true;
 }
 bool create_device_buffer(VkBackend *r, VkDeviceSize size, VkBufferUsageFlags usage, Buffer *out) {
-    *out = (Buffer){0};
+    *out                           = (Buffer){0};
     VkBufferCreateInfo buffer_info = {
-        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-        .size = size,
-        .usage = usage,
+        .sType       = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size        = size,
+        .usage       = usage,
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
     };
-    VmaAllocationCreateInfo alloc_info = {.usage     = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
-                                          .pUserData = mem_tag_data(r)};
-    if (vmaCreateBuffer(r->devc.vmaallocator, &buffer_info, &alloc_info,
-                        &out->buffer, &out->allocation, NULL) != VK_SUCCESS)
+    VmaAllocationCreateInfo alloc_info = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE, .pUserData = mem_tag_data(r)};
+    if (vmaCreateBuffer(r->devc.vmaallocator, &buffer_info, &alloc_info, &out->buffer, &out->allocation, NULL) !=
+        VK_SUCCESS)
         return false;
     out->buffer_size = size;
 
@@ -1624,7 +1619,7 @@ bool create_device_buffer(VkBackend *r, VkDeviceSize size, VkBufferUsageFlags us
     mem_note_create(r, &mem_info, false);
     if (usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT) {
         VkBufferDeviceAddressInfo address_info = {
-            .sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO,
+            .sType  = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO,
             .buffer = out->buffer,
         };
         out->address = vkGetBufferDeviceAddress(r->devc.device, &address_info);
@@ -1905,27 +1900,25 @@ bool rt_resize(VkBackend *r, RenderTarget *rt, uint32_t width, uint32_t height)
 // [0, VK_LOD_CLAMP_NONE]. Name only deltas. Backend-only Vk fields (border color,
 // unnormalized coordinates, etc.) still go through the raw path.
 
-
 static inline VkSamplerCreateInfo sampler_info_from_desc(const SamplerDesc *d) {
     VkSamplerCreateInfo ci = {
-        .sType        = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
-        .magFilter    = d->mag_filter ? d->mag_filter : VK_FILTER_LINEAR,
-        .minFilter    = d->min_filter ? d->min_filter : VK_FILTER_LINEAR,
-        .mipmapMode   = d->nearest_mips ? VK_SAMPLER_MIPMAP_MODE_NEAREST : VK_SAMPLER_MIPMAP_MODE_LINEAR,
-        .addressModeU = d->clamp_mode_override ? d->clamp_mode_override
-                                               : (d->address_u ? d->address_u : VK_SAMPLER_ADDRESS_MODE_REPEAT),
-        .addressModeV = d->clamp_mode_override ? d->clamp_mode_override
-                                               : (d->address_v ? d->address_v : VK_SAMPLER_ADDRESS_MODE_REPEAT),
-        .addressModeW = d->clamp_mode_override ? d->clamp_mode_override
-                                               : (d->address_w ? d->address_w : VK_SAMPLER_ADDRESS_MODE_REPEAT),
+        .sType            = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+        .magFilter        = d->mag_filter ? d->mag_filter : VK_FILTER_LINEAR,
+        .minFilter        = d->min_filter ? d->min_filter : VK_FILTER_LINEAR,
+        .mipmapMode       = d->nearest_mips ? VK_SAMPLER_MIPMAP_MODE_NEAREST : VK_SAMPLER_MIPMAP_MODE_LINEAR,
+        .addressModeU     = d->clamp_mode_override ? d->clamp_mode_override
+                                                   : (d->address_u ? d->address_u : VK_SAMPLER_ADDRESS_MODE_REPEAT),
+        .addressModeV     = d->clamp_mode_override ? d->clamp_mode_override
+                                                   : (d->address_v ? d->address_v : VK_SAMPLER_ADDRESS_MODE_REPEAT),
+        .addressModeW     = d->clamp_mode_override ? d->clamp_mode_override
+                                                   : (d->address_w ? d->address_w : VK_SAMPLER_ADDRESS_MODE_REPEAT),
         .anisotropyEnable = d->anisotropic ? VK_TRUE : VK_FALSE,
         .maxAnisotropy    = d->anisotropic ? 16.0f : 1.0f,
         .compareEnable    = d->compare_enabled ? VK_TRUE : VK_FALSE,
-        .compareOp        = d->compare_enabled ? (d->compare ? d->compare : VK_COMPARE_OP_LESS_OR_EQUAL)
-                                               : VK_COMPARE_OP_NEVER,
-        .minLod           = 0.0f,
-        .maxLod           = VK_LOD_CLAMP_NONE,
-        .borderColor      = d->border_color ? d->border_color : VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE,
+        .compareOp = d->compare_enabled ? (d->compare ? d->compare : VK_COMPARE_OP_LESS_OR_EQUAL) : VK_COMPARE_OP_NEVER,
+        .minLod    = 0.0f,
+        .maxLod    = VK_LOD_CLAMP_NONE,
+        .borderColor = d->border_color ? d->border_color : VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE,
     };
     return ci;
 }
@@ -1936,8 +1929,8 @@ bool sampler_create(VkBackend *r, const SamplerDesc *desc, uint32_t *out_sampler
 
     VkSampler sampler = VK_NULL_HANDLE;
 
-    VkSamplerCreateInfo ci = sampler_info_from_desc(desc);
-    VkResult       res = vkCreateSampler(r->devc.device, &ci, NULL, &sampler);
+    VkSamplerCreateInfo ci  = sampler_info_from_desc(desc);
+    VkResult            res = vkCreateSampler(r->devc.device, &ci, NULL, &sampler);
     if (res != VK_SUCCESS)
         return false;
 
@@ -1967,13 +1960,8 @@ bool sampler_create(VkBackend *r, const SamplerDesc *desc, uint32_t *out_sampler
     return true;
 }
 
-
-
 // The zero-value config is the default state: unblended, no cull, counter-
 // clockwise-wound triangles, triangle list, depth-tested. Call sites name only what differs.
-
-
-
 
 static VkShaderModule create_shader_module(VkDevice device, const void *code, size_t size) {
     VkShaderModuleCreateInfo ci = {
@@ -1987,8 +1975,6 @@ static VkShaderModule create_shader_module(VkDevice device, const void *code, si
     return mod;
 }
 
-
-
 static inline void pipeline_fill_blend_defaults(GraphicsPipelineConfig *cfg) {
     forEach(i, cfg->color_attachment_count) {
         if (cfg->blends[i].write_mask == 0) // unset: designated init leaves the rest zeroed
@@ -1996,7 +1982,6 @@ static inline void pipeline_fill_blend_defaults(GraphicsPipelineConfig *cfg) {
     }
 }
 #include "build/generated/shaders.h" // Generated single header.
-
 
 bool read_shader(const char *path, void **code, size_t *size) {
     /* The file path allocates a buffer the caller owns; the embedded path
@@ -2035,8 +2020,8 @@ VkPipeline create_graphics_pipeline(VkBackend *renderer, const GraphicsPipelineC
 
     /* Not const: the caller owns this buffer and passes it to shader_release,
        which frees it. */
-    void  *vs_code = NULL;
-    void  *fs_code = NULL;
+    void *vs_code = NULL;
+    void *fs_code = NULL;
 
     size_t vs_size = 0;
     size_t fs_size = 0;
@@ -2050,7 +2035,7 @@ VkPipeline create_graphics_pipeline(VkBackend *renderer, const GraphicsPipelineC
     VkShaderModule vs = create_shader_module(renderer->devc.device, vs_code, vs_size);
 
     VkShaderModule fs = create_shader_module(renderer->devc.device, fs_code, fs_size);
- 
+
     VkPipelineShaderStageCreateInfo      stages[2] = {{
                                                           .sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
                                                           .stage  = VK_SHADER_STAGE_VERTEX_BIT,
@@ -2203,8 +2188,6 @@ VkPipeline create_graphics_pipeline(VkBackend *renderer, const GraphicsPipelineC
     vkDestroyShaderModule(renderer->devc.device, vs, NULL);
     vkDestroyShaderModule(renderer->devc.device, fs, NULL);
 
-
-
     shader_release(vs_code);
     shader_release(fs_code);
 
@@ -2332,7 +2315,7 @@ PipelineID pipeline_create_graphics(VkBackend *r, GraphicsPipelineConfig *cfg) {
 
     PipelineEntry *e = &r->render_pipelines.entries[id];
 
-    e->type     = PIPELINE_TYPE_GRAPHICS;
+    e->type = PIPELINE_TYPE_GRAPHICS;
     pipeline_fill_blend_defaults(cfg);
     e->graphics = *cfg;
     e->dirty    = false;
@@ -2449,10 +2432,10 @@ void image_transition_swapchain(VkBackend *r, VkCommandBuffer cmd, FlowSwapchain
                                                           .layerCount     = 1}};
 
     barrier_batch_push(r, &barrier);
-    state->layout                                                 = new_layout;
-    state->stage                                                  = dst_stage;
-    state->access                                                 = dst_access;
-    state->validity                                               = IMAGE_STATE_VALID;
+    state->layout   = new_layout;
+    state->stage    = dst_stage;
+    state->access   = dst_access;
+    state->validity = IMAGE_STATE_VALID;
 }
 
 static inline VkImageSubresourceRange image_subresource_range(VkImageAspectFlags aspect, uint32_t baseMip,
@@ -2467,8 +2450,8 @@ static inline VkImageSubresourceRange image_subresource_range(VkImageAspectFlags
 }
 
 void cmd_transition_all_mips(VkBackend *r, VkCommandBuffer cmd, VkImage image, ImageState *state,
-                                    VkImageAspectFlags aspect, uint32_t mipCount, VkPipelineStageFlags2 newStage,
-                                    VkAccessFlags2 newAccess, VkImageLayout newLayout, uint32_t newQueueFamily) {
+                             VkImageAspectFlags aspect, uint32_t mipCount, VkPipelineStageFlags2 newStage,
+                             VkAccessFlags2 newAccess, VkImageLayout newLayout, uint32_t newQueueFamily) {
     if (state->validity == IMAGE_STATE_VALID) {
         if (state->stage == newStage && state->access == newAccess && state->layout == newLayout &&
             state->queue_family == newQueueFamily) {
@@ -2499,12 +2482,12 @@ void cmd_transition_all_mips(VkBackend *r, VkCommandBuffer cmd, VkImage image, I
         .subresourceRange = image_subresource_range(aspect, 0, mipCount)};
 
     barrier_batch_push(r, &barrier);
-    state->stage                                                  = newStage;
-    state->access                                                 = newAccess;
-    state->layout                                                 = newLayout;
-    state->queue_family                                           = newQueueFamily;
-    state->validity                                               = IMAGE_STATE_VALID;
-    state->dirty_mips                                             = 0;
+    state->stage        = newStage;
+    state->access       = newAccess;
+    state->layout       = newLayout;
+    state->queue_family = newQueueFamily;
+    state->validity     = IMAGE_STATE_VALID;
+    state->dirty_mips   = 0;
 }
 
 void cmd_transition_mip(VkBackend *r, VkCommandBuffer cmd, VkImage image, ImageState *state, VkImageAspectFlags aspect,
@@ -2556,9 +2539,9 @@ void flush_barriers(VkBackend *r, VkCommandBuffer cmd) {
     if (r->barrierbatch.image_count == 0 && r->barrierbatch.buffer_count == 0)
         return;
 
-    VkDependencyInfo dep = {.sType                   = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
-                            .imageMemoryBarrierCount = r->barrierbatch.image_count,
-                            .pImageMemoryBarriers    = r->barrierbatch.image_barriers,
+    VkDependencyInfo dep = {.sType                    = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+                            .imageMemoryBarrierCount  = r->barrierbatch.image_count,
+                            .pImageMemoryBarriers     = r->barrierbatch.image_barriers,
                             .bufferMemoryBarrierCount = r->barrierbatch.buffer_count,
                             .pBufferMemoryBarriers    = r->barrierbatch.buffer_barriers};
 
@@ -2570,12 +2553,12 @@ void flush_barriers(VkBackend *r, VkCommandBuffer cmd) {
         r->barrierbatch.overflow_count = 0;
     }
 
-    r->barrierbatch.image_count   = 0;
-    r->barrierbatch.buffer_count  = 0;
+    r->barrierbatch.image_count  = 0;
+    r->barrierbatch.buffer_count = 0;
 }
 
-void rt_transition_mip(VkBackend *r, VkCommandBuffer cmd, RenderTarget *rt, uint32_t mip,
-                                 VkImageLayout new_layout, VkPipelineStageFlags2 new_stage, VkAccessFlags2 new_access
+void rt_transition_mip(VkBackend *r, VkCommandBuffer cmd, RenderTarget *rt, uint32_t mip, VkImageLayout new_layout,
+                       VkPipelineStageFlags2 new_stage, VkAccessFlags2 new_access
 
 ) {
     assert(mip < rt->mip_count);
@@ -2584,7 +2567,7 @@ void rt_transition_mip(VkBackend *r, VkCommandBuffer cmd, RenderTarget *rt, uint
 }
 
 void rt_transition_all(VkBackend *r, VkCommandBuffer cmd, RenderTarget *rt, VkImageLayout new_layout,
-                                 VkPipelineStageFlags2 new_stage, VkAccessFlags2 new_access) {
+                       VkPipelineStageFlags2 new_stage, VkAccessFlags2 new_access) {
     for (uint32_t mip = 0; mip < rt->mip_count; mip++) {
         ImageState *s = &rt->mip_states[mip];
         // Skip if already in target state
@@ -2622,8 +2605,7 @@ static void emit_root_data(VkBackend *r, VkCommandBuffer cmd, ByteSpan root) {
     push_constants(r, cmd, (ByteSpan){payload, sizeof(payload)});
 }
 
-void cmd_draw(VkBackend *r, VkCommandBuffer cmd, ByteSpan root, uint32_t vertex_count,
-                           uint32_t instance_count) {
+void cmd_draw(VkBackend *r, VkCommandBuffer cmd, ByteSpan root, uint32_t vertex_count, uint32_t instance_count) {
     emit_root_data(r, cmd, root);
     vkCmdDraw(cmd, vertex_count, instance_count, 0, 0);
 }
@@ -2667,9 +2649,8 @@ void cmd_draw_indexed_indirect_count(VkBackend *r, VkCommandBuffer cmd, ByteSpan
                                   stride);
 }
 
-
-void dispatch_push(VkBackend *r, VkCommandBuffer cmd, ByteSpan root, uint32_t group_count_x,
-                                uint32_t group_count_y, uint32_t group_count_z) {
+void dispatch_push(VkBackend *r, VkCommandBuffer cmd, ByteSpan root, uint32_t group_count_x, uint32_t group_count_y,
+                   uint32_t group_count_z) {
     emit_root_data(r, cmd, root);
     vkCmdDispatch(cmd, group_count_x, group_count_y, group_count_z);
 }
@@ -2688,29 +2669,22 @@ void dispatch_indirect(VkBackend *r, VkCommandBuffer cmd, ByteSpan root, BufferS
 // this replaces, which implicated every unrelated allocation in the pool.
 static void pass_push_buffer_reads(VkBackend *r, const BufferAccess *reads, uint32_t count) {
     forEach(i, count) {
+
+        // do not add unnecessary checks 
         const BufferAccess *b = &reads[i];
-        if (!b->slice.buffer)
-            continue;
-        if (!b->slice.state)
-            continue;
-        if (b->slice.state->valid &&
-            (b->slice.state->stage != b->stage || b->slice.state->access != b->access)) {
-            if (r->barrierbatch.buffer_count >= (uint32_t)ARRAY_COUNT(r->barrierbatch.buffer_barriers)) {
-                r->barrierbatch.overflow_count++;
-            } else {
-                r->barrierbatch.buffer_barriers[r->barrierbatch.buffer_count++] = (VkBufferMemoryBarrier2){
-                    .sType               = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2,
-                    .srcStageMask        = b->slice.state->stage,
-                    .srcAccessMask       = b->slice.state->access,
-                    .dstStageMask        = b->stage,
-                    .dstAccessMask        = b->access,
-                    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                    .buffer              = b->slice.buffer,
-                    .offset              = b->slice.offset,
-                    .size                = b->slice.size,
-                };
-            }
+        if (b->slice.state->valid && (b->slice.state->stage != b->stage || b->slice.state->access != b->access)) {
+            r->barrierbatch.buffer_barriers[r->barrierbatch.buffer_count++] = (VkBufferMemoryBarrier2){
+                .sType               = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2,
+                .srcStageMask        = b->slice.state->stage,
+                .srcAccessMask       = b->slice.state->access,
+                .dstStageMask        = b->stage,
+                .dstAccessMask       = b->access,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .buffer              = b->slice.buffer,
+                .offset              = b->slice.offset,
+                .size                = b->slice.size,
+            };
         }
         *b->slice.state = (BufferState){b->stage, b->access, true};
     }
@@ -2722,32 +2696,19 @@ static void pass_push_buffer_reads(VkBackend *r, const BufferAccess *reads, uint
 static void pass_push_buffer_writes(VkBackend *r, const BufferAccess *writes, uint32_t count) {
     forEach(i, count) {
         const BufferAccess *b = &writes[i];
-        if (!b->slice.buffer)
-            continue;
-        if (r->barrierbatch.buffer_count >= (uint32_t)ARRAY_COUNT(r->barrierbatch.buffer_barriers)) {
-            r->barrierbatch.overflow_count++;
-            continue;
-        }
-        if (!b->slice.state)
-            continue;
-        if (b->slice.state->valid &&
-            (b->slice.state->stage != b->stage || b->slice.state->access != b->access)) {
-            if (r->barrierbatch.buffer_count >= (uint32_t)ARRAY_COUNT(r->barrierbatch.buffer_barriers)) {
-                r->barrierbatch.overflow_count++;
-            } else {
-                r->barrierbatch.buffer_barriers[r->barrierbatch.buffer_count++] = (VkBufferMemoryBarrier2){
-                    .sType               = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2,
-                    .srcStageMask        = b->slice.state->stage,
-                    .srcAccessMask       = b->slice.state->access,
-                    .dstStageMask        = b->stage,
-                    .dstAccessMask        = b->access,
-                    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                    .buffer              = b->slice.buffer,
-                    .offset              = b->slice.offset,
-                    .size                = b->slice.size,
-                };
-            }
+        if (b->slice.state->valid && (b->slice.state->stage != b->stage || b->slice.state->access != b->access)) {
+            r->barrierbatch.buffer_barriers[r->barrierbatch.buffer_count++] = (VkBufferMemoryBarrier2){
+                .sType               = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2,
+                .srcStageMask        = b->slice.state->stage,
+                .srcAccessMask       = b->slice.state->access,
+                .dstStageMask        = b->stage,
+                .dstAccessMask       = b->access,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .buffer              = b->slice.buffer,
+                .offset              = b->slice.offset,
+                .size                = b->slice.size,
+            };
         }
         *b->slice.state = (BufferState){b->stage, b->access, true};
     }
@@ -2775,7 +2736,8 @@ static void pass_transition_attachment(VkBackend *r, VkCommandBuffer cmd, const 
     if (a->target->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) {
         rt_transition_all(r, cmd, a->target, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
                           VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
-                          VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT);
+                          VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
+                              VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT);
     } else {
         rt_transition_all(r, cmd, a->target, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                           VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
@@ -2826,7 +2788,7 @@ void begin_pass(VkBackend *r, VkCommandBuffer cmd, const PassDesc *desc) {
     VkRenderingAttachmentInfo color_attachments[MAX_COLOR_ATTACHMENTS];
     forEach(i, desc->color_count) {
         const PassAttachment *a = &desc->colors[i];
-        color_attachments[i] = (VkRenderingAttachmentInfo){
+        color_attachments[i]    = (VkRenderingAttachmentInfo){
             .sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
             .imageView   = a->target ? a->target->view : a->swapchain_view,
             .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
@@ -2906,9 +2868,8 @@ void delete_queue_drain(VkBackend *r) {
     }
 }
 
-
 bool vk_swapchain_acquire(VkDevice device, FlowSwapchain *sc, VkSemaphore image_available, VkFence fence,
-                                       uint64_t timeout) {
+                          uint64_t timeout) {
     ///  PFN_vkAcquireNextImage2KHR
     VkResult r = vkAcquireNextImageKHR(device, sc->swapchain, timeout, image_available, fence, &sc->current_image);
 
@@ -2926,8 +2887,7 @@ bool vk_swapchain_acquire(VkDevice device, FlowSwapchain *sc, VkSemaphore image_
     return false;
 }
 
-bool vk_swapchain_present(VkQueue present_queue, FlowSwapchain *sc, const VkSemaphore *waits,
-                                       uint32_t wait_count) {
+bool vk_swapchain_present(VkQueue present_queue, FlowSwapchain *sc, const VkSemaphore *waits, uint32_t wait_count) {
     VkPresentInfoKHR info = {.sType              = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
                              .waitSemaphoreCount = wait_count,
                              .pWaitSemaphores    = waits,
@@ -2946,9 +2906,7 @@ bool vk_swapchain_present(VkQueue present_queue, FlowSwapchain *sc, const VkSema
     return true;
 }
 
-FORCE_INLINE bool
-set_vulkan_driver(const char *icd_path)
-{
+FORCE_INLINE bool set_vulkan_driver(const char *icd_path) {
 #ifdef _WIN32
     return _putenv_s("VK_DRIVER_FILES", icd_path) == 0;
 #else
@@ -2958,14 +2916,13 @@ set_vulkan_driver(const char *icd_path)
 void vk_instance_create(VkBackend *r, VkBackendDesc *desc) {
     TracyCZoneN(ctx, "renderer_create", 1);
 #ifndef _WIN32
-  /* Optional Linux override. Respect the user's existing setting. */
-  if (!getenv("VK_DRIVER_FILES")) {
-    if (!set_vulkan_driver("/usr/share/vulkan/icd.d/intel_icd.json")) {
-      perror("Failed to set Vulkan driver");
+    /* Optional Linux override. Respect the user's existing setting. */
+    if (!getenv("VK_DRIVER_FILES")) {
+        if (!set_vulkan_driver("/usr/share/vulkan/icd.d/intel_icd.json")) {
+            perror("Failed to set Vulkan driver");
+        }
     }
-  }
 #endif
-
 
     // Instance
     // Debug messenger
@@ -3072,7 +3029,7 @@ void vk_instance_create(VkBackend *r, VkBackendDesc *desc) {
 
             {
                 VK_CHECK(vkCreateDebugUtilsMessengerEXT(r->instance.instance, &ci, r->vk_allocator_callbacks,
-                                               &r->instance.debug_messenger));
+                                                        &r->instance.debug_messenger));
 
                 log_info("[renderer] debug messenger created");
 
@@ -3145,10 +3102,6 @@ void vk_backend_create(VkBackend *r, VkBackendDesc *desc) {
             tail->pNext                              = (VkBaseOutStructure *)&r->info.feature_chain.maintenance5;
             tail                                     = (VkBaseOutStructure *)&r->info.feature_chain.maintenance5;
         }
-
-
-
-
 
         tail->pNext = NULL;
     }
@@ -3264,7 +3217,7 @@ void vk_backend_create(VkBackend *r, VkBackendDesc *desc) {
 
     log_info("[renderer] frame contexts created");
 
-    r->current_frame     = 0;
+    r->current_frame = 0;
 
     log_info("[renderer] initialization complete");
 
@@ -3430,16 +3383,16 @@ void vk_backend_create(VkBackend *r, VkBackendDesc *desc) {
     allocatorInfo.pVulkanFunctions = &vulkanFunctions;
 
     VK_CHECK(vmaCreateAllocator(&allocatorInfo, &r->devc.vmaallocator));
-    FlowSwapchainCreateInfo sci          = {.surface         = r->surface,
-                                            .width           = fb_w,
-                                            .height          = fb_h,
-                                            .min_image_count = 3,
+    FlowSwapchainCreateInfo sci = {.surface         = r->surface,
+                                   .width           = fb_w,
+                                   .height          = fb_h,
+                                   .min_image_count = 3,
 
-                                            //.preferred_present_mode = VK_PRESENT_MODE_IMMEDIATE_KHR,
-                                            .preferred_format      = desc->swapchain_preferred_format,
-                                            .preferred_color_space = desc->swapchain_preferred_color_space,
-                                            .extra_usage           = desc->swapchain_extra_usage_flags,
-                                            .old_swapchain         = VK_NULL_HANDLE};
+                                   //.preferred_present_mode = VK_PRESENT_MODE_IMMEDIATE_KHR,
+                                   .preferred_format      = desc->swapchain_preferred_format,
+                                   .preferred_color_space = desc->swapchain_preferred_color_space,
+                                   .extra_usage           = desc->swapchain_extra_usage_flags,
+                                   .old_swapchain         = VK_NULL_HANDLE};
 
     if (desc->swapchain_preferred_present_mode) {
 
@@ -3471,18 +3424,17 @@ void vk_backend_create(VkBackend *r, VkBackendDesc *desc) {
         const SamplerDesc linear_clamp = {.address_u = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
                                           .address_v = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
                                           .address_w = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE};
-        const SamplerDesc nearest_wrap = {.min_filter  = VK_FILTER_NEAREST,
-                                          .mag_filter  = VK_FILTER_NEAREST,
-                                          .nearest_mips = true};
-        const SamplerDesc nearest_clamp = {.min_filter = VK_FILTER_NEAREST,
-                                           .mag_filter  = VK_FILTER_NEAREST,
+        const SamplerDesc nearest_wrap = {
+            .min_filter = VK_FILTER_NEAREST, .mag_filter = VK_FILTER_NEAREST, .nearest_mips = true};
+        const SamplerDesc nearest_clamp = {.min_filter   = VK_FILTER_NEAREST,
+                                           .mag_filter   = VK_FILTER_NEAREST,
                                            .nearest_mips = true,
                                            .address_u    = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
                                            .address_v    = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
                                            .address_w    = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE};
-        const SamplerDesc aniso_wrap   = {.anisotropic = true};
-        const SamplerDesc shadow       = {.compare_enabled       = true,
-                                    .clamp_mode_override = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER};
+        const SamplerDesc aniso_wrap    = {.anisotropic = true};
+        const SamplerDesc shadow        = {.compare_enabled     = true,
+                                           .clamp_mode_override = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER};
 
         sampler_create(r, &linear_wrap, &table->samplers[SAMPLER_LINEAR_WRAP]);
         sampler_create(r, &linear_clamp, &table->samplers[SAMPLER_LINEAR_CLAMP]);
@@ -3500,10 +3452,9 @@ void vk_backend_create(VkBackend *r, VkBackendDesc *desc) {
                          2048);
         buffer_pool_init(r, BUFFER_POOL_TLSF, &r->gpu_pool, desc->size_of_gpu_pool,
                          VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
-                     
-                             VK_BUFFER_USAGE_TRANSFER_SRC_BIT| 
-                         VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT |
-                             VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+
+                             VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                             VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
                          VMA_MEMORY_USAGE_GPU_ONLY, 0, 2048);
         buffer_pool_init(r, BUFFER_POOL_RING, &r->staging_pool, desc->size_of_staging_pool,
                          VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VMA_MEMORY_USAGE_AUTO,
@@ -3514,7 +3465,6 @@ void vk_backend_create(VkBackend *r, VkBackendDesc *desc) {
                                               .buffer = r->gpu_pool.buffer};
         r->gpu_base_addr                   = vkGetBufferDeviceAddress(r->devc.device, &addrInfo);
     }
-
 }
 
 bool vk_frame_acquire(VkBackend *r) {
@@ -3528,7 +3478,6 @@ bool vk_frame_acquire(VkBackend *r) {
                                     .pValues        = &f->timeline_value};
         VK_CHECK(vkWaitSemaphores(r->devc.device, &wait, UINT64_MAX));
     }
-
 
     buffer_pool_linear_reset(&r->cpu_pool);
     buffer_pool_ring_free_to(&r->staging_pool, f->staging_tail);
@@ -3560,17 +3509,18 @@ void vk_frame_submit(VkBackend *r) {
 
     VkCommandBufferSubmitInfo cmd = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = f->cmdbuf};
 
-    VkSemaphoreSubmitInfo wait = {.sType     = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
-                                  .semaphore = f->image_available_semaphore,
-                                  .stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT};    VkSemaphoreSubmitInfo signal = {.sType     = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
-                                  .semaphore = r->swapchain.render_finished[img],
-                                  .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};
+    VkSemaphoreSubmitInfo wait   = {.sType     = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+                                    .semaphore = f->image_available_semaphore,
+                                    .stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT};
+    VkSemaphoreSubmitInfo signal = {.sType     = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+                                    .semaphore = r->swapchain.render_finished[img],
+                                    .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};
 
     // The device-wide timeline advances on every submission; frame-slot reuse,
     // deferred destruction, and readback waits all key on this value.
-    uint64_t retire_value              = r->timeline_last_submitted + 1;
-    r->timeline_last_submitted         = retire_value;
-    f->timeline_value                  = retire_value;
+    uint64_t retire_value      = r->timeline_last_submitted + 1;
+    r->timeline_last_submitted = retire_value;
+    f->timeline_value          = retire_value;
 
     VkSemaphoreSubmitInfo timeline_signal = {.sType     = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
                                              .semaphore = r->timeline,
@@ -3595,9 +3545,7 @@ void vk_frame_submit(VkBackend *r) {
     TracyCZoneEnd(ctx);
 }
 
-void wait_idle(VkBackend *r) {
-    VK_CHECK(vkDeviceWaitIdle(r->devc.device));
-}
+void wait_idle(VkBackend *r) { VK_CHECK(vkDeviceWaitIdle(r->devc.device)); }
 
 void vk_backend_destroy(VkBackend *r) {
     assert(r->delete_queue.count == 0);
@@ -3656,7 +3604,7 @@ void destroy_texture(VkBackend *r, TextureID id) {
     mem_query(r, texture->allocation, &mem_info);
     mem_note_destroy(r, &mem_info, true);
     vmaDestroyImage(r->devc.vmaallocator, texture->image, texture->allocation);
-    *texture = (Texture){0};
+    *texture                   = (Texture){0};
     r->texture_system.info[id] = (TextureInfo){0};
     mu_id_pool_destroy_id(&r->texture_system.id_pool, id);
 }
@@ -3676,20 +3624,20 @@ bool texture_upload(VkBackend *r, TextureID id, uint32_t mip, uint32_t layer, Vk
     memcpy(staging.mapping, data.data, data.size);
 
     VkImageMemoryBarrier to_dst = {
-        .sType                = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-        .srcAccessMask        = 0,
-        .dstAccessMask        = VK_ACCESS_TRANSFER_WRITE_BIT,
-        .oldLayout            = VK_IMAGE_LAYOUT_UNDEFINED,
-        .newLayout            = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-        .srcQueueFamilyIndex  = VK_QUEUE_FAMILY_IGNORED,
-        .dstQueueFamilyIndex  = VK_QUEUE_FAMILY_IGNORED,
-        .image                = tex->image,
-        .subresourceRange     = {VK_IMAGE_ASPECT_COLOR_BIT, mip, 1, layer, 1},
+        .sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .srcAccessMask       = 0,
+        .dstAccessMask       = VK_ACCESS_TRANSFER_WRITE_BIT,
+        .oldLayout           = VK_IMAGE_LAYOUT_UNDEFINED,
+        .newLayout           = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image               = tex->image,
+        .subresourceRange    = {VK_IMAGE_ASPECT_COLOR_BIT, mip, 1, layer, 1},
     };
 
     VkCommandBuffer cmd = vk_begin_one_time_cmd(r->devc.device, r->one_time_gfx_pool);
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0,
-                         NULL, 1, &to_dst);
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL,
+                         1, &to_dst);
 
     VkBufferImageCopy region = {
         .bufferOffset      = 0,
@@ -3701,14 +3649,14 @@ bool texture_upload(VkBackend *r, TextureID id, uint32_t mip, uint32_t layer, Vk
     };
     vkCmdCopyBufferToImage(cmd, staging.buffer, tex->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
 
-    VkImageMemoryBarrier to_read       = to_dst;
-    to_read.srcAccessMask             = VK_ACCESS_TRANSFER_WRITE_BIT;
-    to_read.dstAccessMask             = VK_ACCESS_SHADER_READ_BIT;
-    to_read.oldLayout                 = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    to_read.newLayout                 = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    VkImageMemoryBarrier to_read = to_dst;
+    to_read.srcAccessMask        = VK_ACCESS_TRANSFER_WRITE_BIT;
+    to_read.dstAccessMask        = VK_ACCESS_SHADER_READ_BIT;
+    to_read.oldLayout            = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    to_read.newLayout            = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL,
-                         0, NULL, 1, &to_read);
+                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, 0,
+                         NULL, 1, &to_read);
 
     vk_end_one_time_cmd(r->devc.device, r->devc.graphics_queue, r->one_time_gfx_pool, cmd);
     destroy_buffer(r, &staging);
@@ -3726,21 +3674,21 @@ void cmd_buffer_barrier(VkCommandBuffer cmd, VkBuffer buffer, VkDeviceSize offse
                         VkPipelineStageFlags2 src_stage, VkAccessFlags2 src_access, VkPipelineStageFlags2 dst_stage,
                         VkAccessFlags2 dst_access) {
     VkBufferMemoryBarrier2 barrier = {
-        .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2,
-        .srcStageMask = src_stage,
-        .srcAccessMask = src_access,
-        .dstStageMask = dst_stage,
-        .dstAccessMask = dst_access,
+        .sType               = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2,
+        .srcStageMask        = src_stage,
+        .srcAccessMask       = src_access,
+        .dstStageMask        = dst_stage,
+        .dstAccessMask       = dst_access,
         .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
         .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .buffer = buffer,
-        .offset = offset,
-        .size = size,
+        .buffer              = buffer,
+        .offset              = offset,
+        .size                = size,
     };
     VkDependencyInfo dep_info = {
-        .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+        .sType                    = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
         .bufferMemoryBarrierCount = 1,
-        .pBufferMemoryBarriers = &barrier,
+        .pBufferMemoryBarriers    = &barrier,
     };
     vkCmdPipelineBarrier2(cmd, &dep_info);
 }
@@ -3748,8 +3696,7 @@ void cmd_buffer_barrier(VkCommandBuffer cmd, VkBuffer buffer, VkDeviceSize offse
 void cmd_fill_buffer(VkCommandBuffer cmd, BufferSlice slice, VkDeviceSize size, uint32_t value) {
     assert(slice.buffer && slice.offset % 4 == 0 && size % 4 == 0 && size <= slice.size);
     if (slice.state && slice.state->valid) {
-        cmd_buffer_barrier(cmd, slice.buffer, slice.offset, size,
-                           slice.state->stage, slice.state->access,
+        cmd_buffer_barrier(cmd, slice.buffer, slice.offset, size, slice.state->stage, slice.state->access,
                            VK_PIPELINE_STAGE_2_CLEAR_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
     }
     vkCmdFillBuffer(cmd, slice.buffer, slice.offset, size, value);
@@ -3760,8 +3707,7 @@ void cmd_fill_buffer(VkCommandBuffer cmd, BufferSlice slice, VkDeviceSize size, 
 void cmd_copy_buffer(VkCommandBuffer cmd, BufferSlice src, VkBuffer dst, VkDeviceSize dst_offset, VkDeviceSize size) {
     assert(src.buffer && dst && size <= src.size);
     if (src.state && src.state->valid) {
-        cmd_buffer_barrier(cmd, src.buffer, src.offset, size,
-                           src.state->stage, src.state->access,
+        cmd_buffer_barrier(cmd, src.buffer, src.offset, size, src.state->stage, src.state->access,
                            VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
     }
     VkBufferCopy copy = {.srcOffset = src.offset, .dstOffset = dst_offset, .size = size};
