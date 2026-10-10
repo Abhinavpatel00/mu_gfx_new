@@ -96,6 +96,8 @@ typedef struct SceneViewFrame {
     BufferSlice scan_aux;   /* 3 * SCENE_SCAN_BLOCK u32x2: block totals + offsets */
     BufferSlice cull_args;  /* VkDispatchIndirectCommand triple, INDIRECT usage */
     BufferSlice group_base; /* max_survivors x u32: vis_base -> group id */
+
+
 } SceneViewFrame;
 
 #define SCENE_MAX_LODS 4
@@ -170,6 +172,18 @@ struct Scene {
        static instances exist, and a destroy's swap-remove permutes rows, so the
        mapping has to be explicit rather than assumed. */
     uint32_t *row_of;
+
+    /* Bloom membership: a mu_bitset for O(1) test/set plus a dense list of
+       blooming slots rebuilt on upload. Strength is a parallel table uploaded
+       whole to the GPU; the VS reads bloom[slot] and forwards it, and the FS
+       writes it into HDR alpha where the bloom bright-pass gates on it. No
+       hot loop branches on any of this. */
+    mu_bitset   bloom_bits;
+    float      *bloom_strength; /* max_instances, 0 = excluded from bloom */
+    uint32_t   *bloom_dense;    /* blooming slots, dense in [0, bloom_count) */
+    uint32_t    bloom_count;
+    bool        bloom_dirty;
+    BufferSlice bloom_table; /* max_instances x float on the GPU */
 
     /* per view, per frame-in-flight transient tables */
     SceneViewFrame view_frame[SCENE_MAX_VIEWS][MAX_FRAMES_IN_FLIGHT];
@@ -282,6 +296,12 @@ Scene *scene_create(VkBackend *vk, const SceneDesc *desc) {
     for (uint32_t i = 0; i < s->max_instances; ++i)
         s->row_of[i] = UINT32_MAX;
 
+    s->bloom_strength = calloc(s->max_instances, sizeof(float));
+    s->bloom_dense    = malloc((size_t)s->max_instances * sizeof(uint32_t));
+    memset(&s->bloom_bits, 0, sizeof(s->bloom_bits));
+    mu_bitset_resize_words(&s->bloom_bits, (s->max_instances + 63u) / 64u);
+    s->bloom_table = alloc_slice(s, (VkDeviceSize)s->max_instances * sizeof(float), 16);
+
 s->cpu_cull         = calloc(s->max_meshes, sizeof(struct SceneCullMesh));
     s->cpu_group_shade = calloc((size_t)s->max_meshes * SCENE_MAX_LODS, sizeof(struct SceneGroupShade));
     s->cpu_rung_vbase  = calloc((size_t)s->max_meshes * SCENE_MAX_LODS, sizeof(uint32_t));
@@ -315,6 +335,7 @@ void scene_destroy(Scene *s) {
     buffer_pool_free(s->lod_rows);
     buffer_pool_free(s->materials);
     buffer_pool_free(s->cull_rows);
+    buffer_pool_free(s->bloom_table);
     buffer_pool_free(s->group_static);
     buffer_pool_free(s->group_shade);
     buffer_pool_free(s->vertex_arena);
@@ -338,6 +359,7 @@ void scene_destroy(Scene *s) {
         buffer_pool_free(vf->cull_args);
         buffer_pool_free(vf->group_base);
     }
+// this is nonsense and monstrocity we need arena alloc
     free(s->staged_vertices);
     free(s->staged_indices);
     free(s->cpu_instances);
@@ -346,6 +368,9 @@ void scene_destroy(Scene *s) {
     free(s->dirty_slots);
     free(s->static_dirty_slots);
     free(s->row_of);
+    free(s->bloom_strength);
+    free(s->bloom_dense);
+    free(s->bloom_bits.array);
     free(s->cpu_cull);
     free(s->cpu_group_shade);
     free(s->cpu_rung_vbase);
@@ -458,6 +483,8 @@ static uint32_t instance_insert(Scene *s, const SceneInstanceDesc *desc, bool is
     pack_instance(&s->cpu_instances[slot].gpu, desc);
     s->cpu_instances[slot].mesh          = desc->mesh;
     s->cpu_instances[slot].alive         = 1;
+    s->bloom_strength[slot]              = 0.0f;
+    mu_bitset_reset(&s->bloom_bits, slot);
     s->cpu_rows[s->candidate_count].slot = slot;
     s->cpu_rows[s->candidate_count].mesh = (uint16_t)desc->mesh;
     s->row_of[slot]                      = s->candidate_count;
@@ -516,6 +543,22 @@ bool scene_instance_alive(const Scene *s, uint32_t slot) {
     return s && slot < s->max_instances && s->cpu_instances[slot].alive;
 }
 
+void scene_set_instance_bloom(Scene *s, uint32_t slot, float strength) {
+    if (!s || slot >= s->max_instances || !s->cpu_instances[slot].alive)
+        return;
+    if (strength < 0.0f)
+        strength = 0.0f;
+    s->bloom_strength[slot] = strength;
+    mu_bitset_set_bit(&s->bloom_bits, slot, strength > 0.0f);
+    s->bloom_dirty = true;
+}
+
+float scene_instance_bloom(const Scene *s, uint32_t slot) {
+    if (!s || slot >= s->max_instances)
+        return 0.0f;
+    return s->bloom_strength[slot];
+}
+
 /* Removal is existence, not state: the candidate row goes away, so no hot loop
    ever asks whether this instance is alive. The slot is retired and becomes a
    hole; holes are reclaimed by scene_compact_slots() at load boundaries.
@@ -541,10 +584,15 @@ void scene_instance_destroy(Scene *s, uint32_t slot) {
     if (slot != last_slot) {
         uint32_t moved_row          = s->row_of[last_slot];
         s->cpu_instances[slot]      = s->cpu_instances[last_slot];
+        s->bloom_strength[slot]     = s->bloom_strength[last_slot];
+        mu_bitset_set_bit(&s->bloom_bits, slot, mu_bitset_test(&s->bloom_bits, last_slot));
         s->row_of[slot]             = moved_row;
         s->cpu_rows[moved_row].slot = slot;
     }
     memset(&s->cpu_instances[last_slot], 0, sizeof(s->cpu_instances[last_slot]));
+    s->bloom_strength[last_slot] = 0.0f;
+    mu_bitset_reset(&s->bloom_bits, last_slot);
+    s->bloom_dirty = true;
     s->instance_count--;
     s->candidates_dirty = true;
 
@@ -609,6 +657,7 @@ void scene_compact_slots(Scene *s) {
         uint32_t to = dst[i];
         if (to != i) {
             s->cpu_instances[to]      = s->cpu_instances[i];
+            s->bloom_strength[to]     = s->bloom_strength[i];
             s->cpu_instances[i].alive = 0;
             s->row_of[i]              = UINT32_MAX;
         }
@@ -618,6 +667,17 @@ void scene_compact_slots(Scene *s) {
         row++;
     }
     free(dst);
+
+    /* Slots moved: rebuild the bitset from strengths so membership follows the
+       new slot layout. Dense is rebuilt on the next bloom upload. */
+    mu_bitset_clear(&s->bloom_bits);
+    for (uint32_t i = 0; i < s->max_instances; ++i) {
+        if (s->cpu_instances[i].alive && s->bloom_strength[i] > 0.0f)
+            mu_bitset_set(&s->bloom_bits, i);
+        else if (!s->cpu_instances[i].alive)
+            s->bloom_strength[i] = 0.0f;
+    }
+    s->bloom_dirty = true;
 
     s->dynamic_count      = dyn;
     s->static_count       = sta;
@@ -709,6 +769,8 @@ renderer_upload_buffer_to_slice(vk, cmd, s->cull_meshes,
                                     (ByteSpan){s->cpu_mat, s->max_materials * sizeof(struct SceneGpuMaterial)});
     renderer_upload_buffer_to_slice(vk, cmd, s->cull_rows,
                                     (ByteSpan){s->cpu_rows, s->max_instances * sizeof(struct SceneCullRow)});
+    renderer_upload_buffer_to_slice(vk, cmd, s->bloom_table,
+                                    (ByteSpan){s->bloom_strength, (size_t)s->max_instances * sizeof(float)});
 
     /* Whole instance table, once. After this the dynamic prefix is rewritten by
        T1 each frame and the static suffix only when a static row actually
@@ -910,6 +972,7 @@ static void build_draw_push(Scene *s, uint32_t view, uint32_t lane, struct Scene
     p->group_base  = slice_addr(vk, vf->group_base);
     p->group_shade = slice_addr(vk, s->group_shade);
     p->materials   = slice_addr(vk, s->materials);
+    p->bloom       = slice_addr(vk, s->bloom_table);
 
     p->counts[5] = getenv("MU_SHADER_DEBUG") ? 1u : 0u;
 }
@@ -1003,6 +1066,24 @@ void scene_frame(Scene *s, VkCommandBuffer cmd, RenderTarget *color, RenderTarge
                                         (ByteSpan){&s->cpu_instances[slot].gpu, sizeof(struct SceneInstance)});
     }
     s->static_dirty_count = 0;
+
+    /* Bloom strength rides separately: rebuild the dense blooming-slot list
+       from the bitset and upload the table whole when dirty. Rebuild cost is
+       proportional to set words, upload is one contiguous copy. */
+    if (s->bloom_dirty) {
+        s->bloom_count = 0;
+        for (uint32_t w = 0; w * 64u < s->max_instances; ++w) {
+            uint64_t word = w < s->bloom_bits.word_count ? s->bloom_bits.array[w] : 0u;
+            while (word) {
+                uint32_t bit                       = (uint32_t)mu_trailing_zeroes_u64(word);
+                s->bloom_dense[s->bloom_count++]   = w * 64u + bit;
+                word                              &= word - 1u;
+            }
+        }
+        renderer_upload_buffer_to_slice(vk, cmd, s->bloom_table,
+                                        (ByteSpan){s->bloom_strength, (size_t)s->max_instances * sizeof(float)});
+        s->bloom_dirty = false;
+    }
 
     /* Candidates mirror the live slot set; re-upload the prefix whenever the
        roster changed. This is a per-roster-change cost, not a per-frame one. */
@@ -1276,7 +1357,7 @@ void scene_frame(Scene *s, VkCommandBuffer cmd, RenderTarget *color, RenderTarge
         PassAttachment dep = {.target = depth, .load = LOAD_CLEAR, .store = STORE_KEEP};
         dep.clear[0] = 0.0f; /* reverse-Z: the far plane is 0.0 */
 
-        BufferAccess draw_reads[9] = {
+        BufferAccess draw_reads[10] = {
             {.slice  = s->instances,
              .stage  = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT,
              .access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT},
@@ -1302,6 +1383,9 @@ void scene_frame(Scene *s, VkCommandBuffer cmd, RenderTarget *color, RenderTarge
              .stage  = VK_PIPELINE_STAGE_2_INDEX_INPUT_BIT,
              .access = VK_ACCESS_2_INDEX_READ_BIT},
             {.slice  = vf->group_base,
+             .stage  = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT,
+             .access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT},
+            {.slice  = s->bloom_table,
              .stage  = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT,
              .access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT},
         };

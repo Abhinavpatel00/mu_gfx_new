@@ -35,5 +35,6 @@ float4 fs_main(SkyVSOut input) : SV_Target0
 {
   float2 uv = pixel_to_uv(input.position.xy, global_data.screen_params.xy) * 0.5 + 0.5;
   float  t  = pow(saturate(uv.y), push.exponent);
-  return float4(lerp(push.bottom.rgb, push.top.rgb, t), 1.0);
+  /* Alpha is the per-instance bloom gate: sky never blooms. */
+  return float4(lerp(push.bottom.rgb, push.top.rgb, t), 0.0);
 }

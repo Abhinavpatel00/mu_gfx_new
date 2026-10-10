@@ -56,12 +56,16 @@ float3 BloomPrefilter(float3 c)
 
 // Apply bright-pass extraction only during pass 1.
 // Pass 2 uses the already-extracted image and only blurs it.
+// HDR alpha carries the per-instance bloom strength: 0 excludes the pixel,
+// >0 includes it with that weight. This is branchless data selection, not a
+// per-pixel flag branch.
 float3 BloomSample(
     Texture2D src,
     SamplerState smp,
     float2 uv)
 {
-    float3 c = src.SampleLevel(smp, uv, 0).rgb;
+    float4 s = src.SampleLevel(smp, uv, 0);
+    float3 c = s.rgb * s.a;
 
     if (push.prefilter != 0u)
         c = BloomPrefilter(c);

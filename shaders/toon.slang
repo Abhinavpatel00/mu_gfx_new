@@ -40,6 +40,7 @@ struct SceneVOut {
     float2               uv       : TEXCOORD1;
     nointerpolation uint material : TEXCOORD2;
     float3               world    : TEXCOORD3;
+    nointerpolation float bloom  : TEXCOORD4;
 };
 
 [shader("vertex")]
@@ -63,6 +64,7 @@ SceneVOut vs_main(uint vid : SV_VertexID, uint iid : SV_InstanceID, uint base_in
     o.uv       = unpack_half2(v.uv);
     o.material = gs.material;
     o.world    = world;
+    o.bloom    = pc.bloom[slot];
     return o;
 }
 
@@ -96,7 +98,7 @@ float4 fs_main(SceneVOut i) : SV_Target0
     }
 
     if ((m.flags & SCENE_MAT_UNLIT) != 0u)
-        return float4(albedo, 1.0f);
+        return float4(albedo, i.bloom);
 
     float3 v = normalize(pc.camera.xyz - i.world);
     float3 l = pc.sun.xyz;
@@ -124,6 +126,7 @@ float4 fs_main(SceneVOut i) : SV_Target0
     float3 specular = f0 * spec * ao;
     float3 rim_light = float3(1.0f) * rim * pc.sun.w * 1.6f;
 
-    /* Linear HDR: exposure, bloom and the tonemap all happen in post. */
-    return float4(diffuse + ambient + specular + rim_light, 1.0f);
+    /* Linear HDR: exposure, bloom and the tonemap all happen in post. Alpha
+       carries the per-instance bloom strength into the bloom bright-pass. */
+    return float4(diffuse + ambient + specular + rim_light, i.bloom);
 }

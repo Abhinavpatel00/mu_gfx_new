@@ -115,7 +115,7 @@ struct SceneGroupShade {
     SCENE_PTR(ScenePackedVertex) vertex_stream; /* 8 device address of the rung */
     SCENE_U32 material;                         /* 4 SceneGpuMaterial index   */
     SCENE_U32 pad;                              /* 4                           */
-};                                              /* 16 */
+}; /* 16 */
 
 /* ---- 12-byte LOD rung. error ascends over the ladder; rung 0's error is
    never read, because the cull walk starts at rung 0 and only tests 1..n. ---- */
@@ -149,9 +149,9 @@ struct SceneGpuDraw {
    slots: the loader resolves every image to a TextureID before uploading, so
    the fragment shader never sees a path or an index into anything else. ---- */
 struct SceneGpuMaterial {
-    SCENE_U32 base_color;    /* UNORM8x4 */
-    SCENE_U32 texture;       /* bindless albedo, 0xFFFFFFFF = none */
-    SCENE_U32 flags;         /* SCENE_MAT_* */
+    SCENE_U32 base_color; /* UNORM8x4 */
+    SCENE_U32 texture;    /* bindless albedo, 0xFFFFFFFF = none */
+    SCENE_U32 flags;      /* SCENE_MAT_* */
     float     metallic;
     float     roughness;
     SCENE_U32 normal_texture; /* bindless normal, 0xFFFFFFFF = none */
@@ -191,16 +191,18 @@ struct SceneCullPush {
 };
 
 struct SceneDrawPush {
+
+    // i think these three field belongs to uniform buffer
     SceneVec4 clip_rows[4]; /* 64 */
     SceneVec4 sun;          /* 16 xyz direction (normalized), w ambient */
     SceneVec4 camera;       /* 16 xyz eye position: specular needs a view vector */
 
     SCENE_PTR(SceneInstance) instances;
     SCENE_PTR(SCENE_U32) vis;
-    SCENE_PTR(SCENE_U32) group_base;   /* vis_base -> group id */
+    SCENE_PTR(SCENE_U32) group_base; /* vis_base -> group id */
     SCENE_PTR(SceneGroupShade) group_shade;
     SCENE_PTR(SceneGpuMaterial) materials;
-
+    SCENE_PTR(float) bloom;
     SCENE_U32 counts[8]; /* 5 shader printf */
 };
 
