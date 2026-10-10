@@ -44,6 +44,8 @@ static void world_sphere(SceneInstance inst, SceneCullMesh cm, out float3 c, out
 /* ---- 6 frustum planes derived from the clip rows ---- */
 static bool frustum_visible(float3 c, float r)
 {
+    
+
     for (uint p = 0; p < 6u; ++p)
     {
         uint  axis = p >> 1;
