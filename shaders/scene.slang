@@ -1,11 +1,17 @@
-/* scene.slang — the GPU-driven 3D scene: cull (T2), vertex and fragment.
-   No mesh shaders: indexed indirect draw + vertex pull.
-   No data-dependent branch on any row field: the only exits are the dispatch
-   bounds guard and the visibility tests. */
+/* scene.slang — T5: the vertex and fragment stages of the GPU-driven draw.
+   Indexed indirect draw + vertex pull; no mesh shaders.
+   The cull kernel lives in cull.slang because the two stages want different
+   push constants and one module cannot declare two. */
 #include "common.slang"
 #include "../src/three_d/scene_shared.h"
 
-[[vk::push_constant]] ScenePush pc;
+[[vk::push_constant]] SceneDrawPush pc;
+
+/* textures[] and samplers[] come from common.slang: the material already holds
+   the bindless descriptor slot, so there is no per-draw binding work. Sampler 0 is SAMPLER_LINEAR_WRAP. The material could name its own, but every
+   albedo in the format wants the same one, and a per-material sampler choice is
+   a second uniform to fetch for no difference today. */
+#define SCENE_SAMPLER 0
 
 /* ---- quaternion (10-10-10-2) ---- */
 static float3 quat_rotate(SceneU32 q, float3 v)
@@ -13,13 +19,11 @@ static float3 quat_rotate(SceneU32 q, float3 v)
     int3   i  = int3((int)(q << 22) >> 22, (int)(q << 12) >> 22, (int)(q << 2) >> 22);
     float3 qv = float3(i) * (1.0f / 511.0f);
     float  qw = sqrt(max(0.0f, 1.0f - dot(qv, qv)));
-    if ((q >> 30) & 1u)
-        qw = -qw;
+    qw       = (q & (1u << 30)) != 0u ? -qw : qw; /* sign bit is data-dependent */
     float3 t = 2.0f * cross(qv, v);
     return v + qw * t + cross(qv, t);
 }
 
-/* ---- decode helpers ---- */
 static float2 unpack_half2(SceneU32 xy) { return float2(f16tof32(xy & 0xFFFFu), f16tof32(xy >> 16)); }
 
 static float3 unpack_oct(SceneU32 o)
@@ -28,125 +32,37 @@ static float3 unpack_oct(SceneU32 o)
     float3 n = float3(e.x, e.y, 1.0f - abs(e.x) - abs(e.y));
     float  t = max(-n.z, 0.0f);
     n.xy += float2(n.x >= 0.0f ? -t : t, n.y >= 0.0f ? -t : t);
-    return n;
+    return normalize(n);
 }
 
-/* ---- exact world sphere under uniform scale ---- */
-static void world_sphere(SceneInstance inst, SceneCullMesh cm, out float3 c, out float r)
-{
-    float3 local = float3(unpack_half2(cm.local_sphere_xy), f16tof32(cm.local_sphere_zr & 0xFFFFu));
-    float  s     = f16tof32(inst.scale);
-    float3 ipos  = float3(inst.pos[0], inst.pos[1], inst.pos[2]);
-    c            = ipos + quat_rotate(inst.quat, local * s);
-    r            = s * f16tof32(cm.local_sphere_zr >> 16);
-}
-
-/* ---- 6 frustum planes derived from the clip rows ---- */
-static bool frustum_visible(float3 c, float r)
-{
-    
-
-    for (uint p = 0; p < 6u; ++p)
-    {
-        uint  axis = p >> 1;
-        float sign = (p & 1u) ? -1.0f : 1.0f;
-        float4 row = pc.clip_rows[axis];
-        float4 plane = float4(pc.clip_rows[3].xyz + sign * row.xyz, pc.clip_rows[3].w + sign * row.w);
-        if (dot(plane.xyz, c) + plane.w < -r * length(plane.xyz))
-            return false;
-    }
-    return true;
-}
-
-/* ---- T2: cull. One thread per candidate. ---- */
-[shader("compute")]
-[numthreads(64, 1, 1)]
-void cs_cull(uint3 gid : SV_GroupID, uint3 tid : SV_DispatchThreadID)
-{
-    if (tid.x >= pc.counts[1])
-        return;
-
-    SceneCullRow  cr   = pc.cull_rows[tid.x];
-    SceneInstance inst = pc.instances[cr.slot];
-    SceneCullMesh cm   = pc.cull_meshes[cr.mesh];
-
-    float3 c;
-    float  r;
-    world_sphere(inst, cm, c, r);
-
-    if (!frustum_visible(c, r))
-    {
-        if (pc.counts[5] != 0u) /* DEBUG: identity of the rejected candidate */
-            printf("[CULLED] cand=%u slot=%u mesh=%u center=(%.4f, %.4f, %.4f) r=%.4f\n",
-                   tid.x, cr.slot, cr.mesh, c.x, c.y, c.z, r);
-
-        InterlockedAdd(pc.counters[SCENE_COUNTER_FRUSTUM], 1u);
-        return;
-    }
-
-    if (pc.counts[5] != 0u) /* DEBUG: sphere that passed, plus the true origin */
-        printf("[CULL] cand=%u slot=%u mesh=%u center=(%.4f, %.4f, %.4f) r=%.4f "
-               "origin=(%.4f, %.4f, %.4f)\n",
-               tid.x, cr.slot, cr.mesh, c.x, c.y, c.z, r,
-               float(inst.pos[0]), float(inst.pos[1]), float(inst.pos[2]));
-
-    /* LOD is arithmetic on data the visibility test already produced. The
-       ladder walk is a no-op until the asset carries rungs (lod_count == 1). */
-    uint lod = 0u;
-    if (cm.lod_count > 1u)
-    {
-        float dist   = max(length(c - pc.viewparams.xyz) - r, 0.0f);
-        float metric = dist * pc.viewparams.w / max(f16tof32(inst.scale), 1e-4f);
-        while (lod + 1u < cm.lod_count && pc.lod_rows[cm.lod_first + lod + 1u].error < metric)
-            ++lod;
-    }
-    int biased = clamp((int)lod + (int)inst.lod_bias, 0, (int)cm.lod_count - 1);
-    lod        = (uint)biased;
-
-    uint key = (lod << 30) | ((uint)cr.mesh << 16) | cr.slot;
-
-    uint idx;
-    InterlockedAdd(pc.survivor_count[0], 1u, idx);
-    if (idx < pc.counts[2])
-    {
-        pc.survivors[idx] = key;
-        InterlockedAdd(pc.counters[SCENE_COUNTER_DRAWN], 1u);
-        InterlockedAdd(pc.counters[SCENE_COUNTER_LOD0 + min(lod, 3u)], 1u);
-    }
-    else
-    {
-        InterlockedAdd(pc.counters[SCENE_COUNTER_DROPPED], 1u);
-    }
-}
-
-/* ---- vertex: indexed indirect draw, identity resolved from vis[] ---- */
 struct SceneVOut {
     float4               position : SV_Position;
     float3               normal   : TEXCOORD0;
     float2               uv       : TEXCOORD1;
     nointerpolation uint material : TEXCOORD2;
+    float3               world    : TEXCOORD3; /* the eye vector needs the world point, not the clip one */
 };
 
 [shader("vertex")]
 SceneVOut vs_main(uint vid : SV_VertexID, uint iid : SV_InstanceID, uint base_inst : SV_StartInstanceLocation)
 {
     /* Identity split, and which half each comes from is the whole point:
-         - mesh is uniform across the draw, so it comes from a per-draw row
-           addressed by the draw's own instance base (group_base[base_instance]),
-           read once and broadcast by the hardware;
+         - the group is uniform across the draw, so it comes from one row
+           addressed by the draw's own instance base (group_base[base_instance])
+           and read once, then broadcast by the hardware;
+         - that one row carries the rung's vertex stream and its material, so
+           mesh, stream and material are a single dependent load rather than the
+           chain group_base -> group_mesh -> shade_meshes -> vertex_stream;
          - the instance slot is the only genuinely per-lane datum, so it is the
-           only thing read per-lane, out of vis_all[] which holds a plain slot.
-       vis_all[] therefore needs no packed key and no decode. */
-    SceneU32 group    = pc.group_base[base_inst];
-    SceneU32 mesh     = pc.group_mesh[group] & 0xFFFFu;
+           only thing read per-lane, out of vis[] which holds a plain slot.
+       vis[] therefore needs no packed key and no decode. */
+    SceneGroupShade gs   = pc.group_shade[pc.group_base[base_inst]];
+    SceneU32        slot = pc.vis[base_inst + iid];
 
     /* iid is Slang SV_InstanceID == InstanceIndex - BaseInstance: draw-local.
        vis base is base_inst == firstInstance. */
-    SceneU32 slot     = pc.vis[base_inst + iid];
-
     SceneInstance     inst = pc.instances[slot];
-    SceneShadeMesh    sm   = pc.shade_meshes[mesh];
-    ScenePackedVertex v    = sm.vertex_stream[vid];
+    ScenePackedVertex v    = gs.vertex_stream[vid];
 
     float3 local = float3(unpack_half2(v.position_xy), f16tof32(v.position_z & 0xFFFFu));
     float  s     = f16tof32(inst.scale);
@@ -154,25 +70,102 @@ SceneVOut vs_main(uint vid : SV_VertexID, uint iid : SV_InstanceID, uint base_in
     float3 world = ipos + quat_rotate(inst.quat, local * s);
 
     if (pc.counts[5] != 0u && iid == 0u) /* DEBUG: one line per draw */
-        printf("[VS] base=%u iid=%u group=%u mesh=%u slot=%u pos=(%.4f, %.4f, %.4f)\n",
-               base_inst, iid, group, mesh, slot, world.x, world.y, world.z);
-    float3 nrm   = quat_rotate(inst.quat, unpack_oct(v.normal_oct));
+        printf("[VS] base=%u iid=%u slot=%u pos=(%.4f, %.4f, %.4f)\n", base_inst, iid, slot, world.x, world.y, world.z);
 
     SceneVOut o;
     o.position = float4(dot(pc.clip_rows[0], float4(world, 1.0f)), dot(pc.clip_rows[1], float4(world, 1.0f)),
                         dot(pc.clip_rows[2], float4(world, 1.0f)), dot(pc.clip_rows[3], float4(world, 1.0f)));
-    o.normal   = nrm;
+    o.normal   = normalize(quat_rotate(inst.quat, unpack_oct(v.normal_oct)));
     o.uv       = unpack_half2(v.uv);
-    o.material = sm.material;
+    o.material = gs.material;
+    o.world    = world;
     return o;
+}
+
+/* Cook-Torrance GGX against one directional light. Metalness and roughness come
+   from the material row, not from a constant, so a model that varies them looks
+   like itself rather than like every other model. */
+static float3 fresnel_schlick(float3 f0, float vdh)
+{
+    return f0 + (1.0f - f0) * pow(1.0f - vdh, 5.0f);
+}
+
+static float distribution_ggx(float ndh, float roughness)
+{
+    float a  = roughness * roughness;
+    float a2 = a * a;
+    float d  = ndh * ndh * (a2 - 1.0f) + 1.0f;
+    return a2 / max(3.14159265f * d * d, 1e-7f);
+}
+
+static float geometry_smith(float ndv, float ndl, float roughness)
+{
+    float k = (roughness + 1.0f) * (roughness + 1.0f) / 8.0f;
+    float gv = ndv / (ndv * (1.0f - k) + k);
+    float gl = ndl / (ndl * (1.0f - k) + k);
+    return gv * gl;
+}
+
+static float3 srgb_to_linear(float3 c)
+{
+    return pow(max(c, 0.0f), float3(2.2f));
 }
 
 [shader("fragment")]
 float4 fs_main(SceneVOut i) : SV_Target0
 {
-    SceneGpuMaterial m   = pc.materials[i.material];
-    float3           alb = float3(m.base_color & 255u, (m.base_color >> 8) & 255u, (m.base_color >> 16) & 255u) *
-                           (1.0f / 255.0f);
-    float light = pc.sun.w + (1.0f - pc.sun.w) * max(dot(normalize(i.normal), normalize(pc.sun.xyz)), 0.0f);
-    return float4(alb * light, 1.0f);
+    SceneGpuMaterial m = pc.materials[i.material];
+
+    float3 albedo = srgb_to_linear(float3(m.base_color & 255u, (m.base_color >> 8) & 255u,
+                                          (m.base_color >> 16) & 255u) * (1.0f / 255.0f));
+    if ((m.flags & SCENE_MAT_HAS_ALBEDO) != 0u)
+        albedo *= srgb_to_linear(textures[NonUniformResourceIndex(m.texture)].Sample(samplers[SCENE_SAMPLER], i.uv).rgb);
+
+    if ((m.flags & SCENE_MAT_UNLIT) != 0u)
+        return float4(albedo, 1.0f);
+
+    float3 n = normalize(i.normal);
+    float  ao = 1.0f;
+    // if ((m.flags & SCENE_MAT_HAS_NORMAL) != 0u) {
+    //     float3 map = textures[NonUniformResourceIndex(m.normal_texture)].Sample(samplers[SCENE_SAMPLER], i.uv).xyz * 2.0f - 1.0f;
+    //     float3 dpdx = ddx(i.world), dpdy = ddy(i.world);
+    //     float2 duvdx = ddx(i.uv), duvdy = ddy(i.uv);
+    //     float3 tangent = normalize(dpdx * duvdy.y - dpdy * duvdx.y);
+    //     float3 bitangent = normalize(-dpdx * duvdy.x + dpdy * duvdx.x);
+    //     n = normalize(map.x * tangent + map.y * bitangent + map.z * normalize(cross(tangent, bitangent)));
+    // }
+    if ((m.flags & SCENE_MAT_HAS_ORM) != 0u) {
+        float3 orm = textures[NonUniformResourceIndex(m.orm_texture)].Sample(samplers[SCENE_SAMPLER], i.uv).rgb;
+        ao = orm.r;
+        m.metallic = orm.b;
+        m.roughness = orm.g;
+    }
+    float3 v = normalize(pc.camera.xyz - i.world);
+    float3 l = pc.sun.xyz;                                   /* already normalized on the CPU */
+
+    float ndl = max(dot(n, l), 0.0f);
+    float ndv = max(dot(n, v), 1e-4f);
+    float3 h  = normalize(l + v);
+    float ndh = max(dot(n, h), 0.0f);
+    float vdh = max(dot(v, h), 0.0f);
+
+    float  metallic  = clamp(m.metallic, 0.0f, 1.0f);
+    float  roughness = clamp(m.roughness, 0.045f, 1.0f);
+    float3 f0       = lerp(float3(0.04f), albedo, metallic);
+    float3 f        = fresnel_schlick(f0, vdh);
+    float  d        = distribution_ggx(ndh, roughness);
+    float  g        = geometry_smith(ndv, ndl, roughness);
+    float3 spec     = f * (d * g / max(4.0f * ndv * ndl, 1e-6f));
+    float3 kd       = (1.0f - f) * (1.0f - metallic);
+
+    /* scene_set_sun takes the direction toward the light, so there is nothing
+       to negate here; flipping it lights the far side of every surface. */
+    float3 diffuse = kd * albedo * (1.0f / 3.14159265f);
+    float3 direct  = (diffuse + spec) * max(dot(n, l), 0.0f);
+    float3 ambient = albedo * pc.sun.w * ao;
+
+    /* Tone map so the scene has a usable range before the post chain. */
+    float3 color = direct + ambient;
+    color        = color / (color + float3(1.0f));
+    return float4(pow(color, float3(1.0f / 2.2f)), 1.0f);
 }

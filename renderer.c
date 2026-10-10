@@ -822,7 +822,7 @@ Renderer *renderer_create(bool use_wayland, GameHooks game) {
         .instance_layer_count        = 0,
         .instance_extension_count    = (uint32_t)platform_ext_count,
         .device_extension_count      = 2,
-        .enable_gpu_based_validation = true,
+        .enable_gpu_based_validation = GPU_VALIDATION,
         .enable_validation           = VALIDATION,
 
         .validation_severity =

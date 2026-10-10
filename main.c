@@ -10,27 +10,30 @@
 #include <string.h>
 /* =========================================================== 3D: cubepets
  *
- * Stress scene replacing the farm: a many-instance grid of mixed cube models
- * under a GPU frustum cull, drawn with one indexed indirect draw per mesh
- * slot. The camera is a mouse/keyboard orbit around the grid origin. */
+ * Stress scene replacing the farm: real cooked assets in a grid, under a GPU
+ * frustum cull, drawn with one indexed indirect draw per (mesh, lod) group.
+ * The camera is a mouse/keyboard flycam. */
 
-/* The grid exists to make the compaction pass do real work: PETS_MESHES is the
-   number of distinct (mesh,lod) groups, so PETS_MESHES above SCENE_SCAN_BLOCK
-   (1024) is what forces the two-level scan to use more than one block. A
-   single-group scene would prove the parallel scan nothing. */
-#define PETS_GRID     3u
-#define PETS_SPACING  3.0f
-#define PETS_MESHES   1200u
-#define PETS_PER_CELL 4u
-#define PETS_MODELS   6u
+/* The grid exists to make the compaction pass do real work: the number of
+   distinct (mesh,lod) groups must exceed SCENE_SCAN_BLOCK (1024) for the
+   two-level scan to use more than one block. A single-group scene would prove
+   the parallel scan nothing. */
+#define PETS_GRID     6u
+#define PETS_SPACING  3.5f
+#define PETS_MODELS   1u
+#define PETS_COPIES   1u
 
-static const char *const pets_models[PETS_MODELS] = {
-    "data/threedassets/kaykitadventure/Characters/gltf/Barbarian.glb",
-    "data/threedassets/kaykitadventure/Characters/gltf/Knight.glb",
-    "data/threedassets/kaykitadventure/Characters/gltf/Mage.glb",
-    "data/threedassets/kaykitadventure/Characters/gltf/Ranger.glb",
-    "data/threedassets/kaykitadventure/Characters/gltf/Rogue.glb",
-    "data/threedassets/kaykitadventure/Characters/gltf/Rogue_Hooded.glb",
+/* Cooked .mua files. Node transforms are baked into the vertices, so a model is
+   a group of meshes in one space: every mesh of a model gets its own instance
+   at the same transform. PETS_MODELS is how many of these to load: it is 1 to
+   look at Barbarian alone, and raising it brings the rest back in. */
+static const char *const pets_assets[] = {
+    "assets/Barbarian.mua",
+    "assets/Knight.mua",
+    "assets/Mage.mua",
+    "assets/Ranger.mua",
+    "assets/Rogue.mua",
+    "assets/Rogue_Hooded.mua",
 };
 
 /* Flycam state. Position is authoritative and freely movable; yaw/pitch are a
@@ -61,49 +64,47 @@ typedef struct CubePets {
 
 static CubePets g_pets;
 
-/* One unit cube: 24 packed vertices (per-face normals) + 36 u16 indices. */
-/* Builds PETS_MESHES distinct meshes out of one cube topology. They differ only
-   in local radius and material, which is enough: what the compaction pass sees
-   is one group per mesh, so this is what makes G large. */
-static void pets_build_cubes(Scene *scene) {
-    static const float face_n[6][3]    = {{0, 0, 1}, {0, 0, -1}, {1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}};
-    static const float face_v[6][4][3] = {
-        {{-0.5f, -0.5f, 0.5f}, {0.5f, -0.5f, 0.5f}, {0.5f, 0.5f, 0.5f}, {-0.5f, 0.5f, 0.5f}},
-        {{0.5f, -0.5f, -0.5f}, {-0.5f, -0.5f, -0.5f}, {-0.5f, 0.5f, -0.5f}, {0.5f, 0.5f, -0.5f}},
-        {{0.5f, -0.5f, 0.5f}, {0.5f, -0.5f, -0.5f}, {0.5f, 0.5f, -0.5f}, {0.5f, 0.5f, 0.5f}},
-        {{-0.5f, -0.5f, -0.5f}, {-0.5f, -0.5f, 0.5f}, {-0.5f, 0.5f, 0.5f}, {-0.5f, 0.5f, -0.5f}},
-        {{-0.5f, 0.5f, 0.5f}, {0.5f, 0.5f, 0.5f}, {0.5f, 0.5f, -0.5f}, {-0.5f, 0.5f, -0.5f}},
-        {{-0.5f, -0.5f, -0.5f}, {0.5f, -0.5f, -0.5f}, {0.5f, -0.5f, 0.5f}, {-0.5f, -0.5f, 0.5f}},
-    };
-    static const float face_uv[4][2] = {{0, 1}, {1, 1}, {1, 0}, {0, 0}};
-
-    struct ScenePackedVertex verts[24];
-    uint16_t                 indices[36];
-    for (uint32_t f = 0; f < 6; ++f) {
-        for (uint32_t v = 0; v < 4; ++v) {
-            scene_pack_vertex(&verts[f * 4 + v], face_v[f][v], face_n[f], face_uv[v]);
+/* Cooks every asset and lays the models out over the grid. Each model
+   contributes SceneAssetLoad.mesh_count instances — a character's nine parts
+   are nine meshes in one space, not nine models — so the instance total is the
+   sum over the assets, not PETS_MODELS.
+ *
+   Returns the number of meshes registered, or UINT32_MAX on a hard load
+   failure; the caller has already created the scene with matching capacities
+   and cannot proceed without them. */
+static uint32_t pets_build_assets(Scene *scene) {
+    uint32_t total_meshes = 0;
+    for (uint32_t m = 0; m < PETS_MODELS; ++m) {
+        SceneAssetLoad load;
+        char           err[256];
+        if (!scene_asset_load(scene, pets_assets[m], &load, err, sizeof(err))) {
+            log_error("[pets] %s: %s", pets_assets[m], err);
+            return UINT32_MAX;
         }
-        uint16_t base      = (uint16_t)(f * 4);
-        indices[f * 6 + 0] = base + 0;
-        indices[f * 6 + 1] = base + 1;
-        indices[f * 6 + 2] = base + 2;
-        indices[f * 6 + 3] = base + 0;
-        indices[f * 6 + 4] = base + 2;
-        indices[f * 6 + 5] = base + 3;
-    }
+        log_info("[pets] %s: %u meshes, %u verts, %u indices, %u rungs, radius %.2f", pets_assets[m], load.mesh_count,
+                 load.vertex_count, load.index_count, load.lod_count, load.radius);
 
-    for (uint32_t m = 0; m < PETS_MESHES; ++m) {
-        /* All cubes share one topology; groups differ by index, which is all
-           the compaction pass needs. (The old k variation was dead code.) */
-        scene_mesh_add(scene, &(SceneMeshDesc){.vertices     = verts,
-                                               .vertex_count = 24,
-                                               .indices      = indices,
-                                               .index_count  = 36,
-                                               .local_center = {0, 0, 0},
-                                                  .local_radius = 0.8660254f,
-                                               .material     = 0});
+        /* One character per cell. A model is a rigid assembly of meshes in one
+           space, so every one of its meshes gets the same transform — spreading
+           them out would show a disassembled model rather than one. */
+        for (uint32_t c = 0; c < PETS_GRID * PETS_GRID * PETS_COPIES; ++c) {
+            float x = ((float)(c % PETS_GRID) - (float)PETS_GRID * 0.5f + 0.5f) * PETS_SPACING;
+            float z = ((float)((c / PETS_GRID) % PETS_GRID) - (float)PETS_GRID * 0.5f + 0.5f) * PETS_SPACING;
+
+            for (uint32_t i = 0; i < load.mesh_count; ++i) {
+                SceneInstanceDesc d = {.pos = {x, 0.0f, z}, .quat = {0, 0, 0, 0}, .scale = 1.0f,
+                                       .mesh = load.first_mesh + i};
+                /* Alternate so both slot regions are populated in every row. */
+                if (((c + i) & 1u) == 0u)
+                    scene_instance_create(scene, &d);
+                else
+                    scene_instance_create_static(scene, &d);
+            }
+        }
+        total_meshes += load.mesh_count;
     }
-    log_info("[cubepets] %u meshes registered", PETS_MESHES);
+    log_info("[pets] %u meshes registered from %u models", total_meshes, PETS_MODELS);
+    return total_meshes;
 }
 
 static void pets_start(void *user, Renderer *renderer) {
@@ -229,6 +230,10 @@ static void pets_frame(void *user, const GameFrame *frame) {
             logged = !logged;
         }
 
+        static int dbg = 0;
+        if (++dbg % 120 == 0)
+            log_info("[pets] sub=%u frustum=%u drawn=%u draws=%u dropped=%u lod=%u/%u/%u", c.submitted, c.culled_frustum,
+                     c.drawn, c.draws, c.dropped, c.lod[0], c.lod[1], c.lod[2]);
         if (!logged && c.drawn > 0) {
             logged = true;
             log_info("[cubepets] counters: submitted=%u frustum_culled=%u drawn=%u draws=%u dropped=%u", c.submitted,
@@ -238,10 +243,6 @@ static void pets_frame(void *user, const GameFrame *frame) {
     renderer_hud(frame->renderer, "flycam: %.1f %.1f %.1f  yaw %.2f pitch %.2f  speed %.0f", p->cam.pos[0],
                  p->cam.pos[1], p->cam.pos[2], p->cam.yaw, p->cam.pitch, p->cam.speed);
     renderer_hud(frame->renderer, "WASD move  Q/E down-up  Shift boost  RMB look  wheel speed");
-
-
-
-
 }
 
 /* GameHooks.render: lazy-init (needs a command buffer for upload + the pass
@@ -250,52 +251,37 @@ static void pets_render(void *user, VkCommandBuffer cmd, RenderTarget *color, Re
     CubePets *p = (CubePets *)user;
 
     if (!p->scene) {
-        /* Half the cells are static (written once, never again) and half are
-           dynamic (rewritten every frame). That split is what the C6 partition
-           exists for, and both kinds must land in the same slot space. */
-        uint32_t cells    = PETS_GRID * PETS_GRID;
-        uint32_t per_cell = PETS_PER_CELL;
-        uint32_t total    = cells * per_cell;
-        uint32_t half     = total / 2;
-        Scene   *scene    = scene_create(p->vk, &(SceneDesc){.max_instances    = total,
-                                                             .dynamic_capacity = half,
-                                                             .static_capacity  = total - half,
-                                                             .max_meshes       = PETS_MESHES,
-                                                             .max_lod_rows     = PETS_MESHES,
-                                                             .max_materials    = 4,
-                                                             .max_survivors    = total});
+        /* Capacities come from the assets themselves rather than from a
+           constant: mesh and LOD capacities are fixed at scene_create and
+           cannot grow, so a hardcoded number is a number that is wrong the
+           first time somebody adds a prop. */
+        uint32_t max_meshes = 0, max_lod_rows = 0, max_materials = 0, total = 0;
+        for (uint32_t m = 0; m < PETS_MODELS; ++m) {
+            SceneAssetProbe probe;
+            char            err[256];
+            if (!scene_asset_probe(pets_assets[m], &probe, err, sizeof(err))) {
+                log_error("[pets] %s: %s", pets_assets[m], err);
+                return;
+            }
+            max_meshes += probe.mesh_count;
+            max_lod_rows += probe.lod_rows;
+            max_materials += probe.material_count;
+            total += probe.mesh_count * PETS_COPIES * PETS_GRID * PETS_GRID;
+        }
+
+        uint32_t half = total / 2;
+        Scene   *scene = scene_create(p->vk, &(SceneDesc){.max_instances    = total,
+                                                         .dynamic_capacity = half,
+                                                         .static_capacity  = total - half,
+                                                         .max_meshes       = max_meshes,
+                                                         .max_lod_rows     = max_lod_rows,
+                                                         .max_materials    = max_materials ? max_materials : 4,
+                                                         .max_survivors    = total});
         if (!scene)
             return;
-        pets_build_cubes(scene);
-
-        /* One unique mesh per instance so every group the scan sees is
-           populated: draws == instances instead of 4. Inside a cell the 4
-           cubes sit on a 2x2 sub-grid at +/-0.75: 1.5 pitch vs 1.0 size
-           leaves a 0.5 gap, so no two cubes in the same cell intersect.
-           The old jx/jz walked 0..~2 diagonally, stacking 1.0-wide cubes
-           ~0.3 apart — that overlap is the staircase. */
-        const float cell_half = (float)PETS_GRID * PETS_SPACING * 0.5f;
-        uint32_t    inst      = 0;
-        for (uint32_t z = 0; z < PETS_GRID; ++z) {
-            for (uint32_t x = 0; x < PETS_GRID; ++x) {
-                for (uint32_t m = 0; m < PETS_MESHES; ++m) {
-                    if (m >= per_cell)
-                        break;
-                    float             ox = ((m & 1u) != 0u) ? 0.75f : -0.75f;
-                    float             oz = ((m & 2u) != 0u) ? 0.75f : -0.75f;
-                    SceneInstanceDesc d  = {.pos   = {(float)x * PETS_SPACING - cell_half + ox, 0.0f,
-                                                      (float)z * PETS_SPACING - cell_half + oz},
-                                            .quat  = {0, 0, 0, 0},
-                                            .scale = 1.0f,
-                                            .mesh  = inst % PETS_MESHES};
-                    /* Alternate so both regions are populated in every row. */
-                    if (((x + z + m) & 1u) == 0u)
-                        scene_instance_create(scene, &d);
-                    else
-                        scene_instance_create_static(scene, &d);
-                    ++inst;
-                }
-            }
+        if (pets_build_assets(scene) == UINT32_MAX) {
+            scene_destroy(scene);
+            return;
         }
 
         if (!scene_upload_scene(scene, cmd)) {
@@ -304,13 +290,8 @@ static void pets_render(void *user, VkCommandBuffer cmd, RenderTarget *color, Re
         }
         scene_set_sun(scene, (const float[3]){0.4f, 0.8f, 0.3f}, 0.18f);
         p->scene = scene;
-
-        /* Destroy every other instance and reclaim the holes. Exercises the
-           existence-based removal path (candidate rows go away, slots retire,
-           no death flag is ever tested) and proves compaction restores a dense
-           slot space afterwards. */
-               log_info("[cubepets] after destroy+compact: %u instances, %u dynamic, %u static", total / 2, total / 4,
-                 total / 4);
+        log_info("[pets] scene live: %u instances, %u meshes, %u rungs, %u groups", total, max_meshes,
+                 scene_lod_count(scene), max_meshes * scene_lod_count(scene));
     }
 
     /* camera: the flycam's eye and forward vector, built during pets_frame */
@@ -336,7 +317,7 @@ static void pets_render(void *user, VkCommandBuffer cmd, RenderTarget *color, Re
         float t = 1.0f / tanf(glm_rad(60.0f) * 0.5f);
         glm_mat4_zero(proj);
         proj[0][0] = t / aspect;
-        proj[1][1] = t;
+        proj[1][1] = -t;
         /* z_clip = near, w_clip = -z_view, so z_ndc = near/dist: 1.0 at the near
            plane falling to 0 at infinity. That is the reverse-Z mapping, and it
            is why [2][2] is 0 and [3][2] is +near. cglm's *_rh_zo infinite entry
@@ -355,14 +336,26 @@ static void pets_render(void *user, VkCommandBuffer cmd, RenderTarget *color, Re
     vd.camera_pos[0] = eye[0];
     vd.camera_pos[1] = eye[1];
     vd.camera_pos[2] = eye[2];
-    vd.lod_target    = 1.0f;
+/* The cooker writes each rung's error in the mesh's own world units, and the
+       cull compares it against dist * lod_target / scale. Making that a real
+       screen-space tolerance means solving for the factor: a world length L at
+       distance d covers L*H / (2*d*tan(fovy/2)) pixels, so a rung is
+       acceptable when its error covers at most T pixels, which is exactly
+       error <= T * 2*tan(fovy/2) * d / (H * scale). Hence:
+
+           lod_target = T * 2 * tan(fovy/2) / H
+
+       Anything else compares pixels to metres. T = 2 px hides the pop a
+       one-pixel threshold would show. The fovy must be the one the projection
+       below actually builds. */
+    vd.lod_target    = 2.0f * 2.0f * tanf(glm_rad(60.0f) * 0.5f) / (float)color->height;
     vd.near_z        = 0.1f;
     vd.far_z         = 400.0f;
     scene_view_set(p->scene, 0, &vd);
 
     /* TEMP instrumentation: auto-screenshot once the scene has rendered. */
     {
-        bool capture_take_screenshot(void *renderer, const char *path);
+        bool       capture_take_screenshot(void *renderer, const char *path);
         static int shot = 0;
         if (++shot == 180)
             capture_take_screenshot(p->renderer, "/tmp/kilo/cubepets_shot.png");

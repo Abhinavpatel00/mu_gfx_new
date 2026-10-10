@@ -34,7 +34,8 @@
 
 
 #define MAX_COLOR_ATTACHMENTS 8
-#define VALIDATION true
+#define VALIDATION true 
+#define GPU_VALIDATION false 
 
 
 // Root capture directory. Everything user-facing goes under here.

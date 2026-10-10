@@ -160,11 +160,35 @@ void cs_scan_blocks(uint3 gid : SV_GroupID, uint3 lid : SV_GroupThreadID)
 
     if (lid.x == 0u)
     {
-        pc.draw_count[0] = s_thread[SCAN_THREADS - 1u].y;
-        /* Mirror the command count into the counter ring so the lag-2 readback
-           reports it. This is the number a CPU reference can be checked
-           against: draw_count must equal the number of non-empty groups. */
-        pc.counters[SCENE_COUNTER_DRAWS] = s_thread[SCAN_THREADS - 1u].y;
+        /* The inclusive totals the scan already produced answer for every
+           counter the cull used to accumulate with an atomic. Drawn is the sum
+           of the per-group instance counts; dropped was the one count with no
+           place in this pass, so the cull still bumps it and it is folded in
+           here. Frustum-rejected is then just what is left over, and Hi-Z is
+           not implemented, so it is a constant.
+
+           Doing it this way is the difference between one atomic per candidate
+           and one write per frame, on a counter block small enough that every
+           thread in the dispatch shares a cache line. */
+        uint2 total = s_thread[SCAN_THREADS - 1u];
+        uint  drawn = total.x;
+        uint  drop  = pc.counters[SCENE_COUNTER_DROPPED];
+        pc.counters[SCENE_COUNTER_DRAWN]   = drawn;
+        pc.counters[SCENE_COUNTER_FRUSTUM] = pc.counts[3] - drawn - drop;
+        pc.counters[SCENE_COUNTER_HIZ]     = 0u;
+        pc.counters[SCENE_COUNTER_DRAWS]   = total.y;
+        pc.draw_count[0]                   = total.y;
+
+        /* The per-LOD totals are accumulated by cs_emit, which runs after this
+           dispatch, so this is where they start from. Storing DRAWN and friends
+           above is an overwrite; these four need clearing because cs_emit adds
+           into them and several groups share one bucket. Clearing them here
+           costs one thread's worth of stores and saves a per-frame fill of the
+           whole counter block. */
+        pc.counters[SCENE_COUNTER_LOD0 + 0u] = 0u;
+        pc.counters[SCENE_COUNTER_LOD0 + 1u] = 0u;
+        pc.counters[SCENE_COUNTER_LOD0 + 2u] = 0u;
+        pc.counters[SCENE_COUNTER_LOD0 + 3u] = 0u;
     }
 }
 
@@ -196,6 +220,10 @@ void cs_emit(uint3 gid : SV_GroupID, uint3 lid : SV_GroupThreadID)
                vis_base[g], which is uniform across the draw — a broadcast, not
                a per-lane gather. */
             pc.group_base[pc.vis_base[g]] = g;
+            /* Per-LOD totals are G atomic adds at most, against one per drawn
+               candidate in the cull: same information, one thousandth of the
+               contention on the counter line. */
+            InterlockedAdd(pc.counters[SCENE_COUNTER_LOD0 + min(g % pc.counts[0], 3u)], pc.group_count[g]);
         }
     }
 }
