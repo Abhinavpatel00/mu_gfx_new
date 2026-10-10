@@ -64,6 +64,81 @@ typedef struct NuklearUi {
     float                       height;
 } NuklearUi;
 
+/* Grade state. The bitmask mirrors shaders/postprocess.slang: a set bit means
+   "apply this stage", so a stage can be skipped without a magic neutral value.
+   Falls back to a tuned cartoon preset and is overridden live from the UI. */
+#define POST_EXPOSURE      (1u << 0)
+#define POST_TONEMAP       (1u << 1)
+#define POST_GAMMA         (1u << 2)
+#define POST_CONTRAST      (1u << 3)
+#define POST_SATURATION    (1u << 4)
+#define POST_WHITE_BALANCE (1u << 5)
+#define POST_VIGNETTE      (1u << 6)
+#define POST_GRAIN         (1u << 7)
+#define POST_SHARPEN       (1u << 8)
+#define POST_CA            (1u << 9)
+#define POST_DITHER        (1u << 10)
+#define POST_SEPIA         (1u << 11)
+#define POST_LIFT_GAIN     (1u << 12)
+
+typedef struct PostSettings {
+    uint32_t flags;
+    uint32_t tonemap_mode; /* 0 neutral 1 aces 2 reinhard 3 reinhard2 4 filmic 5 uncharted2 6 unreal */
+    float    exposure;     /* log2 stops */
+    float    gamma;
+    float    contrast;
+    float    saturation;
+    float    temperature;
+    float    tint;
+    float    vignette;
+    float    vignette_smoothness;
+    float    sharpen;
+    float    ca;
+    float    grain;
+    float    sepia;
+    float    dither;
+    float    lift[3];
+    float    gain[3];
+    float    lut_strength;
+    float    bloom_strength;
+    float    bloom_threshold;
+    float    bloom_knee;
+    bool     toon; /* cel-shade the scene instead of the PBR pipeline */
+} PostSettings;
+
+/* The Slime-Rancher-ish starting point: bright, saturated, soft highlights.
+   Numbers, not a LUT, so the look survives without an external asset. */
+static PostSettings post_settings_cartoon(void) {
+    return (PostSettings){
+        /* Every stage on, with neutral defaults for the ones the preset does not
+           use, so each UI slider takes effect without a separate enable. */
+        .flags               = POST_EXPOSURE | POST_TONEMAP | POST_GAMMA | POST_CONTRAST | POST_SATURATION |
+                               POST_WHITE_BALANCE | POST_VIGNETTE | POST_GRAIN | POST_SHARPEN | POST_CA |
+                               POST_DITHER | POST_SEPIA | POST_LIFT_GAIN,
+        .tonemap_mode        = 1u, /* ACES */
+        .exposure            = 0.35f,
+        .gamma               = 2.2f,
+        .contrast            = 1.08f,
+        .saturation          = 1.35f,
+        .temperature         = 0.02f,
+        .tint                = 0.0f,
+        .vignette            = 0.25f,
+        .vignette_smoothness = 0.55f,
+        .sharpen             = 0.0f,
+        .ca                  = 0.0f,
+        .grain               = 0.0f,
+        .sepia               = 0.0f,
+        .dither              = 1.0f,
+        .lift                = {0.0f, 0.0f, 0.0f},
+        .gain                = {1.0f, 1.0f, 1.0f},
+        .lut_strength        = 0.0f,
+        .bloom_strength      = 0.65f,
+        .bloom_threshold     = 0.85f,
+        .bloom_knee          = 0.5f,
+        .toon                = false,
+    };
+}
+
 struct Renderer {
     VkBackend vk;
 
@@ -85,6 +160,12 @@ struct Renderer {
     RenderTarget       smaa_final[MAX_SWAPCHAIN_IMAGES];
     RenderTarget       smaa_edges[MAX_SWAPCHAIN_IMAGES];
     RenderTarget       smaa_weights[MAX_SWAPCHAIN_IMAGES];
+    RenderTarget       bloom_a[MAX_SWAPCHAIN_IMAGES]; /* half-res, ping */
+    RenderTarget       bloom_b[MAX_SWAPCHAIN_IMAGES]; /* half-res, pong */
+    TextureID          lut_texture;
+    uint32_t           lut_size;
+    PostSettings       post;
+    bool               debug_ui_open;
     TextureID          dummy_texture;
     TextureID          smaa_area_tex;
     TextureID          smaa_search_tex;
@@ -111,6 +192,7 @@ struct Renderer {
         uint32_t sky;
         uint32_t skinning;
         uint32_t grass;
+        uint32_t bloom;
     } EnginePipelines;
 };
 
@@ -480,6 +562,33 @@ static void capture_record(Renderer *r, VkCommandBuffer cmd) {
 }
 #include "src/nuklear_renderer.inl"
 
+/* A neutral (identity) strip LUT: n x n cells of n x n texels, blue major.
+   Generated so the LUT path is always valid; dropping a real LUT in and setting
+   lut_strength is all it takes to use one. */
+static void create_identity_lut(Renderer *r) {
+    const uint32_t N   = 32u;
+    const uint32_t W   = N * N;
+    uint8_t       *px  = (uint8_t *)malloc((size_t)W * N * 4u);
+    for (uint32_t y = 0; y < N; ++y)
+        for (uint32_t x = 0; x < W; ++x) {
+            uint8_t *p = px + ((size_t)y * W + x) * 4u;
+            p[0]       = (uint8_t)((x % N) * 255u / (N - 1u));
+            p[1]       = (uint8_t)(y * 255u / (N - 1u));
+            p[2]       = (uint8_t)((x / N) * 255u / (N - 1u));
+            p[3]       = 255u;
+        }
+    TextureCreateDesc desc = {.width     = W,
+                              .height    = N,
+                              .mip_count = 1,
+                              .format    = VK_FORMAT_R8G8B8A8_UNORM,
+                              .usage     = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT};
+    r->lut_texture = create_texture(&r->vk, &desc);
+    r->lut_size    = N;
+    texture_upload(&r->vk, r->lut_texture, 0, 0, (VkOffset3D){0, 0, 0}, (VkExtent3D){W, N, 1},
+                   (ByteSpan){px, W * N * 4u});
+    free(px);
+}
+
 static void renderer_resources_create(Renderer *r, VkBackendDesc *desc) {
     MemTag prev = vk_mem_set_tag(&r->vk, MEM_TAG_POST);
     VkFormat depth_format = pick_depth_format(r->vk.devc.physical_device);
@@ -666,6 +775,18 @@ static void renderer_resources_create(Renderer *r, VkBackendDesc *desc) {
         r->smaa_area_tex   = smaa_area;
         r->smaa_search_tex = smaa_search;
     }
+    /* Bloom runs at half resolution: the blur is wide and low-frequency, so
+       the extra resolution buys nothing and costs bandwidth. */
+    uint32_t      bw = r->vk.swapchain.extent.width > 1u ? r->vk.swapchain.extent.width / 2u : 1u;
+    uint32_t      bh = r->vk.swapchain.extent.height > 1u ? r->vk.swapchain.extent.height / 2u : 1u;
+    RenderTargetSpec bloom_spec = {.width      = bw,
+                                   .height     = bh,
+                                   .layers     = 1,
+                                   .format     = hdr_format,
+                                   .usage      = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                                   .mip_count  = 1,
+                                   .debug_name = "bloom"};
+
     forEach(i, r->vk.swapchain.image_count) {
         rt_create(&r->vk, &r->depth[i], &depth_spec);
         rt_create(&r->vk, &r->hdr_color[i], &hdr_spec);
@@ -674,6 +795,8 @@ static void renderer_resources_create(Renderer *r, VkBackendDesc *desc) {
 
         rt_create(&r->vk, &r->smaa_edges[i], &smaa_edge_spec);
         rt_create(&r->vk, &r->smaa_weights[i], &smaa_weight_spec);
+        rt_create(&r->vk, &r->bloom_a[i], &bloom_spec);
+        rt_create(&r->vk, &r->bloom_b[i], &bloom_spec);
     }
 
     vk_mem_set_tag(&r->vk, MEM_TAG_CORE);
@@ -788,7 +911,20 @@ static void renderer_resources_create(Renderer *r, VkBackendDesc *desc) {
 
             r->EnginePipelines.fire = pipeline_create_graphics(&r->vk, &cfg);
         }
+
+        r->EnginePipelines.bloom = pipeline_create_compute(&r->vk, "compiledshaders/bloom.comp.spv");
+
+        {
+            GraphicsPipelineConfig cfg = pipeline_config_fullscreen();
+            cfg.vert_path              = "compiledshaders/sky.vert.spv";
+            cfg.frag_path              = "compiledshaders/sky.frag.spv";
+            cfg.color_formats          = &r->hdr_color[0].format;
+            r->EnginePipelines.sky     = pipeline_create_graphics(&r->vk, &cfg);
+        }
     }
+
+    r->post = post_settings_cartoon();
+    create_identity_lut(r);
 
     if (r->game.two_d)
         r->two_d = two_d_create(&r->vk, &r->hdr_color[0].format);
@@ -1027,6 +1163,8 @@ static MU_INLINE bool frame_start(Renderer *r) {
             rt_resize(&r->vk, &r->smaa_final[i], fb_w, fb_h);
             rt_resize(&r->vk, &r->smaa_edges[i], fb_w, fb_h);
             rt_resize(&r->vk, &r->smaa_weights[i], fb_w, fb_h);
+            rt_resize(&r->vk, &r->bloom_a[i], fb_w / 2, fb_h / 2);
+            rt_resize(&r->vk, &r->bloom_b[i], fb_w / 2, fb_h / 2);
         }
 
         capture_resize(r, (uint32_t)fb_w, (uint32_t)fb_h);
@@ -1084,10 +1222,21 @@ static void update_global_data(Renderer *r) {
     vkUpdateDescriptorSets(r->vk.devc.device, 1, &write, 0, NULL);
 }
 
-PUSH_CONSTANT(PostPush, uint32_t src_texture_id; uint32_t output_image_id; uint32_t sampler_id; uint32_t width;
-              uint32_t height; uint frame; float exposure;
+/* Field order is the shader's: both sides are flat scalars, so the layouts
+   line up word for word. */
+PUSH_CONSTANT(PostPush,
+              uint32_t src_texture_id; uint32_t output_image_id; uint32_t sampler_id; uint32_t width;
+              uint32_t height; uint32_t frame; float exposure; uint32_t flags; uint32_t tonemap_mode;
+              float gamma_value; float contrast; float saturation; float temperature; float tint;
+              float vignette_intensity; float vignette_smoothness; float sharpen_strength; float ca_strength;
+              float grain_intensity; float sepia_intensity; float dither_strength; float lift_r; float lift_g;
+              float lift_b; float gain_r; float gain_g; float gain_b; uint32_t lut_texture_id; uint32_t lut_size;
+              float lut_strength; uint32_t bloom_texture_id; float bloom_strength; float time;);
 
-);
+PUSH_CONSTANT(BloomPush, uint32_t src_texture_id; uint32_t dst_image_id; uint32_t sampler_id; uint32_t width;
+              uint32_t height; float dir_x; float dir_y; float threshold; float soft_knee; uint32_t prefilter;);
+
+PUSH_CONSTANT(SkyPush, float top[4]; float bottom[4]; float exponent; float pad0; float pad1; float pad2;);
 PUSH_CONSTANT(EdgePush, uint32_t texture_id; uint32_t sampler_id;);
 
 PUSH_CONSTANT(BlendPush, uint32_t color_tex; uint32_t weight_tex; uint32_t sampler_id; uint32_t pad;);
@@ -1096,31 +1245,118 @@ PUSH_CONSTANT(WeightPush, uint32_t edge_tex; uint32_t area_tex; uint32_t search_
 
 #include "src/nuklear_profiler.inl"
 
+/* Bright-prefilter the HDR image and blur it: pass 1 blurs x into bloom_a,
+   pass 2 blurs y into bloom_b. The post pass reads bloom_b. */
+static void pass_bloom(Renderer *r, VkCommandBuffer cmd, uint32_t image) {
+    if (r->post.bloom_strength <= 0.0f)
+        return;
+
+    RenderTarget *hdr = &r->hdr_color[image];
+    RenderTarget *a   = &r->bloom_a[image];
+    RenderTarget *b   = &r->bloom_b[image];
+
+    RenderTarget *reads1[]  = {hdr};
+    RenderTarget *writes1[] = {a};
+    PassDesc      pd1       = {.shader_reads       = reads1,
+                               .shader_read_count  = 1,
+                               .shader_writes      = writes1,
+                               .shader_write_count = 1,
+                               .pipeline           = r->EnginePipelines.bloom};
+    begin_pass(&r->vk, cmd, &pd1);
+    BloomPush p1 = {.src_texture_id = hdr->bindless_index,
+                    .dst_image_id   = a->bindless_index,
+                    .sampler_id     = r->vk.default_samplers.samplers[SAMPLER_LINEAR_CLAMP],
+                    .width          = a->width,
+                    .height         = a->height,
+                    .dir_x          = 1.0f,
+                    .dir_y          = 0.0f,
+                    .threshold      = r->post.bloom_threshold,
+                    .soft_knee      = r->post.bloom_knee,
+                    .prefilter      = 1u};
+    dispatch_push(&r->vk, cmd, BYTE_SPAN(p1), (p1.width + 15) / 16, (p1.height + 15) / 16, 1);
+    end_pass(&r->vk, cmd, &pd1);
+
+    RenderTarget *reads2[]  = {a};
+    RenderTarget *writes2[] = {b};
+    PassDesc      pd2       = {.shader_reads       = reads2,
+                               .shader_read_count  = 1,
+                               .shader_writes      = writes2,
+                               .shader_write_count = 1,
+                               .pipeline           = r->EnginePipelines.bloom};
+    begin_pass(&r->vk, cmd, &pd2);
+    BloomPush p2 = {.src_texture_id = a->bindless_index,
+                    .dst_image_id   = b->bindless_index,
+                    .sampler_id     = r->vk.default_samplers.samplers[SAMPLER_LINEAR_CLAMP],
+                    .width          = b->width,
+                    .height         = b->height,
+                    .dir_x          = 0.0f,
+                    .dir_y          = 1.0f,
+                    .threshold      = 0.0f,
+                    .soft_knee      = 0.0f,
+                    .prefilter      = 0u};
+    dispatch_push(&r->vk, cmd, BYTE_SPAN(p2), (p2.width + 15) / 16, (p2.height + 15) / 16, 1);
+    end_pass(&r->vk, cmd, &pd2);
+}
+
 static void post_pass(Renderer *r, VkCommandBuffer cmd) {
     uint32_t image = r->vk.swapchain.current_image;
 
+    pass_bloom(r, cmd, image);
+
+    const PostSettings *s        = &r->post;
+    bool                bloom_on = s->bloom_strength > 0.0f;
+
     GpuProfiler *frame_prof = &r->vk.gpuprofiler[r->vk.current_frame];
     GPU_SCOPE(frame_prof, cmd, "Post Processing", VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT) {
-        RenderTarget *reads[]  = {&r->hdr_color[image]};
+        /* bloom_b was written as a storage image by the bloom passes, so naming
+           it here is what transitions it to a sampled read. */
+        RenderTarget *reads[2] = {&r->hdr_color[image], &r->bloom_b[image]};
         RenderTarget *writes[] = {&r->ldr_color[image]};
 
         begin_pass(&r->vk, cmd,
                    &(PassDesc){
                        .shader_reads       = reads,
-                       .shader_read_count  = 1,
+                       .shader_read_count  = bloom_on ? 2u : 1u,
                        .shader_writes      = writes,
                        .shader_write_count = 1,
                        .pipeline           = r->EnginePipelines.postprocess,
                    });
 
-        PostPush push = {
-            .src_texture_id  = r->hdr_color[image].bindless_index,
-            .output_image_id = r->ldr_color[image].bindless_index,
-            .sampler_id      = r->vk.default_samplers.samplers[SAMPLER_LINEAR_CLAMP],
-            .width           = r->vk.swapchain.extent.width,
-            .height          = r->vk.swapchain.extent.height,
-            .frame           = 0,
-            .exposure        = 1.2f,
+        uint32_t bloom_id = bloom_on ? r->bloom_b[image].bindless_index : 0xFFFFFFFFu;
+        PostPush            push     = {
+                         .src_texture_id      = r->hdr_color[image].bindless_index,
+                         .output_image_id     = r->ldr_color[image].bindless_index,
+                         .sampler_id          = r->vk.default_samplers.samplers[SAMPLER_LINEAR_CLAMP],
+                         .width               = r->vk.swapchain.extent.width,
+                         .height              = r->vk.swapchain.extent.height,
+                         .frame               = r->frame_count,
+                         .exposure            = s->exposure,
+                         .flags               = s->flags,
+                         .tonemap_mode        = s->tonemap_mode,
+                         .gamma_value         = s->gamma,
+                         .contrast            = s->contrast,
+                         .saturation          = s->saturation,
+                         .temperature         = s->temperature,
+                         .tint                = s->tint,
+                         .vignette_intensity  = s->vignette,
+                         .vignette_smoothness = s->vignette_smoothness,
+                         .sharpen_strength    = s->sharpen,
+                         .ca_strength         = s->ca,
+                         .grain_intensity     = s->grain,
+                         .sepia_intensity     = s->sepia,
+                         .dither_strength     = s->dither,
+                         .lift_r              = s->lift[0],
+                         .lift_g              = s->lift[1],
+                         .lift_b              = s->lift[2],
+                         .gain_r              = s->gain[0],
+                         .gain_g              = s->gain[1],
+                         .gain_b              = s->gain[2],
+                         .lut_texture_id      = r->lut_texture,
+                         .lut_size            = r->lut_size,
+                         .lut_strength        = s->lut_strength,
+                         .bloom_texture_id    = bloom_id,
+                         .bloom_strength      = s->bloom_strength,
+                         .time = (float)((double)(mu_time_now() - r->start_time) / mu_time_freq()),
         };
 
         dispatch_push(&r->vk, cmd, BYTE_SPAN(push), (push.width + 15) / 16, (push.height + 15) / 16, 1);
@@ -1479,6 +1715,8 @@ void renderer_hud(Renderer *r, const char *fmt, ...) {
 
 VkBackend *renderer_vk(Renderer *r) { return &r->vk; }
 
+bool renderer_toon(Renderer *r) { return r ? r->post.toon : false; }
+
 struct SpriteSystem *renderer_sprites(Renderer *r) {
     return r->two_d ? two_d_sprites(r->two_d) : NULL;
 }
@@ -1487,11 +1725,15 @@ struct SpriteSystem *renderer_sprites(Renderer *r) {
    the 2D stage through sprite_flush, or the core when 2D is opted out. */
 static const float kSceneClear[4] = {0.02f, 0.025f, 0.03f, 1.0f};
 
-static void pass_clear_hdr(Renderer *r, VkCommandBuffer cmd, RenderTarget *target) {
+/* Draws a bright vertical gradient into the HDR target before the scene. The
+   scene then loads instead of clearing, so the sky stays behind geometry. */
+static void pass_sky(Renderer *r, VkCommandBuffer cmd, RenderTarget *target) {
     PassAttachment color = {.target = target, .load = LOAD_CLEAR, .store = STORE_KEEP};
-    forEach(i, 4) color.clear[i] = kSceneClear[i];
-    PassDesc pd = {.colors = &color, .color_count = 1, .pipeline = 0};
+    PassDesc       pd    = {.colors = &color, .color_count = 1, .pipeline = r->EnginePipelines.sky};
     begin_pass(&r->vk, cmd, &pd);
+    SkyPush sp = {.top = {0.28f, 0.60f, 0.98f, 1.0f}, .bottom = {0.86f, 0.95f, 1.0f, 1.0f}, .exponent = 0.65f};
+    push_constants(&r->vk, cmd, (ByteSpan){&sp, sizeof(sp)});
+    vkCmdDraw(cmd, 3, 1, 0, 0);
     end_pass(&r->vk, cmd, &pd);
 }
 
@@ -1524,8 +1766,6 @@ bool renderer_frame(Renderer *r) {
 
     VkCommandBuffer cmd        = r->vk.frames[r->vk.current_frame].cmdbuf;
     GpuProfiler    *frame_prof = &r->vk.gpuprofiler[r->vk.current_frame];
-bool ui= false;
-    
 
     vk_cmd_begin(cmd, false);
     // This frame's queries complete with this frame's submission value; the
@@ -1554,24 +1794,26 @@ bool ui= false;
     if (r->two_d)
         two_d_render(r->two_d, cmd, hdr, kSceneClear);
     else
-        pass_clear_hdr(r, cmd, hdr);
+        pass_sky(r, cmd, hdr);
     if (r->game.render) {
         uint32_t image = r->vk.swapchain.current_image;
         r->game.render(r->game.user, cmd, &r->hdr_color[image], &r->depth[image]);
     }
 
-if (key_down(&r->input, KEY_TAB)) {
-ui =!ui;
-}
+    /* Edge-triggered so the windows persist while you drag a slider; a held
+       key toggling every frame is what the old local did. */
+    if (key_pressed(&r->input, KEY_TAB))
+        r->debug_ui_open = !r->debug_ui_open;
 
     post_pass(r, cmd);
     pass_smaa(r, cmd);
     pass_ldr_to_swapchain(r, cmd);
     render_gpu_profiler_ui(r);
 
-if (ui) {
+if (r->debug_ui_open) {
 
     render_game_ui(r);
+    render_grade_ui(r);
 
 
     render_capture_ui(r);
@@ -1609,6 +1851,8 @@ void renderer_destroy(Renderer *r) {
         rt_destroy(&r->vk, &r->smaa_final[i]);
         rt_destroy(&r->vk, &r->smaa_edges[i]);
         rt_destroy(&r->vk, &r->smaa_weights[i]);
+        rt_destroy(&r->vk, &r->bloom_a[i]);
+        rt_destroy(&r->vk, &r->bloom_b[i]);
     }
     if (r->two_d) {
         two_d_destroy(r->two_d);

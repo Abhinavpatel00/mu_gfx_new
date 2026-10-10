@@ -124,6 +124,12 @@ bool scene_counters(const Scene *s, SceneCounters *out);
 /* Rungs every mesh of the scene carries: 1 until a LOD ladder arrives. */
 uint32_t scene_lod_count(const Scene *s);
 
+/* Switch the scene draw between the PBR pipeline and the cel-shaded variant.
+   Both exist from the first frame; this is a pointer choice, not a rebuild.
+   The initial value comes from the MU_TOON environment variable. */
+void scene_set_toon(Scene *s, bool toon);
+bool scene_toon(const Scene *s);
+
 /* Pack a mesh-local vertex into the 16-byte GPU format. */
 void scene_pack_vertex(struct ScenePackedVertex *out, const float pos[3], const float normal[3], const float uv[2]);
 

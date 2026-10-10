@@ -45,6 +45,10 @@ bool      renderer_frame(Renderer *renderer);
 VkBackend          *renderer_vk(Renderer *renderer);
 struct SpriteSystem *renderer_sprites(Renderer *renderer);
 
+/* Whether the user has switched the scene to the cel-shaded pipeline in the
+   Color Grade window. The app mirrors this onto its own scene each frame. */
+bool renderer_toon(Renderer *renderer);
+
 /* Queue a line for the on-screen Game window. The queue clears every frame, so
    call it once per frame for each line you want. Silently drops overflow. */
 void renderer_hud(Renderer *renderer, const char *fmt, ...);

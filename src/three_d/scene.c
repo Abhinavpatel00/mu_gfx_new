@@ -190,6 +190,8 @@ struct Scene {
     /* pipelines */
     PipelineID cs_cull, cs_count, cs_scan_block, cs_scan_blocks, cs_emit, cs_scatter;
     PipelineID draw_pipeline;
+    PipelineID toon_pipeline; /* cel-shaded variant of the scene draw */
+    bool       toon;
     bool       pipelines_ready;
     bool       uploaded;
     VkFormat   color_format, depth_format;
@@ -776,7 +778,15 @@ static void ensure_pipelines(Scene *s, RenderTarget *color, RenderTarget *depth)
     cfg.depth_compare_op = VK_COMPARE_OP_GREATER;
     cfg.blends[0]        = blend_disabled();
     s->draw_pipeline     = pipeline_create_graphics(s->vk, &cfg);
-    s->pipelines_ready   = true;
+
+    /* The toon variant shares the vertex layout and push constant, so it is the
+       same config with the other fragment shader. Both exist every frame; the
+       switch is a pointer choice at draw time, not a rebuild. */
+    cfg.vert_path      = "compiledshaders/toon.vert.spv";
+    cfg.frag_path      = "compiledshaders/toon.frag.spv";
+    s->toon_pipeline   = pipeline_create_graphics(s->vk, &cfg);
+    s->toon            = getenv("MU_TOON") != NULL;
+    s->pipelines_ready = true;
 }
 
 /* The six clip planes in the form (n.xyz, -d) with |n| == 1, extracted from the
@@ -1259,9 +1269,11 @@ void scene_frame(Scene *s, VkCommandBuffer cmd, RenderTarget *color, RenderTarge
         end_pass(vk, cmd, &scatter_pass);
 
         /* T5: draw */
-        PassAttachment col = {.target = color, .load = LOAD_CLEAR, .store = STORE_KEEP};
+        /* The renderer draws the sky into the HDR target first, so the draw
+           loads it rather than clearing. Depth still clears, because the sky
+           leaves no depth behind. */
+        PassAttachment col = {.target = color, .load = LOAD_KEEP, .store = STORE_KEEP};
         PassAttachment dep = {.target = depth, .load = LOAD_CLEAR, .store = STORE_KEEP};
-        memcpy(col.clear, s->clear, sizeof(s->clear));
         dep.clear[0] = 0.0f; /* reverse-Z: the far plane is 0.0 */
 
         BufferAccess draw_reads[9] = {
@@ -1299,7 +1311,7 @@ void scene_frame(Scene *s, VkCommandBuffer cmd, RenderTarget *color, RenderTarge
             .depth          = &dep,
             .buf_reads      = draw_reads,
             .buf_read_count = ARRAY_COUNT(draw_reads),
-            .pipeline       = s->draw_pipeline,
+            .pipeline       = s->toon ? s->toon_pipeline : s->draw_pipeline,
         };
         begin_pass(vk, cmd, &draw_pass);
 
@@ -1316,6 +1328,13 @@ void scene_frame(Scene *s, VkCommandBuffer cmd, RenderTarget *color, RenderTarge
 }
 
 uint32_t scene_lod_count(const Scene *s) { return s ? s->lod_count : 0u; }
+
+void scene_set_toon(Scene *s, bool toon) {
+    if (s)
+        s->toon = toon;
+}
+
+bool scene_toon(const Scene *s) { return s ? s->toon : false; }
 
 bool scene_counters(const Scene *s, SceneCounters *out) {
     if (!s || !s->has_counters)
