@@ -540,7 +540,12 @@ bool muasset_cook(const CookOptions *opt, CookStats *stats_out, char *err, uint3
        primitives sharing an image share the bindless slot and the payload
        stores it once. */
     int32_t *image_id = (int32_t *)malloc((size_t)(gltf->images_count ? gltf->images_count : 1) * sizeof(int32_t));
-    if (!image_id)
+    /* How each image is used decides its upload format: an image that is only
+       ever an albedo is sRGB, anything that feeds a data channel (normal, ORM)
+       is linear. Tracking it per image rather than per material also covers the
+       case where two materials share one image in different roles. */
+    uint32_t *image_role = (uint32_t *)calloc(gltf->images_count ? gltf->images_count : 1, sizeof(uint32_t));
+    if (!image_id || !image_role)
         FAIL("out of memory");
     for (cgltf_size i = 0; i < gltf->images_count; ++i)
         image_id[i] = -1;
@@ -558,17 +563,24 @@ bool muasset_cook(const CookOptions *opt, CookStats *stats_out, char *err, uint3
     char **tex_uri = (char **)calloc(gltf->images_count ? gltf->images_count : 1, sizeof(char *));
     if (!tex_uri)
         FAIL("out of memory");
+    /* An image touched by any data role has to stay linear. */
+    enum { IMG_ALBEDO = 1u, IMG_DATA = 2u };
     for (cgltf_size mi = 0; mi < gltf->materials_count; ++mi) {
         const cgltf_material *mat = &gltf->materials[mi];
-        const cgltf_texture *views[2] = {
+        const cgltf_texture *views[3] = {
             mat && mat->has_pbr_metallic_roughness && mat->pbr_metallic_roughness.base_color_texture.texture
                 ? mat->pbr_metallic_roughness.base_color_texture.texture
                 : NULL,
-            mat && mat->normal_texture.texture ? mat->normal_texture.texture : NULL};
-        for (int v = 0; v < 2; ++v) {
+            mat && mat->normal_texture.texture ? mat->normal_texture.texture : NULL,
+            mat && mat->has_pbr_metallic_roughness && mat->pbr_metallic_roughness.metallic_roughness_texture.texture
+                ? mat->pbr_metallic_roughness.metallic_roughness_texture.texture
+                : NULL};
+        static const uint32_t role[3] = {IMG_ALBEDO, IMG_DATA, IMG_DATA};
+        for (int v = 0; v < 3; ++v) {
             if (!views[v] || !views[v]->image)
                 continue;
             const cgltf_image *img = views[v]->image;
+            image_role[img - gltf->images] |= role[v];
             if (image_id[img - gltf->images] < 0) {
                 const unsigned char *bytes = NULL;
                 int                  len   = 0;
@@ -601,6 +613,14 @@ bool muasset_cook(const CookOptions *opt, CookStats *stats_out, char *err, uint3
             }
         }
     }
+    /* sRGB is a property of use, not of the bytes, so it is stamped on once
+       every role is known. An image referenced as both albedo and data stays
+       linear: decoding a normal/ORM map as sRGB would corrupt it, while a
+       linear albedo only costs the shader one pow(). */
+    for (cgltf_size ii = 0; ii < gltf->images_count; ++ii)
+        if (image_id[ii] >= 0)
+            ((MuassetTexture *)textures.data + image_id[ii])->format =
+                (image_role[ii] == IMG_ALBEDO) ? MUASSET_TEX_RGBA8_SRGB : MUASSET_TEX_RGBA8;
     st.texture_count = (uint32_t)(textures.size / sizeof(MuassetTexture));
 
     uint32_t mesh_index = 0;
@@ -981,6 +1001,7 @@ fail:
             free(tex_uri[k]);
     free(tex_uri);
     free(image_id);
+    free(image_role);
     free(verts.data);
     free(idxs.data);
     free(meshes.data);

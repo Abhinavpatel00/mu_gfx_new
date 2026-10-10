@@ -106,34 +106,38 @@ static float geometry_smith(float ndv, float ndl, float roughness)
     return gv * gl;
 }
 
-static float3 srgb_to_linear(float3 c)
-{
-    return pow(max(c, 0.0f), float3(2.2f));
-}
-
 [shader("fragment")]
 float4 fs_main(SceneVOut i) : SV_Target0
 {
     SceneGpuMaterial m = pc.materials[i.material];
 
-    float3 albedo = srgb_to_linear(float3(m.base_color & 255u, (m.base_color >> 8) & 255u,
-                                          (m.base_color >> 16) & 255u) * (1.0f / 255.0f));
+    /* glTF's baseColorFactor is a linear multiplier, and the base color texture
+       is uploaded as an sRGB VkFormat so the sampler decodes it. Neither needs a
+       gamma conversion here. */
+    float3 albedo = float3(m.base_color & 255u, (m.base_color >> 8) & 255u, (m.base_color >> 16) & 255u) *
+                    (1.0f / 255.0f);
     if ((m.flags & SCENE_MAT_HAS_ALBEDO) != 0u)
-        albedo *= srgb_to_linear(textures[NonUniformResourceIndex(m.texture)].Sample(samplers[SCENE_SAMPLER], i.uv).rgb);
+        albedo *= textures[NonUniformResourceIndex(m.texture)].Sample(samplers[SCENE_SAMPLER], i.uv).rgb;
 
     if ((m.flags & SCENE_MAT_UNLIT) != 0u)
         return float4(albedo, 1.0f);
 
     float3 n = normalize(i.normal);
     float  ao = 1.0f;
-    // if ((m.flags & SCENE_MAT_HAS_NORMAL) != 0u) {
-    //     float3 map = textures[NonUniformResourceIndex(m.normal_texture)].Sample(samplers[SCENE_SAMPLER], i.uv).xyz * 2.0f - 1.0f;
-    //     float3 dpdx = ddx(i.world), dpdy = ddy(i.world);
-    //     float2 duvdx = ddx(i.uv), duvdy = ddy(i.uv);
-    //     float3 tangent = normalize(dpdx * duvdy.y - dpdy * duvdx.y);
-    //     float3 bitangent = normalize(-dpdx * duvdy.x + dpdy * duvdx.x);
-    //     n = normalize(map.x * tangent + map.y * bitangent + map.z * normalize(cross(tangent, bitangent)));
-    // }
+
+    /* Screen-space tangent frame from the position and UV gradients. The packed
+       vertex row is 16 bytes and carries no tangent, so this is the only frame
+       available; it is exact on a flat triangle and only drifts where the UV
+       unwrap bends sharply across a triangle. */
+    if ((m.flags & SCENE_MAT_HAS_NORMAL) != 0u) {
+        float3 map     = textures[NonUniformResourceIndex(m.normal_texture)].Sample(samplers[SCENE_SAMPLER], i.uv).xyz * 2.0f - 1.0f;
+        float3 dpdx    = ddx(i.world), dpdy = ddy(i.world);
+        float2 duvdx   = ddx(i.uv), duvdy = ddy(i.uv);
+        float3 tangent = normalize(dpdx * duvdy.y - dpdy * duvdx.y);
+        float3 bitangent = normalize(-dpdx * duvdy.x + dpdy * duvdx.x);
+        n = normalize(map.x * tangent + map.y * bitangent + map.z * normalize(cross(tangent, bitangent)));
+    }
+
     if ((m.flags & SCENE_MAT_HAS_ORM) != 0u) {
         float3 orm = textures[NonUniformResourceIndex(m.orm_texture)].Sample(samplers[SCENE_SAMPLER], i.uv).rgb;
         ao = orm.r;
@@ -161,11 +165,17 @@ float4 fs_main(SceneVOut i) : SV_Target0
     /* scene_set_sun takes the direction toward the light, so there is nothing
        to negate here; flipping it lights the far side of every surface. */
     float3 diffuse = kd * albedo * (1.0f / 3.14159265f);
-    float3 direct  = (diffuse + spec) * max(dot(n, l), 0.0f);
-    float3 ambient = albedo * pc.sun.w * ao;
+    float3 direct  = (diffuse + spec) * ndl;
 
-    /* Tone map so the scene has a usable range before the post chain. */
+    /* No image-based lighting yet, so the ambient term stands in for the whole
+       environment: kd*albedo is the diffuse irradiance and f0*ambient is a flat
+       radiance reflection. Without that specular half every metal is black,
+       because kd -> 0 and there is no other light for it to reflect. */
+    float3 ambient = (kd * albedo + f0) * pc.sun.w * ao;
+
+    /* ACES filmic (Narkowicz fit): a cheap curve that keeps a highlight
+       roll-off instead of Reinhard's washed-out shoulder. */
     float3 color = direct + ambient;
-    color        = color / (color + float3(1.0f));
+    color        = saturate((color * (2.51f * color + 0.03f)) / (color * (2.43f * color + 0.59f) + 0.14f));
     return float4(pow(color, float3(1.0f / 2.2f)), 1.0f);
 }
