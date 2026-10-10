@@ -40,6 +40,9 @@
 #define SCAN_ELEMS   4
 #define SCAN_BLOCK   (SCAN_THREADS * SCAN_ELEMS)
 
+/* Thread t owns the strided lanes t + e*SCAN_THREADS, matching cs_emit. */
+#define GROUP_IDX(base, lid, e) ((base) + (lid) + (e) * SCAN_THREADS)
+
 static uint group_of(uint key)
 {
     uint mesh = (key >> 16) & 0x3FFFu;
@@ -92,9 +95,9 @@ void cs_scan_block(uint3 gid : SV_GroupID, uint3 lid : SV_GroupThreadID)
     uint2 v   = uint2(0u, 0u);
     for (uint e = 0u; e < SCAN_ELEMS; ++e)
     {
-uint g = base + lid.x * SCAN_ELEMS + e;
+        uint g = GROUP_IDX(base, lid.x, e);
 
-uint c = (g < G) ? pc.group_count[g] : 0u;
+        uint c = (g < G) ? pc.group_count[g] : 0u;
         vals[e] = uint2(c, (c != 0u) ? 1u : 0u);
         v += vals[e];
     }
@@ -102,7 +105,7 @@ uint c = (g < G) ? pc.group_count[g] : 0u;
     uint2 run = thread_exclusive(v, lid.x);
     for (uint e = 0u; e < SCAN_ELEMS; ++e)
     {
-       uint g = base + lid.x * SCAN_ELEMS + e;
+       uint g = GROUP_IDX(base, lid.x, e);
 
 
        if (g < G)
@@ -175,9 +178,9 @@ void cs_emit(uint3 gid : SV_GroupID, uint3 lid : SV_GroupThreadID)
 
     for (uint e = 0u; e < SCAN_ELEMS; ++e)
     {
-        uint g = base + lid.x + e * SCAN_THREADS;
+        uint g = GROUP_IDX(base, lid.x, e);
         if (g >= G)
-            break; /* gid-major: once past the end every later e is past it too */
+            continue; /* strided: later e can still be in range */
         pc.vis_base[g] += off.x;
         uint cmd = pc.cmd_index[g] + off.y;
         pc.cmd_index[g] = cmd;

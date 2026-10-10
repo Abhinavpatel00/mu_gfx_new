@@ -138,9 +138,9 @@ SceneVOut vs_main(uint vid : SV_VertexID, uint iid : SV_InstanceID, uint base_in
     SceneU32 group    = pc.group_base[base_inst];
     SceneU32 mesh     = pc.group_mesh[group] & 0xFFFFu;
 
-    /* iid is gl_InstanceIndex: absolute, already includes the group's
-       firstInstance == vis base. */
-    SceneU32 slot     = pc.vis[iid];
+    /* iid is Slang SV_InstanceID == InstanceIndex - BaseInstance: draw-local.
+       vis base is base_inst == firstInstance. */
+    SceneU32 slot     = pc.vis[base_inst + iid];
 
     SceneInstance     inst = pc.instances[slot];
     SceneShadeMesh    sm   = pc.shade_meshes[mesh];
@@ -151,7 +151,7 @@ SceneVOut vs_main(uint vid : SV_VertexID, uint iid : SV_InstanceID, uint base_in
     float3 ipos  = float3(inst.pos[0], inst.pos[1], inst.pos[2]);
     float3 world = ipos + quat_rotate(inst.quat, local * s);
 
-    if (pc.counts[5] != 0u && iid == base_inst) /* DEBUG: one line per instance */
+    if (pc.counts[5] != 0u && iid == 0u) /* DEBUG: one line per draw */
         printf("[VS] base=%u iid=%u group=%u mesh=%u slot=%u pos=(%.4f, %.4f, %.4f)\n",
                base_inst, iid, group, mesh, slot, world.x, world.y, world.z);
     float3 nrm   = quat_rotate(inst.quat, unpack_oct(v.normal_oct));
