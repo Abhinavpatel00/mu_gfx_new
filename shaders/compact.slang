@@ -92,8 +92,9 @@ void cs_scan_block(uint3 gid : SV_GroupID, uint3 lid : SV_GroupThreadID)
     uint2 v   = uint2(0u, 0u);
     for (uint e = 0u; e < SCAN_ELEMS; ++e)
     {
-        uint g = base + lid.x + e * SCAN_THREADS;
-        uint c = (g < G) ? pc.group_count[g] : 0u;
+uint g = base + lid.x * SCAN_ELEMS + e;
+
+uint c = (g < G) ? pc.group_count[g] : 0u;
         vals[e] = uint2(c, (c != 0u) ? 1u : 0u);
         v += vals[e];
     }
@@ -101,8 +102,10 @@ void cs_scan_block(uint3 gid : SV_GroupID, uint3 lid : SV_GroupThreadID)
     uint2 run = thread_exclusive(v, lid.x);
     for (uint e = 0u; e < SCAN_ELEMS; ++e)
     {
-        uint g = base + lid.x + e * SCAN_THREADS;
-        if (g < G)
+       uint g = base + lid.x * SCAN_ELEMS + e;
+
+
+       if (g < G)
         {
             /* block-local for now; cs_emit adds the block offset. vis_base and
                cmd_index are two different scans, so two different arrays —

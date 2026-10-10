@@ -427,7 +427,7 @@ static uint32_t instance_insert(Scene *s, const SceneInstanceDesc *desc, bool is
     s->cpu_rows[s->candidate_count].mesh = (uint16_t)desc->mesh;
     s->row_of[slot]                      = s->candidate_count;
     s->candidate_count                   = s->instance_count + 1;
-
+    s->candidates_dirty                  = true;
     if (is_static) {
         s->static_count++;
         s->uploaded_dirty = true; /* static region needs a re-upload */
@@ -929,7 +929,7 @@ void scene_frame(Scene *s, VkCommandBuffer cmd, RenderTarget *color, RenderTarge
         cp.counts[4]      = (G + SCENE_SCAN_BLOCK - 1u) / SCENE_SCAN_BLOCK;
         /* DEBUG: shader-side printf. Off by default; it serialises and floods
            the log, so it is opt-in per run. */
-        cp.counts[5]      = getenv("MU_SHADER_DEBUG") ? 1u : 0u;
+        cp.counts[5] = getenv("MU_SHADER_DEBUG") ? 1u : 0u;
         if (getenv("MU_SHADER_DEBUG") && view == 0 && lane == 0)
             log_info("[dbg] shader printf enable = %u, G = %u", cp.counts[5], G);
         /* Every table is a slice of one buffer, so naming a slice names a byte
@@ -1021,7 +1021,7 @@ void scene_frame(Scene *s, VkCommandBuffer cmd, RenderTarget *color, RenderTarge
         BufferAccess scan_writes[8] = {
             {.slice  = vf->vis_base,
              .stage  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-             .access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT},
+             .access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT|VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT },
             {.slice  = vf->cmd_index,
              .stage  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
              .access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT},

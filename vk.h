@@ -403,14 +403,14 @@ typedef struct VkBackendPipelines {
 } VkBackendPipelines;
 
 typedef struct BarrierBatch {
-    VkImageMemoryBarrier2 image_barriers[64];
+    VkImageMemoryBarrier2 image_barriers[512];
     uint32_t image_count;
 
     // Buffer dependencies declared through PassDesc.buf_reads / buf_writes.
     // Both resolve to per-slice barriers: a read narrows to the pass's own
     // stage/access, a write widens to ALL_COMMANDS. Neither ever names a range
     // wider than the slice it was given.
-    VkBufferMemoryBarrier2 buffer_barriers[64];
+    VkBufferMemoryBarrier2 buffer_barriers[512];
     uint32_t               buffer_count;
 
     // Number of barriers silently dropped when the batch was full. Flushed as
