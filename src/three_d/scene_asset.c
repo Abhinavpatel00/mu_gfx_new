@@ -57,10 +57,14 @@ static uint32_t *load_textures(VkBackend *vk, const Muasset *blob, const char *m
             snprintf(err, err_cap, "%s: texture %u runs past the payload", tex_path, i);
             goto fail;
         }
-        VkFormat fmt = t->format == MUASSET_TEX_RGBA8 ? VK_FORMAT_R8G8B8A8_UNORM : VK_FORMAT_UNDEFINED;
-        if (fmt == VK_FORMAT_UNDEFINED) {
-            snprintf(err, err_cap, "%s: texture %u has format %u this build cannot upload", tex_path, i, t->format);
-            goto fail;
+        VkFormat fmt;
+        switch (t->format) {
+            case MUASSET_TEX_RGBA8:      fmt = VK_FORMAT_R8G8B8A8_UNORM; break;
+            case MUASSET_TEX_RGBA8_SRGB: fmt = VK_FORMAT_R8G8B8A8_SRGB; break;
+            default:
+                snprintf(err, err_cap, "%s: texture %u has format %u this build cannot upload", tex_path, i,
+                         t->format);
+                goto fail;
         }
 
         TextureID tex = create_texture(vk, &(TextureCreateDesc){.width     = t->width,

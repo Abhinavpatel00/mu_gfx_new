@@ -132,7 +132,12 @@ typedef struct MuassetTexture {
     uint32_t format; /* MUASSET_TEX_* */
 } MuassetTexture;
 
-#define MUASSET_TEX_RGBA8 0u
+/* Albedo images are sRGB-encoded; every other role (normal, ORM) is linear
+   data. The cooker picks the tag from how the image is used, and the loader
+   maps it to the matching VkFormat so the hardware sampler decodes sRGB for
+   free instead of the fragment shader paying a pow() per texel. */
+#define MUASSET_TEX_RGBA8      0u
+#define MUASSET_TEX_RGBA8_SRGB 1u
 
 _Static_assert(sizeof(MuassetHeader) == 24, "MuassetHeader is 24");
 _Static_assert(sizeof(MuassetSection) == 32, "MuassetSection is 32");
