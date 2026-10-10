@@ -44,9 +44,24 @@ SRC_C := main.c vk.c ext.c renderer.c src/nuklear.c src/input.c \
          src/two_d/two_d.c \
          src/two_d/picture.c \
          src/three_d/scene.c \
+         src/three_d/scene_asset.c \
+         muasset/muasset.c \
 
 
 SRC_CPP := vma.cpp
+
+# =========================================================
+# muasset_cook: host-only cooker. Never linked into the app —
+# it pulls in cgltf and meshoptimizer, which the engine does not.
+# =========================================================
+COOK      := build/muasset_cook
+COOK_DIR  := $(BUILD_DIR)/cook
+COOK_C    := muasset/muasset.c muasset/muasset_cook.c
+COOK_CXX  := $(wildcard external/meshoptimizer/src/*.cpp)
+COOK_OBJ  := $(addprefix $(COOK_DIR)/, $(COOK_C:.c=.o)) \
+            $(addprefix $(COOK_DIR)/, $(COOK_CXX:.cpp=.o))
+COOK_FLAGS := -std=gnu11 -O2 -Wall -Wextra -Wno-unused-parameter -I. -D_POSIX_C_SOURCE=200809L
+COOK_CXXFLAGS := -std=c++17 -O2 -w -I.
 
 # =========================================================
 # Optional Tracy Profiler
@@ -204,6 +219,8 @@ run_asan: asan
 	UBSAN_OPTIONS=print_stacktrace=1 \
 	./$(APP_ASAN)
 
+cook: $(COOK)
+
 # =========================================================
 # Clean
 # =========================================================
@@ -212,5 +229,21 @@ clean:
 	@echo Cleaning...
 	rm -rf $(BUILD_DIR) $(TARGET) $(APP_ASAN)
 
-.PHONY: all clean release asan run_asan
+# =========================================================
+# muasset_cook
+# =========================================================
+$(COOK_DIR)/%.o: %.c
+	@mkdir -p $(dir $@)
+	@echo Compiling $<
+	$(CC) $(COOK_FLAGS) -c $< -o $@
+
+$(COOK_DIR)/%.o: %.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(COOK_CXXFLAGS) -c $< -o $@
+
+$(COOK): $(COOK_OBJ)
+	@echo Linking $@
+	$(CXX) $^ -o $@ -lm
+
+.PHONY: all clean release asan run_asan cook
 
