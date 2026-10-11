@@ -10,6 +10,12 @@
 #include "src/slangtypes.h"
 #include <stdarg.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+#define JSMN_STATIC
+#define JSMN_IMPLEMENTATION
+#include "external/jsmn/jsmn.h"
 
 // Forward declarations for functions defined later in this file or in included files
 static void install_callbacks(Renderer *r);
@@ -20,6 +26,8 @@ static void install_callbacks(Renderer *r);
 /* How many HUD lines the game can queue per frame, and how long each may be. */
 #define GAME_HUD_LINES 12
 #define GAME_HUD_CHARS 96
+/* Bloom pyramid: mip[0] is half-res, each next level halves again. */
+#define BLOOM_MIPS 5
 // TODO : improve it may be using libav like something idk
 typedef struct CaptureState {
     Buffer   readback[CAPTURE_SLOTS];
@@ -80,6 +88,7 @@ typedef struct NuklearUi {
 #define POST_DITHER        (1u << 10)
 #define POST_SEPIA         (1u << 11)
 #define POST_LIFT_GAIN     (1u << 12)
+#define POST_SSAO          (1u << 13)
 
 typedef struct PostSettings {
     uint32_t flags;
@@ -103,6 +112,8 @@ typedef struct PostSettings {
     float    bloom_strength;
     float    bloom_threshold;
     float    bloom_knee;
+    float    bloom_radius; /* upsample spread in destination texels */
+    float    ssao_strength;
     bool     toon; /* cel-shade the scene instead of the PBR pipeline */
 } PostSettings;
 
@@ -114,7 +125,7 @@ static PostSettings post_settings_cartoon(void) {
            use, so each UI slider takes effect without a separate enable. */
         .flags               = POST_EXPOSURE | POST_TONEMAP | POST_GAMMA | POST_CONTRAST | POST_SATURATION |
                                POST_WHITE_BALANCE | POST_VIGNETTE | POST_GRAIN | POST_SHARPEN | POST_CA |
-                               POST_DITHER | POST_SEPIA | POST_LIFT_GAIN,
+                               POST_DITHER | POST_SEPIA | POST_LIFT_GAIN | POST_SSAO,
         .tonemap_mode        = 1u, /* ACES */
         .exposure            = 0.35f,
         .gamma               = 2.2f,
@@ -135,8 +146,163 @@ static PostSettings post_settings_cartoon(void) {
         .bloom_strength      = 0.65f,
         .bloom_threshold     = 0.85f,
         .bloom_knee          = 0.5f,
+        .bloom_radius        = 1.0f,
+        .ssao_strength       = 1.0f,
         .toon                = false,
     };
+}
+
+#define POST_CONFIG_PATH "post_settings.json"
+
+static void post_settings_save(const PostSettings *s) {
+    FILE *f = fopen(POST_CONFIG_PATH, "wb");
+    if (!f) {
+        fprintf(stderr, "[config] cannot open %s for writing\n", POST_CONFIG_PATH);
+        return;
+    }
+    fprintf(f,
+            "{\n"
+            "  \"flags\": %u,\n"
+            "  \"tonemap_mode\": %u,\n"
+            "  \"exposure\": %.6g,\n"
+            "  \"gamma\": %.6g,\n"
+            "  \"contrast\": %.6g,\n"
+            "  \"saturation\": %.6g,\n"
+            "  \"temperature\": %.6g,\n"
+            "  \"tint\": %.6g,\n"
+            "  \"vignette\": %.6g,\n"
+            "  \"vignette_smoothness\": %.6g,\n"
+            "  \"sharpen\": %.6g,\n"
+            "  \"ca\": %.6g,\n"
+            "  \"grain\": %.6g,\n"
+            "  \"sepia\": %.6g,\n"
+            "  \"dither\": %.6g,\n"
+            "  \"lift\": [%.6g, %.6g, %.6g],\n"
+            "  \"gain\": [%.6g, %.6g, %.6g],\n"
+            "  \"lut_strength\": %.6g,\n"
+            "  \"bloom_strength\": %.6g,\n"
+            "  \"bloom_threshold\": %.6g,\n"
+            "  \"bloom_knee\": %.6g,\n"
+            "  \"bloom_radius\": %.6g,\n"
+            "  \"ssao_strength\": %.6g,\n"
+            "  \"toon\": %s\n"
+            "}\n",
+            s->flags, s->tonemap_mode, s->exposure, s->gamma, s->contrast, s->saturation, s->temperature, s->tint,
+            s->vignette, s->vignette_smoothness, s->sharpen, s->ca, s->grain, s->sepia, s->dither, s->lift[0],
+            s->lift[1], s->lift[2], s->gain[0], s->gain[1], s->gain[2], s->lut_strength, s->bloom_strength,
+            s->bloom_threshold, s->bloom_knee, s->bloom_radius, s->ssao_strength, s->toon ? "true" : "false");
+    fclose(f);
+}
+
+static float json_prim_float(const char *js, const jsmntok_t *t) {
+    char buf[32];
+    int  len = t->end - t->start;
+    if (len <= 0 || len >= (int)sizeof(buf))
+        return 0.0f;
+    memcpy(buf, js + t->start, (size_t)len);
+    buf[len] = '\0';
+    return (float)atof(buf);
+}
+
+static bool json_tok_eq(const char *js, const jsmntok_t *t, const char *key) {
+    size_t klen = strlen(key);
+    return (size_t)(t->end - t->start) == klen && memcmp(js + t->start, key, klen) == 0;
+}
+
+static void post_settings_load(PostSettings *s) {
+    FILE *f = fopen(POST_CONFIG_PATH, "rb");
+    if (!f)
+        return;
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (sz <= 0 || sz > (1 << 20)) {
+        fclose(f);
+        return;
+    }
+    char  *js = (char *)malloc((size_t)sz + 1);
+    size_t rd = fread(js, 1, (size_t)sz, f);
+    fclose(f);
+    js[rd] = '\0';
+
+    jsmn_parser p;
+    jsmntok_t   tok[256];
+    jsmn_init(&p);
+    int n = jsmn_parse(&p, js, rd, tok, 256);
+    if (n < 1 || tok[0].type != JSMN_OBJECT) {
+        free(js);
+        return;
+    }
+
+    /* Walk key/value pairs of the top-level object. Arrays (lift, gain) are
+       three consecutive primitive tokens consumed by index. */
+    for (int i = 1; i + 1 < n;) {
+        jsmntok_t *k = &tok[i];
+        jsmntok_t *v = &tok[i + 1];
+        if (k->type != JSMN_STRING) {
+            i++;
+            continue;
+        }
+        if (json_tok_eq(js, k, "flags"))
+            s->flags = (uint32_t)json_prim_float(js, v);
+        else if (json_tok_eq(js, k, "tonemap_mode"))
+            s->tonemap_mode = (uint32_t)json_prim_float(js, v);
+        else if (json_tok_eq(js, k, "exposure"))
+            s->exposure = json_prim_float(js, v);
+        else if (json_tok_eq(js, k, "gamma"))
+            s->gamma = json_prim_float(js, v);
+        else if (json_tok_eq(js, k, "contrast"))
+            s->contrast = json_prim_float(js, v);
+        else if (json_tok_eq(js, k, "saturation"))
+            s->saturation = json_prim_float(js, v);
+        else if (json_tok_eq(js, k, "temperature"))
+            s->temperature = json_prim_float(js, v);
+        else if (json_tok_eq(js, k, "tint"))
+            s->tint = json_prim_float(js, v);
+        else if (json_tok_eq(js, k, "vignette"))
+            s->vignette = json_prim_float(js, v);
+        else if (json_tok_eq(js, k, "vignette_smoothness"))
+            s->vignette_smoothness = json_prim_float(js, v);
+        else if (json_tok_eq(js, k, "sharpen"))
+            s->sharpen = json_prim_float(js, v);
+        else if (json_tok_eq(js, k, "ca"))
+            s->ca = json_prim_float(js, v);
+        else if (json_tok_eq(js, k, "grain"))
+            s->grain = json_prim_float(js, v);
+        else if (json_tok_eq(js, k, "sepia"))
+            s->sepia = json_prim_float(js, v);
+        else if (json_tok_eq(js, k, "dither"))
+            s->dither = json_prim_float(js, v);
+        else if (json_tok_eq(js, k, "lut_strength"))
+            s->lut_strength = json_prim_float(js, v);
+        else if (json_tok_eq(js, k, "bloom_strength"))
+            s->bloom_strength = json_prim_float(js, v);
+        else if (json_tok_eq(js, k, "bloom_threshold"))
+            s->bloom_threshold = json_prim_float(js, v);
+        else if (json_tok_eq(js, k, "bloom_knee"))
+            s->bloom_knee = json_prim_float(js, v);
+        else if (json_tok_eq(js, k, "bloom_radius"))
+            s->bloom_radius = json_prim_float(js, v);
+        else if (json_tok_eq(js, k, "ssao_strength"))
+            s->ssao_strength = json_prim_float(js, v);
+        else if (json_tok_eq(js, k, "ssao_mode"))
+            (void)0; /* removed; ignore legacy files */
+        else if (json_tok_eq(js, k, "toon"))
+            s->toon = (v->end - v->start == 4) && memcmp(js + v->start, "true", 4) == 0;
+        else if (json_tok_eq(js, k, "lift")) {
+            for (int e = 0; e < 3 && i + 2 + e < n; e++)
+                s->lift[e] = json_prim_float(js, &tok[i + 2 + e]);
+            i += 2 + v->size;
+            continue;
+        } else if (json_tok_eq(js, k, "gain")) {
+            for (int e = 0; e < 3 && i + 2 + e < n; e++)
+                s->gain[e] = json_prim_float(js, &tok[i + 2 + e]);
+            i += 2 + v->size;
+            continue;
+        }
+        i += 2;
+    }
+    free(js);
 }
 
 struct Renderer {
@@ -160,11 +326,21 @@ struct Renderer {
     RenderTarget       smaa_final[MAX_SWAPCHAIN_IMAGES];
     RenderTarget       smaa_edges[MAX_SWAPCHAIN_IMAGES];
     RenderTarget       smaa_weights[MAX_SWAPCHAIN_IMAGES];
-    RenderTarget       bloom_a[MAX_SWAPCHAIN_IMAGES]; /* half-res, ping */
-    RenderTarget       bloom_b[MAX_SWAPCHAIN_IMAGES]; /* half-res, pong */
+    RenderTarget       bloom_mip[MAX_SWAPCHAIN_IMAGES][BLOOM_MIPS];
+    /* SSAO temporal history, ping-pong. .r = accumulated AO, .g = sample count.
+       Two buffers because a pass can't read and write the same target. */
+    RenderTarget       ssao_hist[MAX_SWAPCHAIN_IMAGES][2];
+    uint32_t           ssao_parity[MAX_SWAPCHAIN_IMAGES];
     TextureID          lut_texture;
     uint32_t           lut_size;
     PostSettings       post;
+    /* Camera, fed by the app each frame via renderer_set_camera. cglm
+       column-major. prev_viewproj is last frame's, for temporal reprojection. */
+    mat4               cam_view;
+    mat4               cam_proj;
+    mat4               cam_viewproj;
+    mat4               cam_inv_view;
+    mat4               cam_prev_viewproj;
     bool               debug_ui_open;
     TextureID          dummy_texture;
     TextureID          smaa_area_tex;
@@ -193,6 +369,7 @@ struct Renderer {
         uint32_t skinning;
         uint32_t grass;
         uint32_t bloom;
+        uint32_t ssao;
     } EnginePipelines;
 };
 
@@ -775,18 +952,8 @@ static void renderer_resources_create(Renderer *r, VkBackendDesc *desc) {
         r->smaa_area_tex   = smaa_area;
         r->smaa_search_tex = smaa_search;
     }
-    /* Bloom runs at half resolution: the blur is wide and low-frequency, so
-       the extra resolution buys nothing and costs bandwidth. */
-    uint32_t      bw = r->vk.swapchain.extent.width > 1u ? r->vk.swapchain.extent.width / 2u : 1u;
-    uint32_t      bh = r->vk.swapchain.extent.height > 1u ? r->vk.swapchain.extent.height / 2u : 1u;
-    RenderTargetSpec bloom_spec = {.width      = bw,
-                                   .height     = bh,
-                                   .layers     = 1,
-                                   .format     = hdr_format,
-                                   .usage      = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
-                                   .mip_count  = 1,
-                                   .debug_name = "bloom"};
-
+    /* Bloom pyramid: mip[k] is half-res shifted by k, each a single-mip target
+       so its storage view covers exactly one level. */
     forEach(i, r->vk.swapchain.image_count) {
         rt_create(&r->vk, &r->depth[i], &depth_spec);
         rt_create(&r->vk, &r->hdr_color[i], &hdr_spec);
@@ -795,8 +962,34 @@ static void renderer_resources_create(Renderer *r, VkBackendDesc *desc) {
 
         rt_create(&r->vk, &r->smaa_edges[i], &smaa_edge_spec);
         rt_create(&r->vk, &r->smaa_weights[i], &smaa_weight_spec);
-        rt_create(&r->vk, &r->bloom_a[i], &bloom_spec);
-        rt_create(&r->vk, &r->bloom_b[i], &bloom_spec);
+        forEach(k, BLOOM_MIPS) {
+            uint32_t mw = MAX(r->vk.swapchain.extent.width >> (k + 1u), 1u);
+            uint32_t mh = MAX(r->vk.swapchain.extent.height >> (k + 1u), 1u);
+            RenderTargetSpec mip_spec = {.width      = mw,
+                                         .height     = mh,
+                                         .layers     = 1,
+                                         .format     = hdr_format,
+                                         .usage      = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                                         .mip_count  = 1,
+                                         .debug_name = "bloom_mip"};
+            rt_create(&r->vk, &r->bloom_mip[i][k], &mip_spec);
+        }
+        /* SSAO temporal history at half resolution: the occlusion signal is
+           low-frequency and the bitmask algorithm is ALU-heavy, not
+           bandwidth-heavy. RG16F holds accumulated AO in .r and the sample
+           count in .g; two buffers ping-pong across frames. */
+        uint32_t       aw = MAX(r->vk.swapchain.extent.width / 2u, 1u);
+        uint32_t       ah = MAX(r->vk.swapchain.extent.height / 2u, 1u);
+        RenderTargetSpec ssao_spec = {.width      = aw,
+                                      .height     = ah,
+                                      .layers     = 1,
+                                      .format     = VK_FORMAT_R16G16_SFLOAT,
+                                      .usage      = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                                      .mip_count  = 1,
+                                      .debug_name = "ssao_hist"};
+        rt_create(&r->vk, &r->ssao_hist[i][0], &ssao_spec);
+        rt_create(&r->vk, &r->ssao_hist[i][1], &ssao_spec);
+        r->ssao_parity[i] = 0u;
     }
 
     vk_mem_set_tag(&r->vk, MEM_TAG_CORE);
@@ -913,6 +1106,7 @@ static void renderer_resources_create(Renderer *r, VkBackendDesc *desc) {
         }
 
         r->EnginePipelines.bloom = pipeline_create_compute(&r->vk, "compiledshaders/bloom.comp.spv");
+        r->EnginePipelines.ssao  = pipeline_create_compute(&r->vk, "compiledshaders/ssao.comp.spv");
 
         {
             GraphicsPipelineConfig cfg = pipeline_config_fullscreen();
@@ -924,6 +1118,7 @@ static void renderer_resources_create(Renderer *r, VkBackendDesc *desc) {
     }
 
     r->post = post_settings_cartoon();
+    post_settings_load(&r->post);
     create_identity_lut(r);
 
     if (r->game.two_d)
@@ -1128,6 +1323,39 @@ static void profiler_format_count(char *buffer, size_t buffer_size, uint64_t val
     }
 }
 
+#define PERF_REPORT_PATH "perf_report.txt"
+
+/* Snapshot the live frame + per-pass stats to a text report. Called on demand
+   from the profiler UI; one line per recorded pass. */
+static void perf_dump(const Renderer *r) {
+    FILE *f = fopen(PERF_REPORT_PATH, "wb");
+    if (!f) {
+        fprintf(stderr, "[config] cannot open %s for writing\n", PERF_REPORT_PATH);
+        return;
+    }
+    double frame_ms  = ns_to_ms(r->cpu_frame_ns);
+    double active_ms = ns_to_ms(r->cpu_active_ns);
+    double wait_ms   = ns_to_ms(r->cpu_wait_accum_ns);
+    double gpu_ms    = g_gpu_profiler_ui.total_gpu_time_ms;
+
+    fprintf(f, "== mu_gfx perf report ==\n");
+    fprintf(f, "frames            : %u\n", r->frame_count);
+    fprintf(f, "frame time        : %.3f ms (%.1f fps)\n", frame_ms, frame_ms > 0.0 ? 1000.0 / frame_ms : 0.0);
+    fprintf(f, "cpu active (ema)  : %.3f ms\n", active_ms);
+    fprintf(f, "cpu wait (ema)    : %.3f ms\n", wait_ms);
+    fprintf(f, "gpu frame         : %.3f ms (avg %.3f ms)\n", gpu_ms, g_gpu_profiler_ui.avg_total_gpu_time_ms);
+    fprintf(f, "resolution        : %ux%u\n", r->vk.swapchain.extent.width, r->vk.swapchain.extent.height);
+    fprintf(f, "\n%-28s %10s %10s %10s %10s %12s\n", "pass", "cur(ms)", "avg(ms)", "min(ms)", "max(ms)",
+            "primitives");
+    for (uint32_t i = 0; i < g_gpu_profiler_ui.pass_count; i++) {
+        const GpuPassStats *ps = &g_gpu_profiler_ui.pass_stats[i];
+        fprintf(f, "%-28s %10.3f %10.3f %10.3f %10.3f %12llu\n", ps->name, ps->time_ms, ps->avg_ms, ps->min_ms,
+                ps->max_ms, (unsigned long long)ps->primitives);
+    }
+    fclose(f);
+    fprintf(stderr, "[config] wrote %s\n", PERF_REPORT_PATH);
+}
+
 static MU_INLINE bool frame_start(Renderer *r) {
     TracyCZoneNC(ctx, "frame_start", 0x00FF00, 1);
     uint64_t frame_now  = mu_time_now();
@@ -1163,8 +1391,11 @@ static MU_INLINE bool frame_start(Renderer *r) {
             rt_resize(&r->vk, &r->smaa_final[i], fb_w, fb_h);
             rt_resize(&r->vk, &r->smaa_edges[i], fb_w, fb_h);
             rt_resize(&r->vk, &r->smaa_weights[i], fb_w, fb_h);
-            rt_resize(&r->vk, &r->bloom_a[i], fb_w / 2, fb_h / 2);
-            rt_resize(&r->vk, &r->bloom_b[i], fb_w / 2, fb_h / 2);
+            forEach(k, BLOOM_MIPS)
+                rt_resize(&r->vk, &r->bloom_mip[i][k], MAX((uint32_t)fb_w >> (k + 1u), 1u),
+                          MAX((uint32_t)fb_h >> (k + 1u), 1u));
+            rt_resize(&r->vk, &r->ssao_hist[i][0], MAX((uint32_t)fb_w / 2u, 1u), MAX((uint32_t)fb_h / 2u, 1u));
+            rt_resize(&r->vk, &r->ssao_hist[i][1], MAX((uint32_t)fb_w / 2u, 1u), MAX((uint32_t)fb_h / 2u, 1u));
         }
 
         capture_resize(r, (uint32_t)fb_w, (uint32_t)fb_h);
@@ -1185,12 +1416,13 @@ static MU_INLINE bool frame_start(Renderer *r) {
 }
 static void update_global_data(Renderer *r) {
     GlobalData data = {0};
-    glm_mat4_identity(data.view);
-    glm_mat4_identity(data.projection);
-    glm_mat4_identity(data.viewproj);
-    glm_mat4_identity(data.inv_view);
-    glm_mat4_identity(data.inv_projection);
-    glm_mat4_identity(data.inv_viewproj);
+    glm_mat4_copy(r->cam_view, data.view);
+    glm_mat4_copy(r->cam_proj, data.projection);
+    glm_mat4_copy(r->cam_viewproj, data.viewproj);
+    glm_mat4_copy(r->cam_inv_view, data.inv_view);
+    glm_mat4_inv(r->cam_proj, data.inv_projection);
+    glm_mat4_inv(r->cam_viewproj, data.inv_viewproj);
+    glm_mat4_copy(r->cam_prev_viewproj, data.prev_viewproj);
 
     r->dt = (float)((double)r->cpu_frame_ns / 1000000000.0);
 
@@ -1231,10 +1463,15 @@ PUSH_CONSTANT(PostPush,
               float vignette_intensity; float vignette_smoothness; float sharpen_strength; float ca_strength;
               float grain_intensity; float sepia_intensity; float dither_strength; float lift_r; float lift_g;
               float lift_b; float gain_r; float gain_g; float gain_b; uint32_t lut_texture_id; uint32_t lut_size;
-              float lut_strength; uint32_t bloom_texture_id; float bloom_strength; float time;);
+              float lut_strength; uint32_t bloom_texture_id; float bloom_strength; float time;
+              uint32_t ssao_texture_id; float ssao_strength;);
 
 PUSH_CONSTANT(BloomPush, uint32_t src_texture_id; uint32_t dst_image_id; uint32_t sampler_id; uint32_t width;
-              uint32_t height; float dir_x; float dir_y; float threshold; float soft_knee; uint32_t prefilter;);
+              uint32_t height; uint32_t pass; float radius; float threshold; float soft_knee; uint32_t prefilter;);
+
+PUSH_CONSTANT(SsaoPush, uint32_t depth_texture_id; uint32_t output_image_id; uint32_t sampler_id; uint32_t width;
+              uint32_t height; float proj_00; float proj_11; float radius; float bias; float intensity;
+              uint32_t sample_count; float near_z; float far_z; uint32_t history_texture_id;);
 
 PUSH_CONSTANT(SkyPush, float top[4]; float bottom[4]; float exponent; float pad0; float pad1; float pad2;);
 PUSH_CONSTANT(EdgePush, uint32_t texture_id; uint32_t sampler_id;);
@@ -1245,57 +1482,92 @@ PUSH_CONSTANT(WeightPush, uint32_t edge_tex; uint32_t area_tex; uint32_t search_
 
 #include "src/nuklear_profiler.inl"
 
-/* Bright-prefilter the HDR image and blur it: pass 1 blurs x into bloom_a,
-   pass 2 blurs y into bloom_b. The post pass reads bloom_b. */
+/* Extract emissive into the half-res head, blur down the chain, then
+   accumulate back up. The post pass reads mip[0]. */
+static void bloom_dispatch(Renderer *r, VkCommandBuffer cmd, RenderTarget *src, RenderTarget *dst, uint32_t pass,
+                           float radius) {
+
+    RenderTarget *reads[]  = {src};
+    RenderTarget *writes[] = {dst};
+    PassDesc      pd       = {.shader_reads       = reads,
+                              .shader_read_count  = 1,
+                              .shader_writes      = writes,
+                              .shader_write_count = 1,
+                              .pipeline           = r->EnginePipelines.bloom};
+    begin_pass(&r->vk, cmd, &pd);
+    BloomPush p = {.src_texture_id = src->bindless_index,
+                   .dst_image_id   = dst->bindless_index,
+                   .sampler_id     = r->vk.default_samplers.samplers[SAMPLER_LINEAR_CLAMP],
+                   .width          = dst->width,
+                   .height         = dst->height,
+                   .pass           = pass,
+                   .radius         = radius,
+                   .threshold      = r->post.bloom_threshold,
+                   .soft_knee      = r->post.bloom_knee,
+                   .prefilter      = pass == 0u ? 1u : 0u};
+    dispatch_push(&r->vk, cmd, BYTE_SPAN(p), (p.width + 7) / 8, (p.height + 7) / 8, 1);
+    end_pass(&r->vk, cmd, &pd);
+}
+
 static void pass_bloom(Renderer *r, VkCommandBuffer cmd, uint32_t image) {
     if (r->post.bloom_strength <= 0.0f)
         return;
 
-    RenderTarget *hdr = &r->hdr_color[image];
-    RenderTarget *a   = &r->bloom_a[image];
-    RenderTarget *b   = &r->bloom_b[image];
+    GpuProfiler *frame_prof = &r->vk.gpuprofiler[r->vk.current_frame];
+    GPU_SCOPE(frame_prof, cmd, "Bloom", VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT) {
+        /* pass 0 extracts HDR into the half-res head; later passes convolve
+           already-extracted light, so upsample reads the small level straight. */
+        bloom_dispatch(r, cmd, &r->hdr_color[image], &r->bloom_mip[image][0], 0u, 1.0f);
+        forEach(k, BLOOM_MIPS - 1u)
+            bloom_dispatch(r, cmd, &r->bloom_mip[image][k], &r->bloom_mip[image][k + 1u], 1u, 1.0f);
+        /* Upsample: dst[pix] += blur(src), read back through the storage view so
+           the same target never sits in both the sampled and storage lists. */
+        for (uint32_t k = BLOOM_MIPS - 1u; k > 0u; k--)
+            bloom_dispatch(r, cmd, &r->bloom_mip[image][k], &r->bloom_mip[image][k - 1u], 2u, r->post.bloom_radius);
+    }
+}
 
-    RenderTarget *reads1[]  = {hdr};
-    RenderTarget *writes1[] = {a};
-    PassDesc      pd1       = {.shader_reads       = reads1,
-                               .shader_read_count  = 1,
-                               .shader_writes      = writes1,
-                               .shader_write_count = 1,
-                               .pipeline           = r->EnginePipelines.bloom};
-    begin_pass(&r->vk, cmd, &pd1);
-    BloomPush p1 = {.src_texture_id = hdr->bindless_index,
-                    .dst_image_id   = a->bindless_index,
-                    .sampler_id     = r->vk.default_samplers.samplers[SAMPLER_LINEAR_CLAMP],
-                    .width          = a->width,
-                    .height         = a->height,
-                    .dir_x          = 1.0f,
-                    .dir_y          = 0.0f,
-                    .threshold      = r->post.bloom_threshold,
-                    .soft_knee      = r->post.bloom_knee,
-                    .prefilter      = 1u};
-    dispatch_push(&r->vk, cmd, BYTE_SPAN(p1), (p1.width + 15) / 16, (p1.height + 15) / 16, 1);
-    end_pass(&r->vk, cmd, &pd1);
+/* GT-VBAO compute pass. Reads depth + (in temporal mode) the previous history,
+   reconstructs normals from screen-space depth derivatives, runs the bitmask
+   horizon search, and in temporal mode blends one sample/frame into history.
+   Writes the current-parity history buffer; post reads it via bindless index. */
+static void pass_ssao(Renderer *r, VkCommandBuffer cmd) {
+    uint32_t image  = r->vk.swapchain.current_image;
+    uint32_t parity = r->ssao_parity[image];
 
-    RenderTarget *reads2[]  = {a};
-    RenderTarget *writes2[] = {b};
-    PassDesc      pd2       = {.shader_reads       = reads2,
-                               .shader_read_count  = 1,
-                               .shader_writes      = writes2,
-                               .shader_write_count = 1,
-                               .pipeline           = r->EnginePipelines.bloom};
-    begin_pass(&r->vk, cmd, &pd2);
-    BloomPush p2 = {.src_texture_id = a->bindless_index,
-                    .dst_image_id   = b->bindless_index,
-                    .sampler_id     = r->vk.default_samplers.samplers[SAMPLER_LINEAR_CLAMP],
-                    .width          = b->width,
-                    .height         = b->height,
-                    .dir_x          = 0.0f,
-                    .dir_y          = 1.0f,
-                    .threshold      = 0.0f,
-                    .soft_knee      = 0.0f,
-                    .prefilter      = 0u};
-    dispatch_push(&r->vk, cmd, BYTE_SPAN(p2), (p2.width + 15) / 16, (p2.height + 15) / 16, 1);
-    end_pass(&r->vk, cmd, &pd2);
+    RenderTarget *hist_in  = &r->ssao_hist[image][parity];
+    RenderTarget *hist_out = &r->ssao_hist[image][parity ^ 1u];
+    r->ssao_parity[image]  = parity ^ 1u; /* post reads hist_out next frame */
+
+    /* Unidirectional partial-slice + temporal: the shader reads last frame's
+       history and writes this frame's. */
+    RenderTarget *reads[]  = {&r->depth[image], hist_in};
+    RenderTarget *writes[] = {hist_out};
+    PassDesc      pd       = {.shader_reads       = reads,
+                              .shader_read_count  = 2,
+                              .shader_writes      = writes,
+                              .shader_write_count = 1,
+                              .pipeline           = r->EnginePipelines.ssao};
+
+    const GlobalData *gd = (const GlobalData *)r->global_ubo[r->vk.current_frame].mapping;
+    SsaoPush p = {.depth_texture_id  = r->depth[image].bindless_index,
+                  .output_image_id   = hist_out->bindless_index,
+                  .sampler_id        = r->vk.default_samplers.samplers[SAMPLER_LINEAR_CLAMP],
+                  .width             = hist_out->width,
+                  .height            = hist_out->height,
+                  .proj_00           = gd->projection[0][0],
+                  .proj_11           = gd->projection[1][1],
+                  .radius            = 0.5f,
+                  .bias              = 0.025f,
+                  .intensity         = 1.0f,
+                  .sample_count      = 1u,
+                  .near_z            = 0.1f,
+                  .far_z             = 1000.0f,
+                  .history_texture_id = hist_in->bindless_index};
+
+    begin_pass(&r->vk, cmd, &pd);
+    dispatch_push(&r->vk, cmd, BYTE_SPAN(p), (p.width + 7) / 8, (p.height + 7) / 8, 1);
+    end_pass(&r->vk, cmd, &pd);
 }
 
 static void post_pass(Renderer *r, VkCommandBuffer cmd) {
@@ -1305,24 +1577,35 @@ static void post_pass(Renderer *r, VkCommandBuffer cmd) {
 
     const PostSettings *s        = &r->post;
     bool                bloom_on = s->bloom_strength > 0.0f;
+    bool                ssao_on  = (s->flags & POST_SSAO) && s->ssao_strength > 0.0f;
 
     GpuProfiler *frame_prof = &r->vk.gpuprofiler[r->vk.current_frame];
-    GPU_SCOPE(frame_prof, cmd, "Post Processing", VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT) {
-        /* bloom_b was written as a storage image by the bloom passes, so naming
-           it here is what transitions it to a sampled read. */
-        RenderTarget *reads[2] = {&r->hdr_color[image], &r->bloom_b[image]};
+    GPU_SCOPE(frame_prof, cmd, "Tonemap", VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT) {
+        /* bloom mip[0] was written as a storage image by the bloom passes, and
+           the ssao target by the ssao pass, so naming them here is what
+           transitions them to sampled reads. */
+        /* Build the read set as a prefix so read_count stays correct when
+           bloom and ssao are independently toggled. */
+        RenderTarget *reads[3];
+        uint32_t      read_count = 0;
+        reads[read_count++]      = &r->hdr_color[image];
+        if (bloom_on)
+            reads[read_count++] = &r->bloom_mip[image][0];
+        if (ssao_on)
+            reads[read_count++] = &r->ssao_hist[image][r->ssao_parity[image]];
         RenderTarget *writes[] = {&r->ldr_color[image]};
 
         begin_pass(&r->vk, cmd,
                    &(PassDesc){
                        .shader_reads       = reads,
-                       .shader_read_count  = bloom_on ? 2u : 1u,
+                       .shader_read_count  = read_count,
                        .shader_writes      = writes,
                        .shader_write_count = 1,
                        .pipeline           = r->EnginePipelines.postprocess,
                    });
 
-        uint32_t bloom_id = bloom_on ? r->bloom_b[image].bindless_index : 0xFFFFFFFFu;
+        uint32_t bloom_id = bloom_on ? r->bloom_mip[image][0].bindless_index : 0xFFFFFFFFu;
+        uint32_t ssao_id  = ssao_on ? r->ssao_hist[image][r->ssao_parity[image]].bindless_index : 0xFFFFFFFFu;
         PostPush            push     = {
                          .src_texture_id      = r->hdr_color[image].bindless_index,
                          .output_image_id     = r->ldr_color[image].bindless_index,
@@ -1357,6 +1640,8 @@ static void post_pass(Renderer *r, VkCommandBuffer cmd) {
                          .bloom_texture_id    = bloom_id,
                          .bloom_strength      = s->bloom_strength,
                          .time = (float)((double)(mu_time_now() - r->start_time) / mu_time_freq()),
+                         .ssao_texture_id = ssao_id,
+                         .ssao_strength   = s->ssao_strength,
         };
 
         dispatch_push(&r->vk, cmd, BYTE_SPAN(push), (push.width + 15) / 16, (push.height + 15) / 16, 1);
@@ -1717,6 +2002,20 @@ VkBackend *renderer_vk(Renderer *r) { return &r->vk; }
 
 bool renderer_toon(Renderer *r) { return r ? r->post.toon : false; }
 
+void renderer_set_camera(Renderer *r, const float *view, const float *projection) {
+    if (!r || !view || !projection)
+        return;
+    /* Rotate history: last frame's viewproj becomes prev, then rebuild. */
+    mat4 v, p;
+    memcpy(v, view, sizeof(v));
+    memcpy(p, projection, sizeof(p));
+    glm_mat4_copy(r->cam_viewproj, r->cam_prev_viewproj);
+    glm_mat4_copy(v, r->cam_view);
+    glm_mat4_copy(p, r->cam_proj);
+    glm_mat4_mul(r->cam_proj, r->cam_view, r->cam_viewproj);
+    glm_mat4_inv(r->cam_view, r->cam_inv_view);
+}
+
 struct SpriteSystem *renderer_sprites(Renderer *r) {
     return r->two_d ? two_d_sprites(r->two_d) : NULL;
 }
@@ -1791,13 +2090,15 @@ bool renderer_frame(Renderer *r) {
         }
     }
     RenderTarget *hdr = &r->hdr_color[r->vk.swapchain.current_image];
-    if (r->two_d)
-        two_d_render(r->two_d, cmd, hdr, kSceneClear);
-    else
-        pass_sky(r, cmd, hdr);
-    if (r->game.render) {
-        uint32_t image = r->vk.swapchain.current_image;
-        r->game.render(r->game.user, cmd, &r->hdr_color[image], &r->depth[image]);
+    GPU_SCOPE(frame_prof, cmd, "Scene", VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT) {
+        if (r->two_d)
+            two_d_render(r->two_d, cmd, hdr, kSceneClear);
+        else
+            pass_sky(r, cmd, hdr);
+        if (r->game.render) {
+            uint32_t image = r->vk.swapchain.current_image;
+            r->game.render(r->game.user, cmd, &r->hdr_color[image], &r->depth[image]);
+        }
     }
 
     /* Edge-triggered so the windows persist while you drag a slider; a held
@@ -1805,6 +2106,9 @@ bool renderer_frame(Renderer *r) {
     if (key_pressed(&r->input, KEY_TAB))
         r->debug_ui_open = !r->debug_ui_open;
 
+    GPU_SCOPE(frame_prof, cmd, "SSAO", VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT) {
+        pass_ssao(r, cmd);
+    }
     post_pass(r, cmd);
     pass_smaa(r, cmd);
     pass_ldr_to_swapchain(r, cmd);
@@ -1836,6 +2140,7 @@ void renderer_destroy(Renderer *r) {
     dmon_deinit();
     wait_idle(&r->vk);
     delete_queue_drain(&r->vk);
+    post_settings_save(&r->post);
     if (r->game.shutdown)
         r->game.shutdown(r->game.user);
     forEach(i, CAPTURE_SLOTS) {
@@ -1851,8 +2156,9 @@ void renderer_destroy(Renderer *r) {
         rt_destroy(&r->vk, &r->smaa_final[i]);
         rt_destroy(&r->vk, &r->smaa_edges[i]);
         rt_destroy(&r->vk, &r->smaa_weights[i]);
-        rt_destroy(&r->vk, &r->bloom_a[i]);
-        rt_destroy(&r->vk, &r->bloom_b[i]);
+        forEach(k, BLOOM_MIPS) rt_destroy(&r->vk, &r->bloom_mip[i][k]);
+        rt_destroy(&r->vk, &r->ssao_hist[i][0]);
+        rt_destroy(&r->vk, &r->ssao_hist[i][1]);
     }
     if (r->two_d) {
         two_d_destroy(r->two_d);

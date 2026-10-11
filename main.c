@@ -88,17 +88,26 @@ static uint32_t pets_build_assets(Scene *scene) {
            space, so every one of its meshes gets the same transform — spreading
            them out would show a disassembled model rather than one. */
         for (uint32_t c = 0; c < PETS_GRID * PETS_GRID * PETS_COPIES; ++c) {
-            float x = ((float)(c % PETS_GRID) - (float)PETS_GRID * 0.5f + 0.5f) * PETS_SPACING;
-            float z = ((float)((c / PETS_GRID) % PETS_GRID) - (float)PETS_GRID * 0.5f + 0.5f) * PETS_SPACING;
+            uint32_t gx = c % PETS_GRID;
+            uint32_t gz = (c / PETS_GRID) % PETS_GRID;
+            float x = ((float)gx - (float)PETS_GRID * 0.5f + 0.5f) * PETS_SPACING;
+            float z = ((float)gz - (float)PETS_GRID * 0.5f + 0.5f) * PETS_SPACING;
+
+            /* The center 2x2 block glows: tag every mesh of those characters.
+               Bloom weight rides HDR alpha into the bright-pass. */
+            bool glowing  = false;
 
             for (uint32_t i = 0; i < load.mesh_count; ++i) {
                 SceneInstanceDesc d = {.pos = {x, 0.0f, z}, .quat = {0, 0, 0, 0}, .scale = 1.0f,
                                        .mesh = load.first_mesh + i};
                 /* Alternate so both slot regions are populated in every row. */
+                uint32_t slot;
                 if (((c + i) & 1u) == 0u)
-                    scene_instance_create(scene, &d);
+                    slot = scene_instance_create(scene, &d);
                 else
-                    scene_instance_create_static(scene, &d);
+                    slot = scene_instance_create_static(scene, &d);
+                if (glowing)
+                    scene_set_instance_bloom(scene, slot, 1.0f);
             }
         }
         total_meshes += load.mesh_count;
@@ -332,6 +341,10 @@ static void pets_render(void *user, VkCommandBuffer cmd, RenderTarget *color, Re
     }
     glm_lookat(eye, center, up, view);
     glm_mat4_mul(proj, view, vp);
+
+    /* Hand the real camera to the renderer so GPU effects (SSAO) can
+       reconstruct world position and reproject history across frames. */
+    renderer_set_camera((Renderer *)p->renderer, (const float *)view, (const float *)proj);
 
     SceneViewDesc vd = {0};
     for (int r = 0; r < 4; ++r)

@@ -255,9 +255,10 @@ static bool atlas_upload(SpriteSystem *s, uint32_t atlas_index, uint32_t x, uint
 
 void picture_system_init(SpriteSystem *s) {
     s->picture_capacity = SPRITE_MAX_PICTURES;
-    s->pictures         = (Picture *)calloc(s->picture_capacity, sizeof(Picture));
-    s->picture_count    = 0;
-    s->atlas_count      = 0;
+    s->pictures         = (Picture *)mu_arena_alloc(&s->arena, s->picture_capacity * sizeof(Picture), 16);
+    memset(s->pictures, 0, (size_t)s->picture_capacity * sizeof(Picture));
+    s->picture_count = 0;
+    s->atlas_count   = 0;
     assert(s->pictures);
     atlas_create(s, SPRITE_ATLAS_INITIAL, SPRITE_ATLAS_INITIAL);
 }
@@ -265,8 +266,7 @@ void picture_system_init(SpriteSystem *s) {
 void picture_system_destroy(SpriteSystem *s) {
     for (uint32_t i = 0; i < s->atlas_count; i++)
         destroy_texture(s->vk, s->atlases[i].texture);
-    s->atlas_count = 0;
-    free(s->pictures);
+    s->atlas_count      = 0;
     s->pictures         = NULL;
     s->picture_count    = 0;
     s->picture_capacity = 0;

@@ -46,6 +46,9 @@ struct PostPush
   uint  bloom_texture_id; /* 0xFFFFFFFF = none */
   float bloom_strength;
   float time;
+
+  uint  ssao_texture_id; /* 0xFFFFFFFF = none */
+  float ssao_strength;
 };
 
 static const uint FLAG_EXPOSURE      = (1u << 0);
@@ -61,6 +64,7 @@ static const uint FLAG_CA            = (1u << 9);
 static const uint FLAG_DITHER        = (1u << 10);
 static const uint FLAG_SEPIA         = (1u << 11);
 static const uint FLAG_LIFT_GAIN     = (1u << 12);
+static const uint FLAG_SSAO          = (1u << 13);
 
 bool has_flag(uint flags, uint bit)
 {
@@ -149,6 +153,14 @@ void cs_main(uint3 id : SV_DispatchThreadID)
      rolls off with the rest of the highlights instead of clipping. */
   if (push.bloom_strength > 0.0 && push.bloom_texture_id != 0xFFFFFFFFu)
     color += textures[push.bloom_texture_id].SampleLevel(smp, uv, 0).rgb * push.bloom_strength;
+
+  /* Ambient occlusion attenuates the indirect term, applied in linear HDR
+     before exposure so it scales correctly with the scene radiance. */
+  if (has_flag(push.flags, FLAG_SSAO) && push.ssao_strength > 0.0 && push.ssao_texture_id != 0xFFFFFFFFu)
+  {
+    float ao = textures[push.ssao_texture_id].SampleLevel(smp, uv, 0).r;
+    color *= lerp(1.0, ao, push.ssao_strength);
+  }
 
   if (has_flag(push.flags, FLAG_EXPOSURE))
     color *= exp2(push.exposure);

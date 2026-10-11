@@ -55,6 +55,7 @@ typedef struct GlobalData {
     float4x4 inv_view;       // 64 bytes
     float4x4 inv_projection; // 64 bytes
     float4x4 inv_viewproj;   // 64 bytes
+    float4x4 prev_viewproj;  // 64 bytes  last frame's view-proj, for temporal reprojection
     float4   camera_pos;     // 16 bytes (xyz + fov)
     float4   camera_dir;     // 16 bytes (xyz + aspect)
     float    time;           // 4 bytes
@@ -136,6 +137,7 @@ struct GlobalData {
     float4x4 inv_view;
     float4x4 inv_projection;
     float4x4 inv_viewproj;
+    float4x4 prev_viewproj; // last frame's view-proj, for temporal reprojection
     float4   camera_pos; // xyz + fov
     float4   camera_dir; // xyz + aspect
     float    time;

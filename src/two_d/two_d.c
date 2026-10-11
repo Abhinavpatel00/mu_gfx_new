@@ -70,9 +70,22 @@ static void sprite_system_init(SpriteSystem *s, VkBackend *vk, const VkFormat *c
     memset(s, 0, sizeof(*s));
     s->vk = vk;
 
-    s->instances = (SpriteInst *)malloc((size_t)SPRITE_MAX_INSTANCES * sizeof(SpriteInst));
-    s->sorted    = (SpriteInst *)malloc((size_t)SPRITE_BUFFER_CAPACITY * sizeof(SpriteInst));
-    s->slot_of   = (uint16_t *)malloc((size_t)SPRITE_MAX_INSTANCES * sizeof(uint16_t));
+    /* instances/sorted/slot_of/pictures all live for the system's lifetime, so
+       one arena backs them. pictures is filled in by picture_system_init below. */
+    {
+        uint64_t b = (uint64_t)SPRITE_MAX_INSTANCES * sizeof(SpriteInst);
+        b += (uint64_t)SPRITE_BUFFER_CAPACITY * sizeof(SpriteInst);
+        b += (uint64_t)SPRITE_MAX_INSTANCES * sizeof(uint16_t);
+        b += (uint64_t)SPRITE_MAX_PICTURES * sizeof(Picture);
+        b += 512;
+        s->arena.base     = malloc((size_t)b);
+        s->arena.capacity = (uint32_t)b;
+        s->arena.used     = 0;
+    }
+
+    s->instances = (SpriteInst *)mu_arena_alloc(&s->arena, (uint32_t)(SPRITE_MAX_INSTANCES * sizeof(SpriteInst)), 16);
+    s->sorted    = (SpriteInst *)mu_arena_alloc(&s->arena, (uint32_t)(SPRITE_BUFFER_CAPACITY * sizeof(SpriteInst)), 16);
+    s->slot_of   = (uint16_t *)mu_arena_alloc(&s->arena, SPRITE_MAX_INSTANCES * sizeof(uint16_t), 16);
     if (!s->instances || !s->sorted || !s->slot_of) {
         log_fatal("[sprite] failed to allocate CPU scratch");
         exit(EXIT_FAILURE);
@@ -147,9 +160,7 @@ static void sprite_system_destroy(SpriteSystem *s, VkBackend *vk) {
     picture_system_destroy(s);
     destroy_buffer(vk, &s->stream);
     destroy_buffer(vk, &s->out);
-    free(s->instances);
-    free(s->sorted);
-    free(s->slot_of);
+    free(s->arena.base);
     s->instances = NULL;
     s->sorted    = NULL;
     s->slot_of   = NULL;

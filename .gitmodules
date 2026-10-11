@@ -40,3 +40,6 @@
 [submodule "external/dds-ktx"]
 	path = external/dds-ktx
 	url = https://github.com/septag/dds-ktx.git
+[submodule "external/jsmn"]
+	path = external/jsmn
+	url = https://github.com/zserge/jsmn

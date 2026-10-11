@@ -18,7 +18,7 @@ static void render_gpu_profiler_ui(Renderer *r) {
         nk_end(ctx);
         return;
     }
-    nk_layout_row_dynamic(ctx, 26, 4);
+    nk_layout_row_dynamic(ctx, 26, 5);
     g_gpu_profiler_ui.paused = nk_check_label(ctx, "Pause", g_gpu_profiler_ui.paused);
     g_gpu_profiler_ui.show_pipeline_stats =
         nk_check_label(ctx, "Pipeline Stats", g_gpu_profiler_ui.show_pipeline_stats);
@@ -28,6 +28,8 @@ static void render_gpu_profiler_ui(Renderer *r) {
             g_gpu_profiler_ui.pass_stats[i].max_ms = g_gpu_profiler_ui.pass_stats[i].time_ms;
         }
     }
+    if (nk_button_label(ctx, "Save perf"))
+        perf_dump(r);
     if (nk_button_label(ctx, "Close"))
         g_gpu_profiler_ui.open = false;
 
@@ -236,6 +238,8 @@ static void render_grade_ui(Renderer *r) {
     nk_property_float(ctx, "Bloom", 0.0f, &s->bloom_strength, 3.0f, 0.01f, 0.01f);
     nk_property_float(ctx, "Bloom threshold", 0.0f, &s->bloom_threshold, 3.0f, 0.01f, 0.01f);
     nk_property_float(ctx, "Bloom knee", 0.001f, &s->bloom_knee, 1.0f, 0.001f, 0.001f);
+    nk_property_float(ctx, "Bloom radius", 0.25f, &s->bloom_radius, 4.0f, 0.01f, 0.01f);
+    nk_property_float(ctx, "SSAO", 0.0f, &s->ssao_strength, 2.0f, 0.01f, 0.01f);
 
     nk_layout_row_dynamic(ctx, 22, 1);
     nk_property_float(ctx, "Vignette", 0.0f, &s->vignette, 1.0f, 0.01f, 0.01f);
@@ -247,7 +251,11 @@ static void render_grade_ui(Renderer *r) {
     nk_property_float(ctx, "Dither", 0.0f, &s->dither, 2.0f, 0.01f, 0.01f);
     nk_property_float(ctx, "LUT strength", 0.0f, &s->lut_strength, 1.0f, 0.01f, 0.01f);
 
-    nk_layout_row_dynamic(ctx, 26, 1);
+    nk_layout_row_dynamic(ctx, 26, 3);
+    if (nk_button_label(ctx, "Save"))
+        post_settings_save(&r->post);
+    if (nk_button_label(ctx, "Load"))
+        post_settings_load(&r->post);
     if (nk_button_label(ctx, "Reset (Cartoon)"))
         r->post = post_settings_cartoon();
 

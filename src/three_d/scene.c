@@ -8,6 +8,9 @@
 #include <string.h>
 #include <vulkan/vulkan_core.h>
 
+#define MU_ALLOCATORS_IMPLEMENTATION
+#include "../../external/mu/allocators.h"
+
 /* ============================================================ small encoders */
 
 static uint16_t f2h(float x) {
@@ -83,7 +86,7 @@ typedef struct SceneCpuInstance {
 } SceneCpuInstance;
 
 typedef struct SceneViewFrame {
-    bool       ready; /* transient slices allocated for this view and lane */
+    bool        ready; /* transient slices allocated for this view and lane */
     BufferSlice survivors;
     BufferSlice survivor_count;
     BufferSlice group_count;
@@ -97,7 +100,6 @@ typedef struct SceneViewFrame {
     BufferSlice cull_args;  /* VkDispatchIndirectCommand triple, INDIRECT usage */
     BufferSlice group_base; /* max_survivors x u32: vis_base -> group id */
 
-
 } SceneViewFrame;
 
 #define SCENE_MAX_LODS 4
@@ -110,6 +112,10 @@ struct Scene {
     uint32_t max_lod_rows;
     uint32_t max_materials;
     uint32_t max_survivors;
+
+    /* One backing allocation for every persistent CPU table below. Bump-allocated
+       at create, released as a single block at destroy. See scene_create. */
+    mu_arena arena;
 
     /* persistent gpu tables */
     BufferSlice instances;
@@ -132,7 +138,7 @@ struct Scene {
 
     struct SceneCullMesh    *cpu_cull;
     struct SceneGroupShade  *cpu_group_shade; /* indexed mesh * SCENE_MAX_LODS + lod */
-    uint32_t               *cpu_rung_vbase;  /* vertex base per rung, baked into the shade row at upload */
+    uint32_t                *cpu_rung_vbase;  /* vertex base per rung, baked into the shade row at upload */
     struct SceneLodRow      *cpu_lod;
     struct SceneGpuMaterial *cpu_mat;
     struct SceneCullRow     *cpu_rows;
@@ -141,8 +147,8 @@ struct Scene {
     uint32_t mesh_count;
     uint32_t lod_row_count;
     uint32_t material_count;
-    uint32_t lod_count;    /* rungs every mesh carries; == 1 until an LOD arrives */
-    uint32_t group_count;  /* mesh_count * lod_count, fixed at upload */
+    uint32_t lod_count;   /* rungs every mesh carries; == 1 until an LOD arrives */
+    uint32_t group_count; /* mesh_count * lod_count, fixed at upload */
 
     /* CPU truth. One slot space, split by a scene constant: [0, dynamic_count)
        is the dynamic prefix rewritten every frame, [dynamic_capacity, ...) is the
@@ -150,6 +156,7 @@ struct Scene {
     SceneCpuInstance     *cpu_instances;
     struct SceneInstance *instance_upload_scratch;
     struct SceneCullRow  *candidate_upload_scratch;
+    uint32_t             *compact_dst; /* scene_compact scratch, fixed capacity */
     uint32_t              dynamic_capacity;
     uint32_t              static_capacity;
     uint32_t              dynamic_count;    /* live dynamic slots, dense in [0, dynamic_count) */
@@ -258,19 +265,19 @@ Scene *scene_create(VkBackend *vk, const SceneDesc *desc) {
     s->clear[2] = 0.10f;
     s->clear[3] = 1.0f;
 
-    s->instances    = alloc_slice(s, (VkDeviceSize)s->max_instances * sizeof(struct SceneInstance), 16);
-    s->cull_meshes  = alloc_slice(s, (VkDeviceSize)s->max_meshes * sizeof(struct SceneCullMesh), 16);
-    s->lod_rows     = alloc_slice(s, (VkDeviceSize)s->max_lod_rows * sizeof(struct SceneLodRow), 16);
-    s->materials    = alloc_slice(s, (VkDeviceSize)s->max_materials * sizeof(struct SceneGpuMaterial), 16);
-    s->cull_rows    = alloc_slice(s, (VkDeviceSize)s->max_instances * sizeof(struct SceneCullRow), 16);
+    s->instances   = alloc_slice(s, (VkDeviceSize)s->max_instances * sizeof(struct SceneInstance), 16);
+    s->cull_meshes = alloc_slice(s, (VkDeviceSize)s->max_meshes * sizeof(struct SceneCullMesh), 16);
+    s->lod_rows    = alloc_slice(s, (VkDeviceSize)s->max_lod_rows * sizeof(struct SceneLodRow), 16);
+    s->materials   = alloc_slice(s, (VkDeviceSize)s->max_materials * sizeof(struct SceneGpuMaterial), 16);
+    s->cull_rows   = alloc_slice(s, (VkDeviceSize)s->max_instances * sizeof(struct SceneCullRow), 16);
 
     /* Counters are read back on the CPU, so their host-visible copy has to be
        host-visible: VMA_MEMORY_USAGE_CPU_ONLY is explicitly not mappable, and
        reading it through .mapping is undefined. */
     forEach(i, MAX_FRAMES_IN_FLIGHT) {
         s->counters[i] = alloc_slice(s, sizeof(uint32_t) * SCENE_COUNTERS, 16);
-        if (!create_buffer(vk, sizeof(uint32_t) * SCENE_COUNTERS,
-                           VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_CPU_TO_GPU, &s->counters_host[i]))
+        if (!create_buffer(vk, sizeof(uint32_t) * SCENE_COUNTERS, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                           VMA_MEMORY_USAGE_CPU_TO_GPU, &s->counters_host[i]))
             log_error("[scene] counters host buffer failed");
     }
 
@@ -280,35 +287,79 @@ Scene *scene_create(VkBackend *vk, const SceneDesc *desc) {
        barrier between them — a WRITE_AFTER_WRITE the validation layer flags. */
 
     /* scene_create */
+
+    /* One arena backs every persistent CPU table below. Capacity is the exact
+       sum of their sizes plus per-allocation alignment slack; mu_arena_alloc
+       does not zero, so each table is memset after allocation. */
+    {
+        uint64_t b = 0;
+        b += (uint64_t)s->max_instances * sizeof(SceneCpuInstance);        /* cpu_instances */
+        b += (uint64_t)s->max_instances * sizeof(struct SceneInstance);    /* instance_upload_scratch */
+        b += (uint64_t)s->max_instances * sizeof(struct SceneCullRow) * 2; /* candidate_upload_scratch + cpu_rows */
+        b += (uint64_t)s->max_instances * sizeof(uint32_t) * 4;      /* dirty + static_dirty + row_of + bloom_dense */
+        b += (uint64_t)s->max_instances * sizeof(float);             /* bloom_strength */
+        b += (uint64_t)s->max_instances * sizeof(uint32_t);          /* compact_dst */
+        b += (uint64_t)s->max_meshes * sizeof(struct SceneCullMesh); /* cpu_cull */
+        b += (uint64_t)s->max_meshes * SCENE_MAX_LODS * sizeof(struct SceneGroupShade);
+        b += (uint64_t)s->max_meshes * SCENE_MAX_LODS * sizeof(uint32_t);
+        b += (uint64_t)s->max_meshes * SCENE_MAX_LODS * sizeof(struct SceneGpuDraw);
+        b += (uint64_t)s->max_lod_rows * sizeof(struct SceneLodRow);
+        b += (uint64_t)s->max_materials * sizeof(struct SceneGpuMaterial);
+        b += 512; /* alignment slack for the 13 allocations above */
+        s->arena.base     = malloc((size_t)b);
+        s->arena.capacity = (uint32_t)b;
+        s->arena.used     = 0;
+    }
+
     for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i)
         s->cull_args_dirty[i] = true;
+    /* staged_* grow via realloc during asset load, so they stay heap-backed. */
     s->staged_vertex_cap = 4096;
     s->staged_vertices   = malloc((size_t)s->staged_vertex_cap * sizeof(struct ScenePackedVertex));
     s->staged_index_cap  = 8192;
     s->staged_indices    = malloc((size_t)s->staged_index_cap * sizeof(uint16_t));
 
-    s->cpu_instances            = calloc(s->max_instances, sizeof(SceneCpuInstance));
-    s->instance_upload_scratch  = calloc(s->max_instances, sizeof(struct SceneInstance));
-    s->candidate_upload_scratch = calloc(s->max_instances, sizeof(struct SceneCullRow));
-    s->dirty_slots              = calloc(s->max_instances, sizeof(uint32_t));
-    s->static_dirty_slots       = calloc(s->max_instances, sizeof(uint32_t));
-    s->row_of                   = malloc((size_t)s->max_instances * sizeof(uint32_t));
+    s->cpu_instances = mu_arena_alloc(&s->arena, (uint32_t)(s->max_instances * sizeof(SceneCpuInstance)), 16);
+    s->instance_upload_scratch =
+        mu_arena_alloc(&s->arena, (uint32_t)(s->max_instances * sizeof(struct SceneInstance)), 16);
+    s->candidate_upload_scratch =
+        mu_arena_alloc(&s->arena, (uint32_t)(s->max_instances * sizeof(struct SceneCullRow)), 16);
+    s->dirty_slots        = mu_arena_alloc(&s->arena, s->max_instances * sizeof(uint32_t), 16);
+    s->static_dirty_slots = mu_arena_alloc(&s->arena, s->max_instances * sizeof(uint32_t), 16);
+    s->compact_dst        = mu_arena_alloc(&s->arena, s->max_instances * sizeof(uint32_t), 16);
+    memset(s->cpu_instances, 0, (size_t)s->max_instances * sizeof(SceneCpuInstance));
+    memset(s->instance_upload_scratch, 0, (size_t)s->max_instances * sizeof(struct SceneInstance));
+    memset(s->candidate_upload_scratch, 0, (size_t)s->max_instances * sizeof(struct SceneCullRow));
+    memset(s->dirty_slots, 0, (size_t)s->max_instances * sizeof(uint32_t));
+    memset(s->static_dirty_slots, 0, (size_t)s->max_instances * sizeof(uint32_t));
+
+    s->row_of = mu_arena_alloc(&s->arena, s->max_instances * sizeof(uint32_t), 16);
     for (uint32_t i = 0; i < s->max_instances; ++i)
         s->row_of[i] = UINT32_MAX;
 
-    s->bloom_strength = calloc(s->max_instances, sizeof(float));
-    s->bloom_dense    = malloc((size_t)s->max_instances * sizeof(uint32_t));
+    s->bloom_strength = mu_arena_alloc(&s->arena, s->max_instances * sizeof(float), 16);
+    s->bloom_dense    = mu_arena_alloc(&s->arena, s->max_instances * sizeof(uint32_t), 16);
+    memset(s->bloom_strength, 0, (size_t)s->max_instances * sizeof(float));
     memset(&s->bloom_bits, 0, sizeof(s->bloom_bits));
     mu_bitset_resize_words(&s->bloom_bits, (s->max_instances + 63u) / 64u);
     s->bloom_table = alloc_slice(s, (VkDeviceSize)s->max_instances * sizeof(float), 16);
 
-s->cpu_cull         = calloc(s->max_meshes, sizeof(struct SceneCullMesh));
-    s->cpu_group_shade = calloc((size_t)s->max_meshes * SCENE_MAX_LODS, sizeof(struct SceneGroupShade));
-    s->cpu_rung_vbase  = calloc((size_t)s->max_meshes * SCENE_MAX_LODS, sizeof(uint32_t));
-    s->cpu_lod          = calloc(s->max_lod_rows, sizeof(struct SceneLodRow));
-    s->cpu_mat          = calloc(s->max_materials, sizeof(struct SceneGpuMaterial));
-    s->cpu_rows         = calloc(s->max_instances, sizeof(struct SceneCullRow));
-    s->cpu_group_static = calloc((size_t)s->max_meshes * SCENE_MAX_LODS, sizeof(struct SceneGpuDraw));
+    s->cpu_cull = mu_arena_alloc(&s->arena, s->max_meshes * sizeof(struct SceneCullMesh), 16);
+    s->cpu_group_shade =
+        mu_arena_alloc(&s->arena, (uint32_t)(s->max_meshes * SCENE_MAX_LODS * sizeof(struct SceneGroupShade)), 16);
+    s->cpu_rung_vbase = mu_arena_alloc(&s->arena, (uint32_t)(s->max_meshes * SCENE_MAX_LODS * sizeof(uint32_t)), 16);
+    s->cpu_group_static =
+        mu_arena_alloc(&s->arena, (uint32_t)(s->max_meshes * SCENE_MAX_LODS * sizeof(struct SceneGpuDraw)), 16);
+    s->cpu_lod  = mu_arena_alloc(&s->arena, s->max_lod_rows * sizeof(struct SceneLodRow), 16);
+    s->cpu_mat  = mu_arena_alloc(&s->arena, s->max_materials * sizeof(struct SceneGpuMaterial), 16);
+    s->cpu_rows = mu_arena_alloc(&s->arena, s->max_instances * sizeof(struct SceneCullRow), 16);
+    memset(s->cpu_cull, 0, (size_t)s->max_meshes * sizeof(struct SceneCullMesh));
+    memset(s->cpu_group_shade, 0, (size_t)s->max_meshes * SCENE_MAX_LODS * sizeof(struct SceneGroupShade));
+    memset(s->cpu_rung_vbase, 0, (size_t)s->max_meshes * SCENE_MAX_LODS * sizeof(uint32_t));
+    memset(s->cpu_group_static, 0, (size_t)s->max_meshes * SCENE_MAX_LODS * sizeof(struct SceneGpuDraw));
+    memset(s->cpu_lod, 0, (size_t)s->max_lod_rows * sizeof(struct SceneLodRow));
+    memset(s->cpu_mat, 0, (size_t)s->max_materials * sizeof(struct SceneGpuMaterial));
+    memset(s->cpu_rows, 0, (size_t)s->max_instances * sizeof(struct SceneCullRow));
 
     s->cs_cull        = pipeline_create_compute(vk, "compiledshaders/cull.cs_cull.comp.spv");
     s->cs_count       = pipeline_create_compute(vk, "compiledshaders/compact.cs_count.comp.spv");
@@ -359,25 +410,10 @@ void scene_destroy(Scene *s) {
         buffer_pool_free(vf->cull_args);
         buffer_pool_free(vf->group_base);
     }
-// this is nonsense and monstrocity we need arena alloc
     free(s->staged_vertices);
     free(s->staged_indices);
-    free(s->cpu_instances);
-    free(s->instance_upload_scratch);
-    free(s->candidate_upload_scratch);
-    free(s->dirty_slots);
-    free(s->static_dirty_slots);
-    free(s->row_of);
-    free(s->bloom_strength);
-    free(s->bloom_dense);
     free(s->bloom_bits.array);
-    free(s->cpu_cull);
-    free(s->cpu_group_shade);
-    free(s->cpu_rung_vbase);
-    free(s->cpu_lod);
-    free(s->cpu_mat);
-    free(s->cpu_rows);
-    free(s->cpu_group_static);
+    free(s->arena.base);
     free(s);
 }
 
@@ -386,7 +422,7 @@ void scene_destroy(Scene *s) {
 uint32_t scene_material_add(Scene *s, const struct SceneGpuMaterial *material) {
     if (!s || !material || s->material_count >= s->max_materials)
         return UINT32_MAX;
-    uint32_t id = s->material_count++;
+    uint32_t id    = s->material_count++;
     s->cpu_mat[id] = *material;
     return id;
 }
@@ -444,16 +480,16 @@ uint32_t scene_mesh_add(Scene *s, const SceneMeshDesc *desc) {
         s->cpu_lod[s->lod_row_count].index_count = rung->index_count;
         s->lod_row_count++;
 
-        uint32_t g = mesh * SCENE_MAX_LODS + k;
-        s->cpu_group_static[g].index_count   = rung->index_count;
-        s->cpu_group_static[g].first_index   = ibase + rung->first_index;
+        uint32_t g                            = mesh * SCENE_MAX_LODS + k;
+        s->cpu_group_static[g].index_count    = rung->index_count;
+        s->cpu_group_static[g].first_index    = ibase + rung->first_index;
         s->cpu_group_static[g].instance_count = 0;
         s->cpu_group_static[g].first_instance = 0;
         s->cpu_group_static[g].vertex_offset  = 0; /* the base rides in the shade row */
         s->cpu_group_static[g].mesh_lod       = mesh;
 
-        s->cpu_group_shade[g].material            = desc->material;
-        s->cpu_group_shade[g].pad                 = 0;
+        s->cpu_group_shade[g].material               = desc->material;
+        s->cpu_group_shade[g].pad                    = 0;
         s->cpu_rung_vbase[mesh * SCENE_MAX_LODS + k] = vbase + rung->first_vertex;
     }
 
@@ -481,9 +517,9 @@ static uint32_t instance_insert(Scene *s, const SceneInstanceDesc *desc, bool is
     }
 
     pack_instance(&s->cpu_instances[slot].gpu, desc);
-    s->cpu_instances[slot].mesh          = desc->mesh;
-    s->cpu_instances[slot].alive         = 1;
-    s->bloom_strength[slot]              = 0.0f;
+    s->cpu_instances[slot].mesh  = desc->mesh;
+    s->cpu_instances[slot].alive = 1;
+    s->bloom_strength[slot]      = 0.0f;
     mu_bitset_reset(&s->bloom_bits, slot);
     s->cpu_rows[s->candidate_count].slot = slot;
     s->cpu_rows[s->candidate_count].mesh = (uint16_t)desc->mesh;
@@ -582,9 +618,9 @@ void scene_instance_destroy(Scene *s, uint32_t slot) {
     bool     is_static = slot >= s->dynamic_capacity;
     uint32_t last_slot = is_static ? s->dynamic_capacity + s->static_count - 1 : s->dynamic_count - 1;
     if (slot != last_slot) {
-        uint32_t moved_row          = s->row_of[last_slot];
-        s->cpu_instances[slot]      = s->cpu_instances[last_slot];
-        s->bloom_strength[slot]     = s->bloom_strength[last_slot];
+        uint32_t moved_row      = s->row_of[last_slot];
+        s->cpu_instances[slot]  = s->cpu_instances[last_slot];
+        s->bloom_strength[slot] = s->bloom_strength[last_slot];
         mu_bitset_set_bit(&s->bloom_bits, slot, mu_bitset_test(&s->bloom_bits, last_slot));
         s->row_of[slot]             = moved_row;
         s->cpu_rows[moved_row].slot = slot;
@@ -630,12 +666,9 @@ void scene_compact_slots(Scene *s) {
             dyn++;
     }
 
-    /* dst[] is scratch. max_instances is a fixed capacity decided at
-       scene_create, so this is a bounded stack-free allocation made once per
-       compaction, which happens at load boundaries and never per event. */
-    uint32_t *dst = malloc((size_t)s->max_instances * sizeof(uint32_t));
-    if (!dst)
-        return;
+    /* dst is fixed-capacity scratch carved from the scene arena, reused every
+       compaction; load-boundary only, never per event, so no allocation. */
+    uint32_t *dst = s->compact_dst;
 
     uint32_t d = 0, t = 0, row = 0;
     for (uint32_t i = 0; i < s->max_instances; ++i) {
@@ -666,7 +699,6 @@ void scene_compact_slots(Scene *s) {
         s->row_of[to]         = row;
         row++;
     }
-    free(dst);
 
     /* Slots moved: rebuild the bitset from strengths so membership follows the
        new slot layout. Dense is rebuilt on the next bloom upload. */
@@ -743,10 +775,10 @@ bool scene_upload_scene(Scene *s, VkCommandBuffer cmd) {
         uint64_t vbase_addr = slice_addr(vk, varena);
         for (uint32_t m = 0; m < s->mesh_count; ++m) {
             for (uint32_t k = 0; k < s->lod_count; ++k) {
-                uint32_t src = m * SCENE_MAX_LODS + k;
-                uint32_t g   = m * s->lod_count + k;
-                s->cpu_group_static[g]   = s->cpu_group_static[src];
-                s->cpu_group_shade[g]    = s->cpu_group_shade[src];
+                uint32_t src           = m * SCENE_MAX_LODS + k;
+                uint32_t g             = m * s->lod_count + k;
+                s->cpu_group_static[g] = s->cpu_group_static[src];
+                s->cpu_group_shade[g]  = s->cpu_group_shade[src];
                 s->cpu_group_shade[g].vertex_stream =
                     vbase_addr + (uint64_t)s->cpu_rung_vbase[src] * sizeof(struct ScenePackedVertex);
             }
@@ -761,8 +793,8 @@ bool scene_upload_scene(Scene *s, VkCommandBuffer cmd) {
         s->material_count        = 1;
     }
 
-renderer_upload_buffer_to_slice(vk, cmd, s->cull_meshes,
-                                 (ByteSpan){s->cpu_cull, s->max_meshes * sizeof(struct SceneCullMesh)});
+    renderer_upload_buffer_to_slice(vk, cmd, s->cull_meshes,
+                                    (ByteSpan){s->cpu_cull, s->max_meshes * sizeof(struct SceneCullMesh)});
     renderer_upload_buffer_to_slice(vk, cmd, s->lod_rows,
                                     (ByteSpan){s->cpu_lod, s->max_lod_rows * sizeof(struct SceneLodRow)});
     renderer_upload_buffer_to_slice(vk, cmd, s->materials,
@@ -793,7 +825,7 @@ renderer_upload_buffer_to_slice(vk, cmd, s->cull_meshes,
 
     /* group templates and shade rows, one per (mesh, lod) */
     {
-        uint32_t G = s->group_count ? s->group_count : 1;
+        uint32_t G      = s->group_count ? s->group_count : 1;
         s->group_static = alloc_slice(s, (VkDeviceSize)G * sizeof(struct SceneGpuDraw), 16);
         s->group_shade  = alloc_slice(s, (VkDeviceSize)G * sizeof(struct SceneGroupShade), 16);
         renderer_upload_buffer_to_slice(vk, cmd, s->group_static,
@@ -829,7 +861,7 @@ static void ensure_pipelines(Scene *s, RenderTarget *color, RenderTarget *depth)
     cfg.frag_path              = "compiledshaders/scene.frag.spv";
     /* Current .mua assets include double-sided batches, but this scene has one
        pipeline and does not yet carry batch selection into draw submission. */
-    cfg.cull_mode              = VK_CULL_MODE_NONE;
+    cfg.cull_mode = VK_CULL_MODE_NONE;
 
     cfg.front_face             = VK_FRONT_FACE_COUNTER_CLOCKWISE;
     cfg.color_attachment_count = 1;
@@ -863,7 +895,8 @@ static void build_frustum(const float rows[4][4], struct SceneVec4 *planes) {
     static const struct {
         int   b;
         float sa, sb;
-    } kPlane[6] = {{0, 1.0f, 1.0f}, {0, 1.0f, -1.0f}, {1, 1.0f, 1.0f}, {1, 1.0f, -1.0f}, {2, 0.0f, 1.0f}, {2, 1.0f, -1.0f}};
+    } kPlane[6] = {{0, 1.0f, 1.0f},  {0, 1.0f, -1.0f}, {1, 1.0f, 1.0f},
+                   {1, 1.0f, -1.0f}, {2, 0.0f, 1.0f},  {2, 1.0f, -1.0f}};
 
     for (int p = 0; p < 6; ++p) {
         float nx = kPlane[p].sa * rows[3][0] + kPlane[p].sb * rows[kPlane[p].b][0];
@@ -879,7 +912,7 @@ static void build_frustum(const float rows[4][4], struct SceneVec4 *planes) {
             planes[p].w = 1e20f;
             continue;
         }
-        float inv = 1.0f / len;
+        float inv   = 1.0f / len;
         planes[p].x = nx * inv;
         planes[p].y = ny * inv;
         planes[p].z = nz * inv;
@@ -896,7 +929,7 @@ static void ensure_view_frame(Scene *s, uint32_t view, uint32_t lane) {
     SceneViewFrame *vf = &s->view_frame[view][lane];
     if (vf->ready)
         return;
-    uint32_t G = s->group_count ? s->group_count : 1;
+    uint32_t G         = s->group_count ? s->group_count : 1;
     vf->survivors      = alloc_slice(s, (VkDeviceSize)s->max_survivors * sizeof(uint32_t), 16);
     vf->survivor_count = alloc_slice(s, sizeof(uint32_t), 16);
     vf->group_count    = alloc_slice(s, (VkDeviceSize)G * sizeof(uint32_t), 16);
@@ -933,7 +966,7 @@ static void build_cull_push(Scene *s, uint32_t view, uint32_t lane, struct Scene
     p->lod_rows       = slice_addr(vk, s->lod_rows);
     p->survivors      = slice_addr(vk, vf->survivors);
     p->survivor_count = slice_addr(vk, vf->survivor_count);
-    p->counters      = slice_addr(vk, s->counters[lane]);
+    p->counters       = slice_addr(vk, s->counters[lane]);
     p->cull_args      = slice_addr(vk, vf->cull_args);
 
     p->counts[0] = s->lod_count;
@@ -955,12 +988,12 @@ static void build_draw_push(Scene *s, uint32_t view, uint32_t lane, struct Scene
     }
     /* Normalized once here rather than per fragment; the sign is preserved so
        a light pointing away still lights the back of nothing. */
-    float len      = sqrtf(s->sun[0] * s->sun[0] + s->sun[1] * s->sun[1] + s->sun[2] * s->sun[2]);
-    float inv      = len > 1e-8f ? 1.0f / len : 0.0f;
-    p->sun.x        = s->sun[0] * inv;
-    p->sun.y        = s->sun[1] * inv;
-    p->sun.z        = s->sun[2] * inv;
-    p->sun.w        = s->ambient;
+    float len = sqrtf(s->sun[0] * s->sun[0] + s->sun[1] * s->sun[1] + s->sun[2] * s->sun[2]);
+    float inv = len > 1e-8f ? 1.0f / len : 0.0f;
+    p->sun.x  = s->sun[0] * inv;
+    p->sun.y  = s->sun[1] * inv;
+    p->sun.z  = s->sun[2] * inv;
+    p->sun.w  = s->ambient;
 
     p->camera.x = s->views[view].camera_pos[0];
     p->camera.y = s->views[view].camera_pos[1];
@@ -1075,9 +1108,9 @@ void scene_frame(Scene *s, VkCommandBuffer cmd, RenderTarget *color, RenderTarge
         for (uint32_t w = 0; w * 64u < s->max_instances; ++w) {
             uint64_t word = w < s->bloom_bits.word_count ? s->bloom_bits.array[w] : 0u;
             while (word) {
-                uint32_t bit                       = (uint32_t)mu_trailing_zeroes_u64(word);
-                s->bloom_dense[s->bloom_count++]   = w * 64u + bit;
-                word                              &= word - 1u;
+                uint32_t bit                     = (uint32_t)mu_trailing_zeroes_u64(word);
+                s->bloom_dense[s->bloom_count++] = w * 64u + bit;
+                word &= word - 1u;
             }
         }
         renderer_upload_buffer_to_slice(vk, cmd, s->bloom_table,
@@ -1191,6 +1224,8 @@ void scene_frame(Scene *s, VkCommandBuffer cmd, RenderTarget *color, RenderTarge
             .buf_write_count = ARRAY_COUNT(cull_writes),
             .pipeline        = s->cs_cull,
         };
+
+
         begin_pass(vk, cmd, &cull_pass);
         dispatch_indirect(vk, cmd, (ByteSpan){&cp_push, (uint32_t)sizeof(cp_push)}, vf->cull_args);
         end_pass(vk, cmd, &cull_pass);
@@ -1235,7 +1270,7 @@ void scene_frame(Scene *s, VkCommandBuffer cmd, RenderTarget *color, RenderTarge
         BufferAccess scan_writes[8] = {
             {.slice  = vf->vis_base,
              .stage  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-             .access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT|VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT },
+             .access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT},
             {.slice  = vf->cmd_index,
              .stage  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
              .access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT},
@@ -1355,7 +1390,7 @@ void scene_frame(Scene *s, VkCommandBuffer cmd, RenderTarget *color, RenderTarge
            leaves no depth behind. */
         PassAttachment col = {.target = color, .load = LOAD_KEEP, .store = STORE_KEEP};
         PassAttachment dep = {.target = depth, .load = LOAD_CLEAR, .store = STORE_KEEP};
-        dep.clear[0] = 0.0f; /* reverse-Z: the far plane is 0.0 */
+        dep.clear[0]       = 0.0f; /* reverse-Z: the far plane is 0.0 */
 
         BufferAccess draw_reads[10] = {
             {.slice  = s->instances,

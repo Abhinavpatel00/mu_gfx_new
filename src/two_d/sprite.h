@@ -19,6 +19,7 @@
 
 #include "../../vk.h"
 #include "sprite_data.h"
+#include "../../external/mu/allocators.h"
 
 #define SPRITE_MAX_PICTURES 4096u
 
@@ -101,6 +102,9 @@ typedef struct SpriteDraw {
 
 typedef struct SpriteSystem {
     VkBackend *vk;
+
+    /* One backing allocation for instances/sorted/slot_of/pictures. */
+    mu_arena arena;
 
     /* CPU build state, rebuilt by every flush. */
     SpriteInst *instances;  /* pushed, unsorted */

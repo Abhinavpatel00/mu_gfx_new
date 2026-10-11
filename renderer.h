@@ -49,6 +49,12 @@ struct SpriteSystem *renderer_sprites(Renderer *renderer);
    Color Grade window. The app mirrors this onto its own scene each frame. */
 bool renderer_toon(Renderer *renderer);
 
+/* Feed the renderer this frame's view and projection (column-major, cglm
+   layout). The renderer derives view-proj, its inverse, and keeps the previous
+   frame's view-proj so GPU effects that reconstruct world position (SSAO) can
+   reproject history across frames. Call once per frame before the passes. */
+void renderer_set_camera(Renderer *renderer, const float *view, const float *projection);
+
 /* Queue a line for the on-screen Game window. The queue clears every frame, so
    call it once per frame for each line you want. Silently drops overflow. */
 void renderer_hud(Renderer *renderer, const char *fmt, ...);

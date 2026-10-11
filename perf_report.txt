@@ -1,0 +1,9 @@
+== mu_gfx perf report ==
+frames            : 3579
+frame time        : 30.606 ms (32.7 fps)
+cpu active (ema)  : 16.333 ms
+cpu wait (ema)    : 17.724 ms
+gpu frame         : 0.000 ms (avg 0.000 ms)
+resolution        : 1362x749
+
+pass                            cur(ms)    avg(ms)    min(ms)    max(ms)   primitives

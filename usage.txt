@@ -1,0 +1,9 @@
+#include "src/three_d/scene.h"  // scene_set_instance_bloom
+
+uint32_t fire  = scene_instance_create(scene, &fire_desc);
+uint32_t beam  = scene_instance_create(scene, &beam_desc);
+uint32_t crate = scene_instance_create(scene, &crate_desc);
+
+scene_set_instance_bloom(scene, fire,  2.0f);  // strong glow
+scene_set_instance_bloom(scene, beam,  1.0f);  // normal glow
+// crate: never touched, defaults 0.0f = excluded
