@@ -20,8 +20,8 @@
 // Forward declarations for functions defined later in this file or in included files
 static void install_callbacks(Renderer *r);
 
-#include "vk.h"
 #include "src/two_d/two_d.h"
+#include "vk.h"
 
 /* How many HUD lines the game can queue per frame, and how long each may be. */
 #define GAME_HUD_LINES 12
@@ -123,9 +123,9 @@ static PostSettings post_settings_cartoon(void) {
     return (PostSettings){
         /* Every stage on, with neutral defaults for the ones the preset does not
            use, so each UI slider takes effect without a separate enable. */
-        .flags               = POST_EXPOSURE | POST_TONEMAP | POST_GAMMA | POST_CONTRAST | POST_SATURATION |
-                               POST_WHITE_BALANCE | POST_VIGNETTE | POST_GRAIN | POST_SHARPEN | POST_CA |
-                               POST_DITHER | POST_SEPIA | POST_LIFT_GAIN | POST_SSAO,
+        .flags = POST_EXPOSURE | POST_TONEMAP | POST_GAMMA | POST_CONTRAST | POST_SATURATION | POST_WHITE_BALANCE |
+                 POST_VIGNETTE | POST_GRAIN | POST_SHARPEN | POST_CA | POST_DITHER | POST_SEPIA | POST_LIFT_GAIN |
+                 POST_SSAO,
         .tonemap_mode        = 1u, /* ACES */
         .exposure            = 0.35f,
         .gamma               = 2.2f,
@@ -327,24 +327,26 @@ struct Renderer {
     RenderTarget       smaa_edges[MAX_SWAPCHAIN_IMAGES];
     RenderTarget       smaa_weights[MAX_SWAPCHAIN_IMAGES];
     RenderTarget       bloom_mip[MAX_SWAPCHAIN_IMAGES][BLOOM_MIPS];
-    /* SSAO temporal history, ping-pong. .r = accumulated AO, .g = sample count.
-       Two buffers because a pass can't read and write the same target. */
-    RenderTarget       ssao_hist[MAX_SWAPCHAIN_IMAGES][2];
-    uint32_t           ssao_parity[MAX_SWAPCHAIN_IMAGES];
-    TextureID          lut_texture;
-    uint32_t           lut_size;
-    PostSettings       post;
+    /* SSAO temporal history, ping-pong. .r = accumulated AO, .g = sample count,
+       .b = the view distance the texel saw. Two buffers because a pass can't
+       read and write the same target. */
+    RenderTarget ssao_hist[MAX_SWAPCHAIN_IMAGES][2];
+    uint32_t     ssao_parity[MAX_SWAPCHAIN_IMAGES];
+    bool         ssao_history_valid[MAX_SWAPCHAIN_IMAGES];
+    TextureID    lut_texture;
+    uint32_t     lut_size;
+    PostSettings post;
     /* Camera, fed by the app each frame via renderer_set_camera. cglm
        column-major. prev_viewproj is last frame's, for temporal reprojection. */
-    mat4               cam_view;
-    mat4               cam_proj;
-    mat4               cam_viewproj;
-    mat4               cam_inv_view;
-    mat4               cam_prev_viewproj;
-    bool               debug_ui_open;
-    TextureID          dummy_texture;
-    TextureID          smaa_area_tex;
-    TextureID          smaa_search_tex;
+    mat4      cam_view;
+    mat4      cam_proj;
+    mat4      cam_viewproj;
+    mat4      cam_inv_view;
+    mat4      cam_prev_viewproj;
+    bool      debug_ui_open;
+    TextureID dummy_texture;
+    TextureID smaa_area_tex;
+    TextureID smaa_search_tex;
     struct {
         uint32_t smaa_edge;
         uint32_t smaa_weight;
@@ -743,9 +745,9 @@ static void capture_record(Renderer *r, VkCommandBuffer cmd) {
    Generated so the LUT path is always valid; dropping a real LUT in and setting
    lut_strength is all it takes to use one. */
 static void create_identity_lut(Renderer *r) {
-    const uint32_t N   = 32u;
-    const uint32_t W   = N * N;
-    uint8_t       *px  = (uint8_t *)malloc((size_t)W * N * 4u);
+    const uint32_t N  = 32u;
+    const uint32_t W  = N * N;
+    uint8_t       *px = (uint8_t *)malloc((size_t)W * N * 4u);
     for (uint32_t y = 0; y < N; ++y)
         for (uint32_t x = 0; x < W; ++x) {
             uint8_t *p = px + ((size_t)y * W + x) * 4u;
@@ -759,15 +761,15 @@ static void create_identity_lut(Renderer *r) {
                               .mip_count = 1,
                               .format    = VK_FORMAT_R8G8B8A8_UNORM,
                               .usage     = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT};
-    r->lut_texture = create_texture(&r->vk, &desc);
-    r->lut_size    = N;
+    r->lut_texture         = create_texture(&r->vk, &desc);
+    r->lut_size            = N;
     texture_upload(&r->vk, r->lut_texture, 0, 0, (VkOffset3D){0, 0, 0}, (VkExtent3D){W, N, 1},
                    (ByteSpan){px, W * N * 4u});
     free(px);
 }
 
 static void renderer_resources_create(Renderer *r, VkBackendDesc *desc) {
-    MemTag prev = vk_mem_set_tag(&r->vk, MEM_TAG_POST);
+    MemTag   prev         = vk_mem_set_tag(&r->vk, MEM_TAG_POST);
     VkFormat depth_format = pick_depth_format(r->vk.devc.physical_device);
     VkFormat hdr_format   = VK_FORMAT_R16G16B16A16_SFLOAT;
     capture_init(r, r->vk.swapchain.extent.width, r->vk.swapchain.extent.height);
@@ -963,8 +965,8 @@ static void renderer_resources_create(Renderer *r, VkBackendDesc *desc) {
         rt_create(&r->vk, &r->smaa_edges[i], &smaa_edge_spec);
         rt_create(&r->vk, &r->smaa_weights[i], &smaa_weight_spec);
         forEach(k, BLOOM_MIPS) {
-            uint32_t mw = MAX(r->vk.swapchain.extent.width >> (k + 1u), 1u);
-            uint32_t mh = MAX(r->vk.swapchain.extent.height >> (k + 1u), 1u);
+            uint32_t         mw       = MAX(r->vk.swapchain.extent.width >> (k + 1u), 1u);
+            uint32_t         mh       = MAX(r->vk.swapchain.extent.height >> (k + 1u), 1u);
             RenderTargetSpec mip_spec = {.width      = mw,
                                          .height     = mh,
                                          .layers     = 1,
@@ -976,14 +978,16 @@ static void renderer_resources_create(Renderer *r, VkBackendDesc *desc) {
         }
         /* SSAO temporal history at half resolution: the occlusion signal is
            low-frequency and the bitmask algorithm is ALU-heavy, not
-           bandwidth-heavy. RG16F holds accumulated AO in .r and the sample
-           count in .g; two buffers ping-pong across frames. */
-        uint32_t       aw = MAX(r->vk.swapchain.extent.width / 2u, 1u);
-        uint32_t       ah = MAX(r->vk.swapchain.extent.height / 2u, 1u);
+           bandwidth-heavy. RGBA16F holds accumulated AO in .r, the sample count
+           in .g, and the view distance the texel saw in .b — the disocclusion
+           test reads it to tell our surface from whatever was there before.
+           Two buffers ping-pong across frames. */
+        uint32_t         aw        = MAX(r->vk.swapchain.extent.width / 2u, 1u);
+        uint32_t         ah        = MAX(r->vk.swapchain.extent.height / 2u, 1u);
         RenderTargetSpec ssao_spec = {.width      = aw,
                                       .height     = ah,
                                       .layers     = 1,
-                                      .format     = VK_FORMAT_R16G16_SFLOAT,
+                                      .format     = VK_FORMAT_R16G16B16A16_SFLOAT,
                                       .usage      = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
                                       .mip_count  = 1,
                                       .debug_name = "ssao_hist"};
@@ -1125,7 +1129,7 @@ static void renderer_resources_create(Renderer *r, VkBackendDesc *desc) {
         r->two_d = two_d_create(&r->vk, &r->hdr_color[0].format);
     if (r->game.start)
         r->game.start(r->game.user, r);
-     vk_mem_report(&r->vk, "init");
+    vk_mem_report(&r->vk, "init");
 }
 
 Renderer *renderer_create(bool use_wayland, GameHooks game) {
@@ -1170,7 +1174,7 @@ Renderer *renderer_create(bool use_wayland, GameHooks game) {
         .swapchain_extra_usage_flags =
             VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
         .vsync               = false,
-        .enable_debug_printf = true ,
+        .enable_debug_printf = true,
 
         .bindless_sampled_image_count     = MAX_BINDLESS_TEXTURES,
         .bindless_sampler_count           = MAX_BINDLESS_SAMPLERS,
@@ -1345,8 +1349,7 @@ static void perf_dump(const Renderer *r) {
     fprintf(f, "cpu wait (ema)    : %.3f ms\n", wait_ms);
     fprintf(f, "gpu frame         : %.3f ms (avg %.3f ms)\n", gpu_ms, g_gpu_profiler_ui.avg_total_gpu_time_ms);
     fprintf(f, "resolution        : %ux%u\n", r->vk.swapchain.extent.width, r->vk.swapchain.extent.height);
-    fprintf(f, "\n%-28s %10s %10s %10s %10s %12s\n", "pass", "cur(ms)", "avg(ms)", "min(ms)", "max(ms)",
-            "primitives");
+    fprintf(f, "\n%-28s %10s %10s %10s %10s %12s\n", "pass", "cur(ms)", "avg(ms)", "min(ms)", "max(ms)", "primitives");
     for (uint32_t i = 0; i < g_gpu_profiler_ui.pass_count; i++) {
         const GpuPassStats *ps = &g_gpu_profiler_ui.pass_stats[i];
         fprintf(f, "%-28s %10.3f %10.3f %10.3f %10.3f %12llu\n", ps->name, ps->time_ms, ps->avg_ms, ps->min_ms,
@@ -1391,9 +1394,8 @@ static MU_INLINE bool frame_start(Renderer *r) {
             rt_resize(&r->vk, &r->smaa_final[i], fb_w, fb_h);
             rt_resize(&r->vk, &r->smaa_edges[i], fb_w, fb_h);
             rt_resize(&r->vk, &r->smaa_weights[i], fb_w, fb_h);
-            forEach(k, BLOOM_MIPS)
-                rt_resize(&r->vk, &r->bloom_mip[i][k], MAX((uint32_t)fb_w >> (k + 1u), 1u),
-                          MAX((uint32_t)fb_h >> (k + 1u), 1u));
+            forEach(k, BLOOM_MIPS) rt_resize(&r->vk, &r->bloom_mip[i][k], MAX((uint32_t)fb_w >> (k + 1u), 1u),
+                                             MAX((uint32_t)fb_h >> (k + 1u), 1u));
             rt_resize(&r->vk, &r->ssao_hist[i][0], MAX((uint32_t)fb_w / 2u, 1u), MAX((uint32_t)fb_h / 2u, 1u));
             rt_resize(&r->vk, &r->ssao_hist[i][1], MAX((uint32_t)fb_w / 2u, 1u), MAX((uint32_t)fb_h / 2u, 1u));
         }
@@ -1454,24 +1456,43 @@ static void update_global_data(Renderer *r) {
     vkUpdateDescriptorSets(r->vk.devc.device, 1, &write, 0, NULL);
 }
 
+/* The app sets the camera from its render hook, which runs after
+   update_global_data, so the matrices it wrote are a frame old by then. Copy
+   them into this frame's UBO once the scene pass has recorded, so every pass
+   that reprojects reads the camera that produced the depth it reads. A
+   frame-late camera never lands history back on itself, and SSAO smears
+   permanently instead of converging. Only the mapping changes: the descriptor
+   already points at this frame's buffer. */
+static void write_global_camera(Renderer *r) {
+    GlobalData *gd = (GlobalData *)r->global_ubo[r->vk.current_frame].mapping;
+    glm_mat4_copy(r->cam_view, gd->view);
+    glm_mat4_copy(r->cam_proj, gd->projection);
+    glm_mat4_copy(r->cam_viewproj, gd->viewproj);
+    glm_mat4_copy(r->cam_inv_view, gd->inv_view);
+    glm_mat4_inv(r->cam_proj, gd->inv_projection);
+    glm_mat4_inv(r->cam_viewproj, gd->inv_viewproj);
+    glm_mat4_copy(r->cam_prev_viewproj, gd->prev_viewproj);
+    vmaFlushAllocation(r->vk.devc.vmaallocator, r->global_ubo[r->vk.current_frame].allocation, 0, sizeof(*gd));
+}
+
 /* Field order is the shader's: both sides are flat scalars, so the layouts
    line up word for word. */
-PUSH_CONSTANT(PostPush,
-              uint32_t src_texture_id; uint32_t output_image_id; uint32_t sampler_id; uint32_t width;
-              uint32_t height; uint32_t frame; float exposure; uint32_t flags; uint32_t tonemap_mode;
-              float gamma_value; float contrast; float saturation; float temperature; float tint;
-              float vignette_intensity; float vignette_smoothness; float sharpen_strength; float ca_strength;
-              float grain_intensity; float sepia_intensity; float dither_strength; float lift_r; float lift_g;
-              float lift_b; float gain_r; float gain_g; float gain_b; uint32_t lut_texture_id; uint32_t lut_size;
-              float lut_strength; uint32_t bloom_texture_id; float bloom_strength; float time;
-              uint32_t ssao_texture_id; float ssao_strength;);
+PUSH_CONSTANT(PostPush, uint32_t src_texture_id; uint32_t output_image_id; uint32_t sampler_id; uint32_t width;
+              uint32_t height; uint32_t frame; float exposure; uint32_t flags; uint32_t tonemap_mode; float gamma_value;
+              float contrast; float saturation; float temperature; float tint; float vignette_intensity;
+              float vignette_smoothness; float sharpen_strength; float ca_strength; float grain_intensity;
+              float sepia_intensity; float dither_strength; float lift_r; float lift_g; float lift_b; float gain_r;
+              float gain_g; float gain_b; uint32_t lut_texture_id; uint32_t lut_size; float lut_strength;
+              uint32_t bloom_texture_id; float bloom_strength; float time; uint32_t ssao_texture_id;
+              float                                                                 ssao_strength;);
 
 PUSH_CONSTANT(BloomPush, uint32_t src_texture_id; uint32_t dst_image_id; uint32_t sampler_id; uint32_t width;
               uint32_t height; uint32_t pass; float radius; float threshold; float soft_knee; uint32_t prefilter;);
 
 PUSH_CONSTANT(SsaoPush, uint32_t depth_texture_id; uint32_t output_image_id; uint32_t sampler_id; uint32_t width;
-              uint32_t height; float proj_00; float proj_11; float radius; float bias; float intensity;
-              uint32_t sample_count; float near_z; float far_z; uint32_t history_texture_id;);
+              uint32_t height; uint32_t sample_count; uint32_t mode; float proj_00; float proj_11; float radius;
+              float thickness; float bias; float intensity; float near_z; float far_z; float depth_scale;
+              uint32_t history_texture_id;);
 
 PUSH_CONSTANT(SkyPush, float top[4]; float bottom[4]; float exponent; float pad0; float pad1; float pad2;);
 PUSH_CONSTANT(EdgePush, uint32_t texture_id; uint32_t sampler_id;);
@@ -1527,7 +1548,34 @@ static void pass_bloom(Renderer *r, VkCommandBuffer cmd, uint32_t image) {
     }
 }
 
-/* GT-VBAO compute pass. Reads depth + (in temporal mode) the previous history,
+/* Resets both SSAO history buffers to neutral (AO=1, count=0) while SSAO is
+   disabled, flipping parity like pass_ssao so post reads a fresh buffer when
+   the effect comes back. Without this, re-enabling blends the frame's last
+   stale accumulation for up to MaxHistory frames. Depth is not read and no
+   history is sampled, so this is one half-res storage write. */
+static void pass_ssao_reset(Renderer *r, VkCommandBuffer cmd) {
+    uint32_t image  = r->vk.swapchain.current_image;
+    uint32_t parity = r->ssao_parity[image];
+
+    RenderTarget *hist_out = &r->ssao_hist[image][parity ^ 1u];
+    r->ssao_parity[image]  = parity ^ 1u;
+
+    RenderTarget *writes[] = {hist_out};
+    PassDesc      pd       = {.shader_writes      = writes,
+                              .shader_write_count = 1,
+                              .pipeline           = r->EnginePipelines.ssao};
+
+    SsaoPush p = {.output_image_id = hist_out->bindless_index,
+                  .width           = hist_out->width,
+                  .height          = hist_out->height,
+                  .mode            = 0u};
+
+    begin_pass(&r->vk, cmd, &pd);
+    dispatch_push(&r->vk, cmd, BYTE_SPAN(p), (p.width + 7) / 8, (p.height + 7) / 8, 1);
+    end_pass(&r->vk, cmd, &pd);
+}
+
+/* GT-VBAO compute pass. Reads depth and the previous history,
    reconstructs normals from screen-space depth derivatives, runs the bitmask
    horizon search, and in temporal mode blends one sample/frame into history.
    Writes the current-parity history buffer; post reads it via bindless index. */
@@ -1550,20 +1598,29 @@ static void pass_ssao(Renderer *r, VkCommandBuffer cmd) {
                               .pipeline           = r->EnginePipelines.ssao};
 
     const GlobalData *gd = (const GlobalData *)r->global_ubo[r->vk.current_frame].mapping;
-    SsaoPush p = {.depth_texture_id  = r->depth[image].bindless_index,
-                  .output_image_id   = hist_out->bindless_index,
-                  .sampler_id        = r->vk.default_samplers.samplers[SAMPLER_LINEAR_CLAMP],
-                  .width             = hist_out->width,
-                  .height            = hist_out->height,
-                  .proj_00           = gd->projection[0][0],
-                  .proj_11           = gd->projection[1][1],
-                  .radius            = 0.5f,
-                  .bias              = 0.025f,
-                  .intensity         = 1.0f,
-                  .sample_count      = 1u,
-                  .near_z            = 0.1f,
-                  .far_z             = 1000.0f,
-                  .history_texture_id = hist_in->bindless_index};
+    SsaoPush          p  = {.depth_texture_id   = r->depth[image].bindless_index,
+                            .output_image_id    = hist_out->bindless_index,
+                            /* Depth is D32_SFLOAT, which is not a filterable format, and
+                               filtering it would invent geometry across silhouettes anyway.
+                               History taps are point samples for the same reason: a filtered
+                               tap blends AO across the edge it is meant to detect. */
+                            .sampler_id         = r->vk.default_samplers.samplers[SAMPLER_NEAREST_CLAMP],
+                            .width              = hist_out->width,
+                            .height             = hist_out->height,
+                            .proj_00            = gd->projection[0][0],
+                            .proj_11            = gd->projection[1][1],
+                            .radius             = 0.5f,
+                            /* Half the radius: the slab is the occluder's own depth, and at
+                               radius it swallows the whole neighbourhood and over-occludes. */
+                            .thickness          = 0.25f,
+                            .bias               = 0.025f,
+                            .intensity          = 1.0f,
+                            .sample_count       = 1u,
+                            .near_z             = 0.1f,
+                            .far_z              = 1000.0f,
+                            .depth_scale        = (float)r->depth[image].width / (float)hist_out->width,
+                            .history_texture_id = hist_in->bindless_index,
+                            .mode               = 1u};
 
     begin_pass(&r->vk, cmd, &pd);
     dispatch_push(&r->vk, cmd, BYTE_SPAN(p), (p.width + 7) / 8, (p.height + 7) / 8, 1);
@@ -1606,48 +1663,47 @@ static void post_pass(Renderer *r, VkCommandBuffer cmd) {
 
         uint32_t bloom_id = bloom_on ? r->bloom_mip[image][0].bindless_index : 0xFFFFFFFFu;
         uint32_t ssao_id  = ssao_on ? r->ssao_hist[image][r->ssao_parity[image]].bindless_index : 0xFFFFFFFFu;
-        PostPush            push     = {
-                         .src_texture_id      = r->hdr_color[image].bindless_index,
-                         .output_image_id     = r->ldr_color[image].bindless_index,
-                         .sampler_id          = r->vk.default_samplers.samplers[SAMPLER_LINEAR_CLAMP],
-                         .width               = r->vk.swapchain.extent.width,
-                         .height              = r->vk.swapchain.extent.height,
-                         .frame               = r->frame_count,
-                         .exposure            = s->exposure,
-                         .flags               = s->flags,
-                         .tonemap_mode        = s->tonemap_mode,
-                         .gamma_value         = s->gamma,
-                         .contrast            = s->contrast,
-                         .saturation          = s->saturation,
-                         .temperature         = s->temperature,
-                         .tint                = s->tint,
-                         .vignette_intensity  = s->vignette,
-                         .vignette_smoothness = s->vignette_smoothness,
-                         .sharpen_strength    = s->sharpen,
-                         .ca_strength         = s->ca,
-                         .grain_intensity     = s->grain,
-                         .sepia_intensity     = s->sepia,
-                         .dither_strength     = s->dither,
-                         .lift_r              = s->lift[0],
-                         .lift_g              = s->lift[1],
-                         .lift_b              = s->lift[2],
-                         .gain_r              = s->gain[0],
-                         .gain_g              = s->gain[1],
-                         .gain_b              = s->gain[2],
-                         .lut_texture_id      = r->lut_texture,
-                         .lut_size            = r->lut_size,
-                         .lut_strength        = s->lut_strength,
-                         .bloom_texture_id    = bloom_id,
-                         .bloom_strength      = s->bloom_strength,
-                         .time = (float)((double)(mu_time_now() - r->start_time) / mu_time_freq()),
-                         .ssao_texture_id = ssao_id,
-                         .ssao_strength   = s->ssao_strength,
+        PostPush push     = {
+            .src_texture_id      = r->hdr_color[image].bindless_index,
+            .output_image_id     = r->ldr_color[image].bindless_index,
+            .sampler_id          = r->vk.default_samplers.samplers[SAMPLER_LINEAR_CLAMP],
+            .width               = r->vk.swapchain.extent.width,
+            .height              = r->vk.swapchain.extent.height,
+            .frame               = r->frame_count,
+            .exposure            = s->exposure,
+            .flags               = s->flags,
+            .tonemap_mode        = s->tonemap_mode,
+            .gamma_value         = s->gamma,
+            .contrast            = s->contrast,
+            .saturation          = s->saturation,
+            .temperature         = s->temperature,
+            .tint                = s->tint,
+            .vignette_intensity  = s->vignette,
+            .vignette_smoothness = s->vignette_smoothness,
+            .sharpen_strength    = s->sharpen,
+            .ca_strength         = s->ca,
+            .grain_intensity     = s->grain,
+            .sepia_intensity     = s->sepia,
+            .dither_strength     = s->dither,
+            .lift_r              = s->lift[0],
+            .lift_g              = s->lift[1],
+            .lift_b              = s->lift[2],
+            .gain_r              = s->gain[0],
+            .gain_g              = s->gain[1],
+            .gain_b              = s->gain[2],
+            .lut_texture_id      = r->lut_texture,
+            .lut_size            = r->lut_size,
+            .lut_strength        = s->lut_strength,
+            .bloom_texture_id    = bloom_id,
+            .bloom_strength      = s->bloom_strength,
+            .time                = (float)((double)(mu_time_now() - r->start_time) / mu_time_freq()),
+            .ssao_texture_id     = ssao_id,
+            .ssao_strength       = s->ssao_strength,
         };
 
         dispatch_push(&r->vk, cmd, BYTE_SPAN(push), (push.width + 15) / 16, (push.height + 15) / 16, 1);
     }
 }
-
 
 static void pass_smaa(Renderer *r, VkCommandBuffer cmd) {
     uint32_t     image      = r->vk.swapchain.current_image;
@@ -1955,37 +2011,22 @@ static void platform_poll_events(Renderer *r) {
     r->ui.height = (float)height;
 }
 
-
-
-
-typedef struct Transform2D
-{
+typedef struct Transform2D {
     vec2  position;
     vec2  scale;
     float rotation;
 } Transform2D;
 
-typedef struct Sprite2D
-{
-    TextureID texture_id;
+typedef struct Sprite2D {
+    TextureID   texture_id;
     Transform2D transform;
 
     vec2 velocity;
 
-    vec4 tint_color;
+    vec4  tint_color;
     float depth;
-    vec4 uv_rect;
+    vec4  uv_rect;
 } Sprite2D;
-
-
-
-
-
-
-
-
-
-
 
 void renderer_hud(Renderer *r, const char *fmt, ...) {
     if (r->hud_count >= GAME_HUD_LINES)
@@ -2016,9 +2057,7 @@ void renderer_set_camera(Renderer *r, const float *view, const float *projection
     glm_mat4_inv(r->cam_view, r->cam_inv_view);
 }
 
-struct SpriteSystem *renderer_sprites(Renderer *r) {
-    return r->two_d ? two_d_sprites(r->two_d) : NULL;
-}
+struct SpriteSystem *renderer_sprites(Renderer *r) { return r->two_d ? two_d_sprites(r->two_d) : NULL; }
 
 /* The scene background. Whoever runs first on the HDR target owns this clear:
    the 2D stage through sprite_flush, or the core when 2D is opted out. */
@@ -2051,14 +2090,14 @@ bool renderer_frame(Renderer *r) {
     update_global_data(r);
 
     if (r->game.frame) {
-        r->hud_count = 0;
+        r->hud_count    = 0;
         GameFrame frame = {
-            .renderer     = r,
-            .sprites      = r->two_d ? two_d_sprites(r->two_d) : NULL,
-            .input        = &r->input,
-            .dt           = r->dt,
-            .viewport_w   = r->vk.swapchain.extent.width,
-            .viewport_h   = r->vk.swapchain.extent.height,
+            .renderer   = r,
+            .sprites    = r->two_d ? two_d_sprites(r->two_d) : NULL,
+            .input      = &r->input,
+            .dt         = r->dt,
+            .viewport_w = r->vk.swapchain.extent.width,
+            .viewport_h = r->vk.swapchain.extent.height,
         };
         r->game.frame(r->game.user, &frame);
     }
@@ -2101,26 +2140,34 @@ bool renderer_frame(Renderer *r) {
         }
     }
 
+    write_global_camera(r);
+
     /* Edge-triggered so the windows persist while you drag a slider; a held
        key toggling every frame is what the old local did. */
     if (key_pressed(&r->input, KEY_TAB))
         r->debug_ui_open = !r->debug_ui_open;
 
     GPU_SCOPE(frame_prof, cmd, "SSAO", VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT) {
-        pass_ssao(r, cmd);
+        /* The checkbox gates the whole pass, not just the post blend: when
+           SSAO is off we skip sampling history, flip parity, and — important
+           for temporal — stamp a clean (ao=1, count=0) frame so toggling back
+           on reconverges instead of blending stale frames. */
+        if ((r->post.flags & POST_SSAO) && r->post.ssao_strength > 0.0f)
+            pass_ssao(r, cmd);
+        else
+            pass_ssao_reset(r, cmd);
     }
     post_pass(r, cmd);
     pass_smaa(r, cmd);
     pass_ldr_to_swapchain(r, cmd);
     render_gpu_profiler_ui(r);
 
-if (r->debug_ui_open) {
+    if (r->debug_ui_open) {
 
-    render_game_ui(r);
-    render_grade_ui(r);
+        render_game_ui(r);
+        render_grade_ui(r);
 
-
-    render_capture_ui(r);
+        render_capture_ui(r);
     }
     pass_nuklear(r, cmd);
     capture_record(r, cmd);
@@ -2167,7 +2214,7 @@ void renderer_destroy(Renderer *r) {
     forEach(i, MAX_FRAMES_IN_FLIGHT) destroy_buffer(&r->vk, &r->global_ubo[i]);
     destroy_buffer(&r->vk, &r->readback_buffer);
     pipeline_cache_save(r->vk.devc.device, r->vk.devc.physical_device, r->vk.devc.pipeline_cache, "pipeline_cache.bin");
-     vk_mem_report(&r->vk, "shutdown");
+    vk_mem_report(&r->vk, "shutdown");
     vk_backend_destroy(&r->vk);
     vkDestroySurfaceKHR(r->vk.instance.instance, r->vk.surface, NULL);
     vk_instance_destroy(&r->vk);

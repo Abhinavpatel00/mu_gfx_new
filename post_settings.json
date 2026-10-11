@@ -1,5 +1,5 @@
 {
-  "flags": 8191,
+  "flags": 16383,
   "tonemap_mode": 1,
   "exposure": 0.35,
   "gamma": 2.2,

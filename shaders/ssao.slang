@@ -8,10 +8,10 @@
 
    Marches one direction per slice and uses a partial-slice remap (w0) so the
    single march still covers the hemisphere. Runs 1 sample per frame and blends
-   into an RG16F history buffer (.r = accumulated AO, .g = sample count),
-   reprojecting through last frame's view-proj with a neighborhood clamp to
-   reject stale history. Normals are reconstructed from screen-space depth
-   derivatives, so no gbuffer normal target is needed. */
+   into an RGBA16F history buffer (.r = accumulated AO, .g = sample count,
+   .b = the view distance the texel saw when it was written), reprojecting
+   through last frame's view-proj. Normals are reconstructed from screen-space
+   depth derivatives, so no gbuffer normal target is needed. */
 
 struct SsaoPush {
     uint  depth_texture_id;
@@ -19,14 +19,19 @@ struct SsaoPush {
     uint  sampler_id;
     uint  width;   // AO target size (half res)
     uint  height;
+    uint  sample_count;
+    // 1 = compute AO, 0 = reset history (write neutral AO=1, count=0)
+    uint  mode;
     float proj_00;
     float proj_11;
     float radius;
+    float thickness;
     float bias;
     float intensity;
-    uint  sample_count;
     float near_z;
     float far_z;
+    // depth texels per AO texel: the march counts steps in depth-buffer pixels
+    float depth_scale;
     uint  history_texture_id;
 };
 [[vk::push_constant]] SsaoPush push;
@@ -38,9 +43,11 @@ static const float Pi05  = 1.5707963267948966;
 
 static const float Raymarching_Width   = 512.0;
 static const float Raymarching_Samples = 32.0;
-static const float Thickness           = 0.5;
 static const uint  Slices              = 32u;
-static const float MaxHistory          = 64.0; // cap the accumulation count
+
+static const float MaxHistory = 16.0;      // frames before the blend stops trusting history
+static const float MotionAlphaScale = 0.15; // blend floor per AO texel of reprojection drift
+static const float ClampMargin = 0.1;      // slack the neighbourhood clamp allows around its range
 
 uint CountBits(uint v) {
     v = v - ((v >> 1u) & 0x55555555u);
@@ -54,7 +61,7 @@ float ACosPoly(float x) {
 }
 
 float ACos(float x) {
-    float ax = abs(x);
+    float ax = clamp(abs(x), 0.0, 1.0);
     float u  = ACosPoly(ax) * sqrt(1.0 - ax);
     return x >= 0.0 ? u : Pi - u;
 }
@@ -183,9 +190,12 @@ float SliceRelCDF_Cos(float x, float angN, float cosN, bool isPhiLargerThanAngN)
 // One unidirectional partial-slice. pos/N/V are view space; p00/p11 the
 // projection diagonal; frame advances the per-pixel noise. Returns AO in [0,1].
 float uniGTVBAO(int2 pix, float3 pos, float3 N, float3 V, float p00, float p11, uint frame) {
-    float2 res = float2(push.width, push.height);
-    float2 rayStartPix = float2(pix) + 0.5;
-    float  ao = 0.0;
+    /* Step in depth-buffer pixels, not AO pixels: the depth target is larger
+       than this one, so a step short of a depth texel walks straight past
+       geometry the ray should have hit. uv below is unchanged by the scale. */
+    float2 res         = float2(push.width, push.height) * push.depth_scale;
+    float2 rayStartPix = (float2(pix) + 0.5) * push.depth_scale;
+    float  ao          = 0.0;
     for (uint i = 0u; i < push.sample_count; ++i) {
         uint f = frame * push.sample_count + i;
         float rs = Rnd(pix, f, 1u);
@@ -201,7 +211,9 @@ float uniGTVBAO(int2 pix, float3 pos, float3 N, float3 V, float p00, float p11, 
         float3 smplDirVS = Transform_Vz0Qz0(dir, Q_toV);
 
         float3 rayEndVS = pos + smplDirVS * (push.near_z * 0.5);
-        float2 rayEndNdc = float2(rayEndVS.x * p00 / rayEndVS.z, rayEndVS.y * p11 / rayEndVS.z);
+        /* Projection uses w = -view.z (right-handed camera looking down -Z).
+           Dividing by view.z mirrors the direction across the screen center. */
+        float2 rayEndNdc = float2(rayEndVS.x * p00 / -rayEndVS.z, rayEndVS.y * p11 / -rayEndVS.z);
         float2 rayEndPix = (rayEndNdc * 0.5 + 0.5) * res;
         float2 dxy = rayEndPix - rayStartPix;
         dxy /= max(length(dxy), 1e-6);
@@ -211,7 +223,7 @@ float uniGTVBAO(int2 pix, float3 pos, float3 N, float3 V, float p00, float p11, 
         float3 projN = N - sliceN * dot(N, sliceN);
         float projNSqrLen = dot(projN, projN);
         if (projNSqrLen == 0.0)
-            return 1.0;
+            return i == 0u ? 1.0 : ao / float(i); // degenerate slice: keep what the earlier samples found
         float projNRcpLen = rsqrt(projNSqrLen);
         float cosN = dot(projN, V) * projNRcpLen;
         float3 T = cross(sliceN, projN);
@@ -225,8 +237,14 @@ float uniGTVBAO(int2 pix, float3 pos, float3 N, float3 V, float p00, float p11, 
         float w0_remap_mul = 1.0 / (1.0 - w0);
         float w0_remap_add = -w0 * w0_remap_mul;
 
-        uint occBits = 0u;
-        float s = pow(Raymarching_Width, 1.0 / Raymarching_Samples);
+        /* The slice only has to cross the sampling radius on screen. Marching a
+           fixed 512 pixels instead spends most of the 32 steps past the radius,
+           where the sample is rejected for being too far anyway. A world length
+           L at view distance d covers L * p11 * height/2 / d pixels. */
+        float width = clamp(2.0 * push.radius * abs(p11) * (0.5 * res.y) / max(-pos.z, 1e-4), 16.0,
+                            Raymarching_Width);
+        uint  occBits = 0u;
+        float s = pow(width, 1.0 / Raymarching_Samples);
         float t = pow(s, rz);
         for (float step = 0.0; step < Raymarching_Samples; ++step) {
             float2 samplePix = rayStartPix + dxy * t;
@@ -235,10 +253,17 @@ float uniGTVBAO(int2 pix, float3 pos, float3 N, float3 V, float p00, float p11, 
                 break;
             float2 uv = samplePix / res;
             float depth = textures[push.depth_texture_id].SampleLevel(samplers[push.sampler_id], uv, 0.0).r;
+            /* Reverse-Z clear depth is zero. Sky has no finite view position
+               and must not contribute a false horizon. */
+            if (depth <= 1e-4)
+                continue;
             float3 sampleVS = ViewPos(uv * 2.0 - 1.0, depth, p00, p11, push.near_z);
             float3 deltaFront = sampleVS - pos;
+            float sampleDistance = length(deltaFront);
+            if (sampleDistance <= push.bias || sampleDistance > push.radius)
+                continue;
             // slab back face pushed radially away from the camera (perspective)
-            float3 deltaBack = deltaFront + normalize(sampleVS) * Thickness;
+            float3 deltaBack = deltaFront + normalize(sampleVS) * push.thickness;
 
             float2 horCos = float2(dot(normalize(deltaFront), V), dot(normalize(deltaBack), V));
             float2 horAng = float2(ACos(horCos.x), ACos(horCos.y));
@@ -271,8 +296,17 @@ void cs_main(uint3 id : SV_DispatchThreadID) {
     float2 texel = 1.0 / float2(push.width, push.height);
     float2 uv = (float2(pix) + 0.5) * texel;
 
-    float z = depth_tex.SampleLevel(smp, uv, 0.0).r;
     RWTexture2D<float4> out_img = storage_images[push.output_image_id];
+
+    /* Reset mode: no depth read, no history blend. Every pixel becomes a
+       neutral (AO=1, count=0) texel so the first real frame after a toggle
+       starts accumulation from scratch instead of blending stale history. */
+    if (push.mode == 0u) {
+        out_img[pix] = float4(1.0, 0.0, 0.0, 1.0);
+        return;
+    }
+
+    float z = depth_tex.SampleLevel(smp, uv, 0.0).r;
     // reverse-Z: cleared sky is 0.0. Write AO=1, count=0 so it never blends.
     if (z <= 1e-4) {
         out_img[pix] = float4(1.0, 0.0, 0.0, 1.0);
@@ -302,41 +336,56 @@ void cs_main(uint3 id : SV_DispatchThreadID) {
     float ao = uniGTVBAO(pix, pos, N, V, push.proj_00, push.proj_11, frame);
     ao = clamp(pow(saturate(ao), push.intensity), 0.0, 1.0);
 
-    /* Temporal accumulation: reproject this world point into last frame,
-       read history, variance-clamp against this frame's neighborhood, and
-       blend one new sample in. Reprojection rejects stale history on motion;
-       the neighborhood clamp rejects it on disocclusion. */
-    float4 world = mul(global_data.inv_view, float4(pos, 1.0));
+    /* Temporal accumulation. Reprojection aligns last frame's history, the
+       stored view distance decides whether the texel we land on held the same
+       surface, a neighbourhood clamp bounds the survivors, and the blend
+       factor rises with reprojection drift so motion does not drag a trail. */
+    float4 world    = mul(global_data.inv_view, float4(pos, 1.0));
     float4 prevClip = mul(global_data.prev_viewproj, world);
-    float2 prevUv = (prevClip.xy / prevClip.w) * 0.5 + 0.5;
+    float2 prevUv   = (prevClip.xy / prevClip.w) * 0.5 + 0.5;
+    // w_clip = -view.z for this projection, so the clip w is last frame's distance
+    float prevDist = -prevClip.w;
 
-    float histAO = 0.0, histCount = 0.0;
-    bool valid = prevClip.w > 0.0 && prevUv.x >= 0.0 && prevUv.x <= 1.0 && prevUv.y >= 0.0 && prevUv.y <= 1.0;
-    if (valid) {
+    float accum = ao, outCount = 1.0;
+    if (prevClip.w > 0.0 && prevUv.x >= 0.0 && prevUv.x <= 1.0 && prevUv.y >= 0.0 && prevUv.y <= 1.0) {
         float4 h = textures[push.history_texture_id].SampleLevel(smp, prevUv, 0.0);
-        histAO = h.r;
-        histCount = h.g;
-        // neighborhood clamp: min/max of history in a 3x3 around the
-        // reprojected uv, so stale history from other surfaces can't linger.
-        float lo = histAO, hi = histAO;
-        float2 ht = 1.0 / float2(push.width, push.height);
-        for (int y = -1; y <= 1; ++y)
-            for (int x = -1; x <= 1; ++x) {
-                float2 quv = prevUv + float2(x, y) * ht;
-                if (quv.x < 0.0 || quv.x > 1.0 || quv.y < 0.0 || quv.y > 1.0)
-                    continue;
-                float a = textures[push.history_texture_id].SampleLevel(smp, quv, 0.0).r;
-                lo = min(lo, a);
-                hi = max(hi, a);
-            }
-        float margin = 0.1;
-        histAO = clamp(histAO, lo - margin, hi + margin);
-    }
 
-    float newCount = min(histCount + 1.0, MaxHistory);
-    float accum = valid && histCount > 0.0 ? lerp(histAO, ao, 1.0 / newCount) : ao;
-    float outCount = valid && histCount > 0.0 ? newCount : 1.0;
-    out_img[pix] = float4(accum, outCount, 0.0, 1.0);
+        /* Every texel stores the distance of the surface it saw. If that differs
+           from our distance under last frame's camera by more than the AO radius
+           can explain, that texel was a different surface — or empty — and its
+           AO belongs to something else. This is what stops a disoccluded pixel
+           from inheriting the wall that used to cover it. */
+        float tol = min(max(0.08 * prevDist, 0.03), push.radius * 0.5);
+        float facing = saturate(dot(N, V));
+        if (abs(h.b - prevDist) > tol || abs(h.a - facing) > 0.2)
+            h.g = 0.0;
+
+        if (h.g > 0.0) {
+            /* Depth-aware neighbourhood clamp: only taps that also sat on our
+               surface may widen the range, so a neighbour that still holds
+               another surface's AO cannot let a stale value through. */
+            float  lo = h.r, hi = h.r;
+            float2 ht = 1.0 / float2(push.width, push.height);
+            for (int y = -1; y <= 1; ++y)
+                for (int x = -1; x <= 1; ++x) {
+                    float2 quv = prevUv + float2(x, y) * ht;
+                    if (quv.x < 0.0 || quv.x > 1.0 || quv.y < 0.0 || quv.y > 1.0)
+                        continue;
+                    float4 n = textures[push.history_texture_id].SampleLevel(smp, quv, 0.0);
+                    if (n.g <= 0.0 || abs(n.b - prevDist) > tol || abs(n.a - facing) > 0.2)
+                        continue;
+                    lo = min(lo, n.r);
+                    hi = max(hi, n.r);
+                }
+
+            float drift  = length((prevUv - uv) * float2(push.width, push.height));
+            float alpha  = max(1.0 / min(h.g + 1.0, MaxHistory), saturate(drift * MotionAlphaScale));
+            accum        = lerp(clamp(h.r, lo - ClampMargin, hi + ClampMargin), ao, alpha);
+            outCount     = 1.0 / alpha; // the weight the accumulated value now carries
+        }
+    }
+    out_img[pix] = float4(accum, outCount, -pos.z, 1.0);
+    out_img[pix] = float4(accum, outCount, -pos.z, saturate(dot(N, V)));
 }
 
 

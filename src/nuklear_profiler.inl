@@ -239,7 +239,16 @@ static void render_grade_ui(Renderer *r) {
     nk_property_float(ctx, "Bloom threshold", 0.0f, &s->bloom_threshold, 3.0f, 0.01f, 0.01f);
     nk_property_float(ctx, "Bloom knee", 0.001f, &s->bloom_knee, 1.0f, 0.001f, 0.001f);
     nk_property_float(ctx, "Bloom radius", 0.25f, &s->bloom_radius, 4.0f, 0.01f, 0.01f);
-    nk_property_float(ctx, "SSAO", 0.0f, &s->ssao_strength, 2.0f, 0.01f, 0.01f);
+    nk_layout_row_dynamic(ctx, 24, 1);
+    {
+        int ssao = (s->flags & POST_SSAO) != 0;
+        nk_checkbox_label(ctx, "SSAO", &ssao);
+        if (ssao)
+            s->flags |= POST_SSAO;
+        else
+            s->flags &= ~POST_SSAO;
+    }
+    nk_property_float(ctx, "SSAO strength", 0.0f, &s->ssao_strength, 2.0f, 0.01f, 0.01f);
 
     nk_layout_row_dynamic(ctx, 22, 1);
     nk_property_float(ctx, "Vignette", 0.0f, &s->vignette, 1.0f, 0.01f, 0.01f);

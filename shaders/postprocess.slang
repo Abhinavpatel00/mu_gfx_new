@@ -48,6 +48,7 @@ struct PostPush
   float time;
 
   uint  ssao_texture_id; /* 0xFFFFFFFF = none */
+  uint  depth_texture_id;
   float ssao_strength;
 };
 
@@ -158,7 +159,27 @@ void cs_main(uint3 id : SV_DispatchThreadID)
      before exposure so it scales correctly with the scene radiance. */
   if (has_flag(push.flags, FLAG_SSAO) && push.ssao_strength > 0.0 && push.ssao_texture_id != 0xFFFFFFFFu)
   {
-    float ao = textures[push.ssao_texture_id].SampleLevel(smp, uv, 0).r;
+    Texture2D depth = textures[push.depth_texture_id];
+    float center_depth = depth.Load(int3(pix, 0)).r;
+    uint ao_width, ao_height;
+    textures[push.ssao_texture_id].GetDimensions(ao_width, ao_height);
+    float2 ao_position = uv * float2(ao_width, ao_height) - 0.5;
+    int2 ao_base = int2(floor(ao_position));
+    float ao_sum = 0.0;
+    float ao_weight_sum = 0.0;
+    for (int y = 0; y <= 1; ++y)
+    {
+      for (int x = 0; x <= 1; ++x)
+      {
+        int2 ao_pix = clamp(ao_base + int2(x, y), int2(0, 0), int2(int(ao_width) - 1, int(ao_height) - 1));
+        float sample_depth = depth.Load(int3(ao_pix * 2 + int2(0, 0), 0)).r;
+        float depth_delta = abs(sample_depth - center_depth) / max(center_depth, 1e-4);
+        float weight = exp(-depth_delta * 32.0);
+        ao_sum += textures[push.ssao_texture_id].Load(int3(ao_pix, 0)).r * weight;
+        ao_weight_sum += weight;
+      }
+    }
+    float ao = ao_weight_sum > 1e-4 ? ao_sum / ao_weight_sum : 1.0;
     color *= lerp(1.0, ao, push.ssao_strength);
   }
 

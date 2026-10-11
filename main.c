@@ -14,27 +14,69 @@
  * frustum cull, drawn with one indexed indirect draw per (mesh, lod) group.
  * The camera is a mouse/keyboard flycam. */
 
-/* The grid exists to make the compaction pass do real work: the number of
-   distinct (mesh,lod) groups must exceed SCENE_SCAN_BLOCK (1024) for the
-   two-level scan to use more than one block. A single-group scene would prove
-   the parallel scan nothing. */
-#define PETS_GRID     6u
-#define PETS_SPACING  3.5f
-#define PETS_MODELS   1u
-#define PETS_COPIES   1u
+/* Room scene: static interior built from cooked KayKit pieces, not the old
+   character grid. The compaction comment that lived here went with it. */
 
-/* Cooked .mua files. Node transforms are baked into the vertices, so a model is
-   a group of meshes in one space: every mesh of a model gets its own instance
-   at the same transform. PETS_MODELS is how many of these to load: it is 1 to
-   look at Barbarian alone, and raising it brings the rest back in. */
+/* SSAO test room: a dungeon shell (floor, walls, pillars) dressed with
+   furniture. Cooked with: build/muasset_cook <src.gltf> -o assets/interior_<name>.mua --lods 1
+   Yaws are about +Y; wall/floor pieces are solid boxes so facing is texture-only. */
 static const char *const pets_assets[] = {
-    "assets/Barbarian.mua",
-    "assets/Knight.mua",
-    "assets/Mage.mua",
-    "assets/Ranger.mua",
-    "assets/Rogue.mua",
-    "assets/Rogue_Hooded.mua",
+    "assets/interior_floor_tile_large.mua", /* 0: 4x4 floor tile            */
+    "assets/interior_wall.mua",             /* 1: 4m wall, 4 tall           */
+    "assets/interior_wall_corner.mua",      /* 2: L corner                  */
+    "assets/interior_pillar.mua",           /* 3: pillar, 4 tall            */
+    "assets/interior_table_medium.mua",     /* 4: 2x2 table, 1 tall         */
+    "assets/interior_chair_A.mua",          /* 5: chair                     */
+    "assets/interior_couch.mua",            /* 6: couch                     */
+    "assets/interior_lamp_table.mua",       /* 7: table lamp                */
 };
+#define ROOM_MODELS (sizeof(pets_assets) / sizeof(pets_assets[0]))
+
+typedef struct RoomProp {
+    uint32_t asset; /* index into pets_assets */
+    float    x, y, z;
+    float    yaw; /* radians about Y; 0 = as authored */
+} RoomProp;
+
+#define YAW_0   0.0f
+#define YAW_90  1.5707963f
+#define YAW_180 3.1415927f
+#define YAW_270 -1.5707963f
+
+/* 12x12m room: 3x3 floor tiles, perimeter walls, corners, pillars, furniture.
+   Floor tile is 4x4 so 3x3 covers [-6,6]^2. Walls are 4m segments on the
+   perimeter; wall_corner is an L for the four corners. Quats are built from
+   yaw at placement time. */
+static const RoomProp room_props[] = {
+    /* 3x3 floor */
+    {0, -4.0f, 0.0f, -4.0f, YAW_0}, {0, 0.0f, 0.0f, -4.0f, YAW_0}, {0, 4.0f, 0.0f, -4.0f, YAW_0},
+    {0, -4.0f, 0.0f,  0.0f, YAW_0}, {0, 0.0f, 0.0f,  0.0f, YAW_0}, {0, 4.0f, 0.0f,  0.0f, YAW_0},
+    {0, -4.0f, 0.0f,  4.0f, YAW_0}, {0, 0.0f, 0.0f,  4.0f, YAW_0}, {0, 4.0f, 0.0f,  4.0f, YAW_0},
+    /* north wall (z=-6), running along x */
+    {1, -4.0f, 0.0f, -6.0f, YAW_0}, {1, 0.0f, 0.0f, -6.0f, YAW_0}, {1, 4.0f, 0.0f, -6.0f, YAW_0},
+    /* south wall (z=+6) */
+    {1, -4.0f, 0.0f, 6.0f, YAW_180}, {1, 0.0f, 0.0f, 6.0f, YAW_180}, {1, 4.0f, 0.0f, 6.0f, YAW_180},
+    /* west wall (x=-6), running along z */
+    {1, -6.0f, 0.0f, -4.0f, YAW_90}, {1, -6.0f, 0.0f, 0.0f, YAW_90}, {1, -6.0f, 0.0f, 4.0f, YAW_90},
+    /* east wall (x=+6) */
+    {1, 6.0f, 0.0f, -4.0f, YAW_270}, {1, 6.0f, 0.0f, 0.0f, YAW_270}, {1, 6.0f, 0.0f, 4.0f, YAW_270},
+    /* corners */
+    {2, -6.0f, 0.0f, -6.0f, YAW_0},   {2, 6.0f, 0.0f, -6.0f, YAW_90},
+    {2, 6.0f, 0.0f, 6.0f, YAW_180},   {2, -6.0f, 0.0f, 6.0f, YAW_270},
+    /* pillars */
+    {3, -3.0f, 0.0f, -3.0f, YAW_0}, {3, 3.0f, 0.0f, -3.0f, YAW_0},
+    {3, -3.0f, 0.0f, 3.0f, YAW_0},  {3, 3.0f, 0.0f, 3.0f, YAW_0},
+    /* table + chairs + couch + lamp */
+    {4, 0.0f, 0.0f, 1.0f, YAW_0},
+    {5, -1.8f, 0.0f, 1.0f, YAW_90}, {5, 1.8f, 0.0f, 1.0f, YAW_270}, {5, 0.0f, 0.0f, -1.0f, YAW_0},
+    {6, 0.0f, 0.0f, 4.3f, YAW_180},
+    {7, 0.0f, 1.0f, 1.0f, YAW_0},
+};
+#define ROOM_PROPS (sizeof(room_props) / sizeof(room_props[0]))
+
+/* Cooked .mua room pieces (see the table above). Node transforms are baked
+   into the vertices, so a model is a group of meshes in one space: every mesh
+   of a piece gets its own instance at the same transform. */
 
 /* Flycam state. Position is authoritative and freely movable; yaw/pitch are a
    derived view direction built from it, not a separate orbit around a pivot.
@@ -64,55 +106,44 @@ typedef struct CubePets {
 
 static CubePets g_pets;
 
-/* Cooks every asset and lays the models out over the grid. Each model
-   contributes SceneAssetLoad.mesh_count instances — a character's nine parts
-   are nine meshes in one space, not nine models — so the instance total is the
-   sum over the assets, not PETS_MODELS.
+/* Cooks every room piece and plants the prop table. Each piece contributes
+   SceneAssetLoad.mesh_count instances per prop — a piece is a group of meshes
+   in one space, not one model — so the instance total is the mesh sum over
+   props.
  *
    Returns the number of meshes registered, or UINT32_MAX on a hard load
    failure; the caller has already created the scene with matching capacities
    and cannot proceed without them. */
 static uint32_t pets_build_assets(Scene *scene) {
     uint32_t total_meshes = 0;
-    for (uint32_t m = 0; m < PETS_MODELS; ++m) {
-        SceneAssetLoad load;
-        char           err[256];
-        if (!scene_asset_load(scene, pets_assets[m], &load, err, sizeof(err))) {
+    SceneAssetLoad loads[ROOM_MODELS];
+    for (uint32_t m = 0; m < ROOM_MODELS; ++m) {
+        char err[256];
+        if (!scene_asset_load(scene, pets_assets[m], &loads[m], err, sizeof(err))) {
             log_error("[pets] %s: %s", pets_assets[m], err);
             return UINT32_MAX;
         }
-        log_info("[pets] %s: %u meshes, %u verts, %u indices, %u rungs, radius %.2f", pets_assets[m], load.mesh_count,
-                 load.vertex_count, load.index_count, load.lod_count, load.radius);
-
-        /* One character per cell. A model is a rigid assembly of meshes in one
-           space, so every one of its meshes gets the same transform — spreading
-           them out would show a disassembled model rather than one. */
-        for (uint32_t c = 0; c < PETS_GRID * PETS_GRID * PETS_COPIES; ++c) {
-            uint32_t gx = c % PETS_GRID;
-            uint32_t gz = (c / PETS_GRID) % PETS_GRID;
-            float x = ((float)gx - (float)PETS_GRID * 0.5f + 0.5f) * PETS_SPACING;
-            float z = ((float)gz - (float)PETS_GRID * 0.5f + 0.5f) * PETS_SPACING;
-
-            /* The center 2x2 block glows: tag every mesh of those characters.
-               Bloom weight rides HDR alpha into the bright-pass. */
-            bool glowing  = false;
-
-            for (uint32_t i = 0; i < load.mesh_count; ++i) {
-                SceneInstanceDesc d = {.pos = {x, 0.0f, z}, .quat = {0, 0, 0, 0}, .scale = 1.0f,
-                                       .mesh = load.first_mesh + i};
-                /* Alternate so both slot regions are populated in every row. */
-                uint32_t slot;
-                if (((c + i) & 1u) == 0u)
-                    slot = scene_instance_create(scene, &d);
-                else
-                    slot = scene_instance_create_static(scene, &d);
-                if (glowing)
-                    scene_set_instance_bloom(scene, slot, 1.0f);
-            }
-        }
-        total_meshes += load.mesh_count;
+        log_info("[pets] %s: %u meshes, %u verts, %u indices, %u rungs, radius %.2f", pets_assets[m],
+                 loads[m].mesh_count, loads[m].vertex_count, loads[m].index_count, loads[m].lod_count,
+                 loads[m].radius);
+        total_meshes += loads[m].mesh_count;
     }
-    log_info("[pets] %u meshes registered from %u models", total_meshes, PETS_MODELS);
+
+    /* Each room prop plants one instance per mesh of its asset at the prop's
+       transform, yawed about Y. Everything is static: the room doesn't move,
+       so the static region owns it. */
+    for (uint32_t p = 0; p < ROOM_PROPS; ++p) {
+        const RoomProp      *rp = &room_props[p];
+        const SceneAssetLoad *ld = &loads[rp->asset];
+        float half = rp->yaw * 0.5f;
+        for (uint32_t i = 0; i < ld->mesh_count; ++i)
+            scene_instance_create_static(
+                scene, &(SceneInstanceDesc){.pos   = {rp->x, rp->y, rp->z},
+                                            .quat  = {0.0f, sinf(half), 0.0f, cosf(half)},
+                                            .scale = 1.0f,
+                                            .mesh  = ld->first_mesh + i});
+    }
+    log_info("[pets] %u meshes registered from %u models, %u props", total_meshes, ROOM_MODELS, ROOM_PROPS);
     return total_meshes;
 }
 
@@ -120,12 +151,12 @@ static void pets_start(void *user, Renderer *renderer) {
     CubePets *p   = (CubePets *)user;
     p->vk         = renderer_vk(renderer);
     p->renderer   = renderer; /* TEMP */
-    p->dist       = 34.0f;
+    p->dist       = 14.0f;
     p->cam.pos[0] = 0.0f;
-    p->cam.pos[1] = 6.0f;
-    p->cam.pos[2] = 22.0f;
-    p->cam.yaw    = 0.0f; /* looking down -Z */
-    p->cam.pitch  = -0.25f;
+    p->cam.pos[1] = 3.2f;
+    p->cam.pos[2] = 8.6f;
+    p->cam.yaw    = 0.0f; /* looking down -Z, into the room */
+    p->cam.pitch  = -0.18f;
     p->cam.speed  = 8.0f;
     glm_vec3_zero(p->cam.forward);
     glm_vec3_zero(p->cam.right);
@@ -268,8 +299,11 @@ static void pets_render(void *user, VkCommandBuffer cmd, RenderTarget *color, Re
            constant: mesh and LOD capacities are fixed at scene_create and
            cannot grow, so a hardcoded number is a number that is wrong the
            first time somebody adds a prop. */
+        /* Capacities from the cooked assets: one instance per mesh of every
+           prop, all placed static. */
+        uint32_t asset_meshes[ROOM_MODELS] = {0};
         uint32_t max_meshes = 0, max_lod_rows = 0, max_materials = 0, total = 0;
-        for (uint32_t m = 0; m < PETS_MODELS; ++m) {
+        for (uint32_t m = 0; m < ROOM_MODELS; ++m) {
             SceneAssetProbe probe;
             char            err[256];
             if (!scene_asset_probe(pets_assets[m], &probe, err, sizeof(err))) {
@@ -279,9 +313,10 @@ static void pets_render(void *user, VkCommandBuffer cmd, RenderTarget *color, Re
             max_meshes += probe.mesh_count;
             max_lod_rows += probe.lod_rows;
             max_materials += probe.material_count;
-            total += probe.mesh_count * PETS_COPIES * PETS_GRID * PETS_GRID;
+            asset_meshes[m] = probe.mesh_count;
         }
-
+        for (uint32_t p = 0; p < ROOM_PROPS; ++p)
+            total += asset_meshes[room_props[p].asset];
         uint32_t half = total / 2;
         Scene   *scene = scene_create(p->vk, &(SceneDesc){.max_instances    = total,
                                                          .dynamic_capacity = half,
