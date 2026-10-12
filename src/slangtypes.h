@@ -63,6 +63,14 @@ typedef struct GlobalData {
     uint     frame_count;    // 4 bytes
     uint     pad;            // 4 bytes
     float4   screen_params;  // x = width, y = height, z = 1/width, w = 1/height
+    /* Environment. The renderer owns it and every shading path reads it here,
+       so the sky pass and the two scene pipelines cannot drift apart: the
+       ambient a tree is lit by is the gradient actually behind it. */
+    float4   env_sky;     // xyz zenith color, w = ambient intensity
+    float4   env_horizon; // xyz horizon color (the sky gradient's bottom stop)
+    float4   env_ground;  // xyz ground-bounce color for down-facing normals
+    float4   sun_dir;     // xyz normalized direction toward the sun, w = intensity
+    float4   sun_color;   // xyz sun tint
     float2   mouse_pos;
 
     float2 mouse_buttons;
@@ -145,6 +153,11 @@ struct GlobalData {
     uint     frame_count;
     uint     pad;
    float4   screen_params;
+   float4   env_sky;
+   float4   env_horizon;
+   float4   env_ground;
+   float4   sun_dir;
+   float4   sun_color;
    float2   mouse_pos;
    float2   mouse_buttons;
 };

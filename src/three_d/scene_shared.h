@@ -194,7 +194,6 @@ struct SceneDrawPush {
 
     // i think these three field belongs to uniform buffer
     SceneVec4 clip_rows[4]; /* 64 */
-    SceneVec4 sun;          /* 16 xyz direction (normalized), w ambient */
     SceneVec4 camera;       /* 16 xyz eye position: specular needs a view vector */
 
     SCENE_PTR(SceneInstance) instances;

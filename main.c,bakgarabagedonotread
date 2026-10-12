@@ -1,0 +1,463 @@
+#include "src/game/crypt.h"
+
+#include <math.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* ============================================================== CRYPT RUN
+ *
+ * main.c is the shell: it owns the renderer's GameHooks, the camera, the HUD,
+ * and the fixed-step accumulator. Everything the game actually simulates lives
+ * in src/game/.
+ *
+ * Frame:
+ *   pets_frame    input -> intent, accumulator -> N fixed steps of crypt_sim_step
+ *   pets_render   tables -> scene instances, then scene_frame
+ */
+
+/* ------------------------------------------------------------- constants -- */
+
+#define SIM_DT (1.0f / 60.0f)
+#define MAX_STEPS 5
+
+#define CAM_DIST 9.5f
+#define CAM_HEIGHT 4.6f
+#define CAM_PITCH_MIN -0.35f
+#define CAM_PITCH_MAX 1.15f
+#define FOV_TAN (0.5773503f) /* tan(30 degrees) */
+#define HUD_CHARS 96
+
+static const char *const kAssetPath[GAME_ASSET_COUNT] = {
+    [A_FLOOR_TILE] = "assets/floor_tile_small.mua",
+    [A_FLOOR_DIRT] = "assets/floor_dirt_large.mua",
+    [A_WALL] = "assets/wall.mua",
+    [A_WALL_CORNER] = "assets/wall_corner.mua",
+    [A_WALL_COLUMN] = "assets/wall_column.mua",
+    [A_PILLAR] = "assets/pillar.mua",
+    [A_STAIRS] = "assets/stairs_wide.mua",
+    [A_TORCH] = "assets/torch_lit.mua",
+    [A_TORCH_WALL] = "assets/torch_wall.mua",
+    [A_CANDLE] = "assets/candle_lit.mua",
+    [A_BARREL] = "assets/barrel_large.mua",
+    [A_CRATES] = "assets/crates_stacked.mua",
+    [A_CHEST] = "assets/chest.mua",
+    [A_CHEST_GOLD] = "assets/chest_gold.mua",
+    [A_RUBBLE] = "assets/rubble_large.mua",
+    [A_TABLE] = "assets/table_long.mua",
+    [A_SHELF] = "assets/shelf_large.mua",
+    [A_BANNER] = "assets/banner_red.mua",
+    [A_COIN] = "assets/coin_stack.mua",
+    [A_SKEL_STAFF] = "assets/skel_staff.mua",
+    [A_SKEL_AXE] = "assets/skel_axe.mua",
+    [A_SKEL_CROSSBOW] = "assets/skel_crossbow.mua",
+    [A_SKEL_SHIELD_A] = "assets/skel_shield_a.mua",
+    [A_SKEL_SHIELD_B] = "assets/skel_shield_b.mua",
+    [A_SWORD_1H] = "assets/sword_1h.mua",
+    [A_SWORD_2H] = "assets/sword_2h.mua",
+    [A_AXE_1H] = "assets/axe_1h.mua",
+    [A_WAND] = "assets/wand.mua",
+    [A_SHIELD_ROUND] = "assets/shield_round.mua",
+};
+
+static Game g_game;
+
+/* ---------------------------------------------------------------- camera -- */
+
+/* Pulls the camera in until nothing solid sits between it and the player.
+   Marching the grid beats a mesh raycast here: the walls are the grid, so the
+   answer is a cell lookup, and there is no acceleration structure to keep in
+   sync with the geometry. */
+static float camera_clearance(const Game *g, vec3 from, vec3 to) {
+    float dx = to[0] - from[0], dy = to[1] - from[1], dz = to[2] - from[2];
+    float len = sqrtf(dx * dx + dy * dy + dz * dz);
+    if (len < 1e-4f)
+        return 1.0f;
+    dx /= len;
+    dy /= len;
+    dz /= len;
+
+    const float kStep = 0.25f;
+    for (float t = 1.0f; t <= len; t += kStep) {
+        float px = from[0] + dx * t, py = from[1] + dy * t, pz = from[2] + dz * t;
+        /* Only the chest height matters: above head height the camera is over
+           the barriers anyway, and below the knees the floor is not occluding. */
+        if (py < 0.15f || py > 2.1f)
+            continue;
+        if (!crypt_walkable(crypt_world_x(px), crypt_world_z(pz)))
+            return MU_MAX(0.0f, (t - kStep) / len);
+    }
+    return 1.0f;
+}
+
+static void camera_update(Game *g, float dt) {
+    vec3 focus = {g->pos[0], 1.15f, g->pos[2]};
+
+    float cp = cosf(g->cam_pitch), sp = sinf(g->cam_pitch);
+    float cy = cosf(g->cam_yaw), sy = sinf(g->cam_yaw);
+    vec3  offset = {-sy * cp * g->cam_dist, sp * g->cam_dist + CAM_HEIGHT * 0.35f, -cy * cp * g->cam_dist};
+
+    float clear = camera_clearance(g, focus, (vec3){focus[0] + offset[0], focus[1] + offset[1], focus[2] + offset[2]});
+    float want  = offset[0] * clear, want_y = offset[1] * clear, want_z = offset[2] * clear;
+
+     /* Exponential damping gives the same response at 30 and 144 Hz. Clamp a
+         stalled frame before evaluating it so a debugger break cannot teleport
+         the camera through a wall. */
+     float follow_dt = MU_CLAMP(dt, 0.0f, 0.1f);
+     float k = 1.0f - expf(-12.0f * follow_dt);
+    g->cam_pos[0] += (focus[0] + want - g->cam_pos[0]) * k;
+    g->cam_pos[1] += (focus[1] + want_y - g->cam_pos[1]) * k;
+    g->cam_pos[2] += (focus[2] + want_z - g->cam_pos[2]) * k;
+
+    if (g->cam_shake > 0.0f) {
+        g->cam_shake -= dt * 2.4f;
+        float s = MU_MAX(g->cam_shake, 0.0f) * 0.22f;
+        /* Shake is a hash of the frame, not an accumulator, so it decorrelates
+           instead of drifting. */
+        uint32_t h = g->frame * 2654435761u;
+        g->cam_pos[0] += ((float)((h >> 8) & 0xFFu) / 255.0f - 0.5f) * s;
+        g->cam_pos[1] += ((float)((h >> 16) & 0xFFu) / 255.0f - 0.5f) * s;
+    }
+}
+
+/* ------------------------------------------------------------------- HUD -- */
+
+static void hud_line(const GameFrame *f, const char *fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    char buf[HUD_CHARS];
+    vsnprintf(buf, sizeof(buf), fmt, args);
+    va_end(args);
+    renderer_hud(f->renderer, "%s", buf);
+}
+
+static void draw_hud(const GameFrame *f) {
+    Game *g = &g_game;
+
+    if (g->state == GS_DEAD) {
+        hud_line(f, "YOU DIED");
+        hud_line(f, "floor %u   kills %u   gold %u   %d:%02d", g->depth, g->kills, g->gold,
+                 (int)(g->run_time / 60), (int)g->run_time % 60);
+        hud_line(f, "SPACE  new run");
+        return;
+    }
+
+    if (g->state == GS_CHOOSING) {
+        hud_line(f, "FLOOR %u CLEAR", g->depth + 1);
+        hud_line(f, "1  %s  —  %s", g->offer[0].name, g->offer[0].detail);
+        hud_line(f, "2  %s  —  %s", g->offer[1].name, g->offer[1].detail);
+        hud_line(f, "3  %s  —  %s", g->offer[2].name, g->offer[2].detail);
+        hud_line(f, "gold %u   kills %u", g->gold, g->kills);
+        return;
+    }
+
+    int hp = (int)(g->health + 0.5f);
+    hud_line(f, "HP %3d / %d", hp, (int)g->health_max);
+    hud_line(f, "FLOOR %u   WAVE %u/%u   LEFT %u", g->depth + 1, MU_MIN(g->wave + 1, g->waves_per_floor),
+             g->waves_per_floor, g->e_alive.count + g->wave_to_spawn);
+    hud_line(f, "GOLD %u   KILLS %u", g->gold, g->kills);
+    if (g->exit_open)
+        hud_line(f, "STAIRS OPEN — head for them");
+    if (g->roll.damage > 0.0f || g->roll.swing > 0.0f || g->roll.speed > 0.0f || g->roll.armor > 0.0f ||
+        g->roll.greed > 0.0f || g->roll.lifesteal > 0.0f)
+        hud_line(f, "dmg +%d%%  arc +%d%%  spd +%d%%  armour %d%%  greed +%d%%", (int)(g->roll.damage * 100),
+                 (int)(g->roll.swing * 100), (int)(g->roll.speed * 100), (int)(g->roll.armor * 100),
+                 (int)(g->roll.greed * 100));
+    hud_line(f, "WASD move   LMB swing   SPACE dash   mouse look");
+}
+
+/* ------------------------------------------------------------------ load -- */
+
+static bool load_assets(Game *g) {
+    uint32_t meshes = 0, lod_rows = 0;
+    for (uint32_t i = 0; i < GAME_ASSET_COUNT; ++i) {
+        SceneAssetProbe probe;
+        char             err[256];
+        if (!scene_asset_probe(kAssetPath[i], &probe, err, sizeof(err))) {
+            log_error("[crypt] %s: %s", kAssetPath[i], err);
+            return false;
+        }
+        meshes += probe.mesh_count;
+        lod_rows += probe.lod_rows;
+        if (!scene_asset_load(g->scene, kAssetPath[i], &g->asset[i], err, sizeof(err))) {
+            log_error("[crypt] %s: %s", kAssetPath[i], err);
+            return false;
+        }
+        g->asset_first[i] = g->asset[i].first_mesh;
+    }
+    g->asset_meshes = meshes;
+    log_info("[crypt] %u meshes across %u models, %u lod rows", meshes, GAME_ASSET_COUNT, lod_rows);
+
+    for (uint32_t i = 0; i < CHARACTER_COUNT; ++i)
+        if (!crypt_rig_build(g, i))
+            log_error("[crypt] %s: rig build failed", crypt_character_path[i]);
+    return true;
+}
+
+/* Scene capacities are fixed at create and cannot grow, so they come from a
+   probe of every model the run will load plus the headroom the game itself
+   needs: one instance per rig part, one weapon, one per live enemy and pickup. */
+static bool create_scene(Game *g) {
+    uint32_t meshes = 0, lod_rows = 0, materials = 0;
+    for (uint32_t i = 0; i < GAME_ASSET_COUNT; ++i) {
+        SceneAssetProbe probe;
+        char             err[256];
+        if (!scene_asset_probe(kAssetPath[i], &probe, err, sizeof(err))) {
+            log_error("[crypt] probe %s: %s", kAssetPath[i], err);
+            return false;
+        }
+        meshes += probe.mesh_count;
+        lod_rows += probe.lod_rows;
+        materials += probe.material_count;
+    }
+    for (uint32_t i = 0; i < CHARACTER_COUNT; ++i) {
+        SceneAssetProbe probe;
+        char             err[256];
+        if (!scene_asset_probe(crypt_character_path[i], &probe, err, sizeof(err))) {
+            log_error("[crypt] probe %s: %s", crypt_character_path[i], err);
+            return false;
+        }
+        meshes += probe.mesh_count;
+        lod_rows += probe.lod_rows;
+        materials += probe.material_count;
+    }
+
+    const uint32_t dynamic = CHARACTER_COUNT * MAX_ASSET_MESHES + MAX_ENEMIES + MAX_PICKUPS + 8u;
+    g->dynamic_instances = dynamic;
+    log_info("[crypt] scene %u instances (%u dynamic + %u static), %u meshes, %u lod rows, %u materials",
+             dynamic + MAX_DUNGEON_INSTANCES, dynamic, MAX_DUNGEON_INSTANCES, meshes, lod_rows, materials);
+    g->scene             = scene_create(g->vk,
+                            &(SceneDesc){.max_instances = dynamic + MAX_DUNGEON_INSTANCES,
+                                         .dynamic_capacity = dynamic,
+                                         .static_capacity = MAX_DUNGEON_INSTANCES,
+                                         .max_meshes = meshes,
+                                         .max_lod_rows = lod_rows,
+                                         .max_materials = materials + 8u,
+                                         .max_survivors = dynamic + MAX_DUNGEON_INSTANCES});
+    if (!g->scene) {
+        log_error("[crypt] scene_create failed");
+        return false;
+    }
+    return load_assets(g);
+}
+
+static bool create_storage(Game *g) {
+    g->dungeon_slot  = (uint32_t *)calloc(MAX_DUNGEON_INSTANCES, sizeof(uint32_t));
+    g->flow         = (int16_t *)calloc((size_t)GRID_W * GRID_H, sizeof(int16_t));
+    g->flow_queue   = (int *)calloc((size_t)GRID_W * GRID_H * 4, sizeof(int));
+    g->bucket_head  = (int32_t *)calloc((size_t)GRID_W * GRID_H, sizeof(int32_t));
+    g->bucket_next  = (int32_t *)calloc(MAX_ENEMIES, sizeof(int32_t));
+    if (!g->dungeon_slot || !g->flow || !g->flow_queue || !g->bucket_head || !g->bucket_next) {
+        log_error("[crypt] out of memory");
+        return false;
+    }
+    mu_sparse_set_init(&g->e_alive, MAX_ENEMIES);
+    mu_sparse_set_init(&g->e_dying, MAX_ENEMIES);
+    mu_sparse_set_init(&g->p_alive, MAX_PICKUPS);
+    for (uint32_t i = 0; i < GRID_W * GRID_H; ++i)
+        g->flow[i] = 32767;
+    return true;
+}
+
+static void new_run(Game *g, uint32_t seed) {
+    crypt_sim_reset(g, seed);
+    g->rng = (mu_pcg32){0};
+    mu_pcg32_init(&g->rng, seed, 0xC8A7u);
+
+    /* Retire the previous run's dynamic instances before the new floor's static
+       geometry is planted, so the dynamic region never overflows. */
+    for (uint32_t i = 0; i < g->e_alive.count; ++i)
+        scene_instance_destroy(g->scene, g->e_slot[mu_sparse_set_at(&g->e_alive, i)]);
+    for (uint32_t i = 0; i < g->e_dying.count; ++i)
+        scene_instance_destroy(g->scene, g->e_slot[mu_sparse_set_at(&g->e_dying, i)]);
+    for (uint32_t i = 0; i < g->p_alive.count; ++i)
+        scene_instance_destroy(g->scene, g->p_slot[mu_sparse_set_at(&g->p_alive, i)]);
+    mu_sparse_set_clear(&g->e_alive);
+    mu_sparse_set_clear(&g->e_dying);
+    mu_sparse_set_clear(&g->p_alive);
+    for (uint32_t i = 0; i < MAX_ENEMIES; ++i)
+        g->e_free[i] = MAX_ENEMIES - 1u - i;
+    g->e_free_count = MAX_ENEMIES;
+    for (uint32_t i = 0; i < MAX_PICKUPS; ++i)
+        g->p_free[i] = MAX_PICKUPS - 1u - i;
+    g->p_free_count = MAX_PICKUPS;
+
+    crypt_floor_start(g);
+     /* Floor generation can move the player a long way. Start the presentation
+         camera at the new floor instead of letting the old floor's camera drift
+         across the dungeon for several frames. */
+     camera_update(g, 1.0f);
+    log_info("[crypt] floor %u: %u rooms, %u pieces, start cell %d,%d exit %d,%d player %.1f,%.1f cam %.1f,%.1f,%.1f",
+             g->depth, crypt_room_count, g->dungeon_used, g->start_x, g->start_y, g->exit_x, g->exit_y, g->pos[0], g->pos[2],
+             g->cam_pos[0], g->cam_pos[1], g->cam_pos[2]);
+
+    /* The rig's parts need dynamic instances; they live for the whole run. */
+    const RiggedModel *rig = &crypt_character[g->character];
+    g->part_count         = rig->part_count;
+    for (uint32_t p = 0; p < rig->part_count; ++p)
+        g->part_slot[p] = scene_instance_create(g->scene, &(SceneInstanceDesc){.mesh = rig->parts[p].mesh, .scale = 1.0f});
+    g->weapon_slot = scene_instance_create(g->scene,
+                                           &(SceneInstanceDesc){.mesh = g->asset_first[crypt_weapon_for_character[g->character]],
+                                                                .scale = 1.0f});
+}
+
+/* ------------------------------------------------------------------ hooks -- */
+
+static void pets_start(void *user, Renderer *renderer) {
+    Game *g = (Game *)user;
+    g->renderer = renderer;
+    g->vk       = renderer_vk(renderer);
+    g->cam_yaw  = 0.0f;
+    g->cam_pitch = 0.46f;
+    g->cam_dist = CAM_DIST;
+
+    if (!create_storage(g) || !create_scene(g))
+        exit(EXIT_FAILURE);
+
+    const char *seed_env = getenv("MU_CRYPT_SEED");
+    new_run(g, seed_env ? (uint32_t)atoi(seed_env) : (uint32_t)(mu_time_now() & 0xFFFFFFFFu));
+    log_info("[crypt] running as %s on floor 1", crypt_character_path[g->character]);
+}
+
+static void pets_frame(void *user, const GameFrame *frame) {
+    Game *g = (Game *)user;
+    const Input *in = frame->input;
+
+    if (key_pressed(in, KEY_F2)) {
+        uint32_t seed = (uint32_t)(mu_time_now() & 0xFFFFFFFFu);
+        new_run(g, seed);
+        renderer_hud(frame->renderer, "new run, seed %u", seed);
+    }
+
+    /* Mouse look drives the camera yaw and the character's facing together, so
+       the swing arc is always where the reticle is. */
+    g->cam_yaw   -= (float)mouse_dx(in) * 0.0032f;
+    g->cam_pitch = MU_CLAMP(g->cam_pitch + (float)mouse_dy(in) * 0.0028f, CAM_PITCH_MIN, CAM_PITCH_MAX);
+    g->cam_dist  = MU_CLAMP(g->cam_dist * (1.0f - (float)scroll_y(in) * 0.10f), 4.0f, 14.0f);
+
+    if (g->state == GS_CHOOSING) {
+        if (key_pressed(in, KEY_1))
+            crypt_take_offer(g, 0);
+        else if (key_pressed(in, KEY_2))
+            crypt_take_offer(g, 1);
+        else if (key_pressed(in, KEY_3))
+            crypt_take_offer(g, 2);
+        draw_hud(frame);
+        camera_update(g, frame->dt);
+        return;
+    }
+
+    if (g->state == GS_DEAD) {
+        if (key_pressed(in, KEY_SPACE))
+            new_run(g, (uint32_t)(mu_time_now() & 0xFFFFFFFFu));
+        draw_hud(frame);
+        camera_update(g, frame->dt);
+        return;
+    }
+
+    /* Movement is relative to the camera: forward is where the camera looks,
+       which is the only orientation the player actually has. */
+    float in_x = input_axis(in, KEY_A, KEY_D) + (float)(mouse_down(in, MOUSE_RIGHT) ? 1.0f : 0.0f);
+    float in_z = input_axis(in, KEY_S, KEY_W) + (float)(mouse_down(in, MOUSE_RIGHT) ? -1.0f : 0.0f);
+    float cy = cosf(g->cam_yaw), sy = sinf(g->cam_yaw);
+    float move_x = in_x * cy - in_z * sy;
+    float move_z = in_x * sy + in_z * cy;
+
+    if (mouse_pressed(in, MOUSE_LEFT))
+        crypt_player_attack(g);
+    if (key_pressed(in, KEY_SPACE))
+        crypt_player_dash(g);
+
+    g->accum += MU_CLAMP(frame->dt, 0.0f, 0.25f);
+    int steps = 0;
+    while (g->accum >= SIM_DT && steps < MAX_STEPS) {
+        crypt_sim_step(g, move_x, move_z);
+        g->accum -= SIM_DT;
+        ++steps;
+    }
+    if (steps == MAX_STEPS)
+        g->accum = 0.0f; /* clamp, so a stall cannot spiral */
+
+    camera_update(g, frame->dt);
+    draw_hud(frame);
+}
+
+static void pets_render(void *user, VkCommandBuffer cmd, RenderTarget *color, RenderTarget *depth) {
+    Game *g = (Game *)user;
+
+    /* Every asset the run will ever load is registered before the first frame,
+       because mesh and LOD capacities are fixed at scene_create. */
+    if (!g->uploaded) {
+        g->uploaded = true;
+        if (!scene_upload_scene(g->scene, cmd)) {
+            log_error("[crypt] scene_upload_scene failed");
+            exit(EXIT_FAILURE);
+        }
+    }
+
+    scene_set_toon(g->scene, renderer_toon(g->renderer));
+    crypt_render_sync(g);
+
+    /* Reverse-Z with an infinite far plane, written out rather than taken from
+       cglm: the depth attachment compares GREATER and clears to 0.0. */
+    mat4 proj, view, vp;
+    float aspect = (float)color->width / (float)color->height;
+    float t      = 1.0f / tanf(1.0471976f * 0.5f);
+    glm_mat4_zero(proj);
+    proj[0][0] = t / aspect;
+    proj[1][1] = -t; /* negated because begin_pass installs a negative-height viewport */
+    proj[2][2] = 0.0f;
+    proj[2][3] = -1.0f;
+    proj[3][2] = 0.1f;
+
+    vec3 eye;
+    glm_vec3_copy(g->cam_pos, eye);
+    vec3 at  = {g->pos[0], g->pos[1] + 1.0f, g->pos[2]};
+    vec3 up  = {0.0f, 1.0f, 0.0f};
+    glm_lookat(eye, at, up, view);
+    glm_mat4_mul(proj, view, vp);
+
+    renderer_set_camera(g->renderer, (const float *)view, (const float *)proj);
+
+    SceneViewDesc vd = {0};
+    for (int r = 0; r < 4; ++r)
+        for (int c = 0; c < 4; ++c)
+            vd.clip_rows[r][c] = vp[c][r]; /* cglm is column-major */
+    vd.camera_pos[0] = eye[0];
+    vd.camera_pos[1] = eye[1];
+    vd.camera_pos[2] = eye[2];
+    /* The cooker writes each rung's error in the mesh's own world units, so a
+       screen-space tolerance has to be solved for: a world length L at distance
+       d covers L*H / (2*d*tan(fovy/2)) pixels. */
+    vd.lod_target = 2.0f * 2.0f * tanf(1.0471976f * 0.5f) / (float)color->height;
+    vd.near_z     = 0.1f;
+    vd.far_z      = 400.0f;
+    scene_view_set(g->scene, 0, &vd);
+
+    scene_frame(g->scene, cmd, color, depth);
+}
+
+static void pets_shutdown(void *user) {
+    Game *g = (Game *)user;
+    free(g->dungeon_slot);
+    free(g->flow);
+    free(g->flow_queue);
+    free(g->bucket_head);
+    free(g->bucket_next);
+    scene_destroy(g->scene);
+}
+
+int main(void) {
+    GameHooks hooks = {.user   = &g_game,
+                       .two_d  = false,
+                       .start  = pets_start,
+                       .frame  = pets_frame,
+                       .render = pets_render,
+                       .shutdown = pets_shutdown};
+    Renderer *renderer = renderer_create(true, hooks);
+    while (renderer_frame(renderer)) {
+    }
+    renderer_destroy(renderer);
+    return EXIT_SUCCESS;
+}

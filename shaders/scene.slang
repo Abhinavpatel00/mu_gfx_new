@@ -3,6 +3,7 @@
    The cull kernel lives in cull.slang because the two stages want different
    push constants and one module cannot declare two. */
 #include "common.slang"
+#include "lighting.slang"
 #include "../src/three_d/scene_shared.h"
 
 [[vk::push_constant]] SceneDrawPush pc;
@@ -147,7 +148,7 @@ float4 fs_main(SceneVOut i) : SV_Target0
         m.roughness = orm.g;
     }
     float3 v = normalize(pc.camera.xyz - i.world);
-    float3 l = pc.sun.xyz;                                   /* already normalized on the CPU */
+    float3 l = env_sun_dir();
 
     float ndl = max(dot(n, l), 0.0f);
     float ndv = max(dot(n, v), 1e-4f);
@@ -164,16 +165,16 @@ float4 fs_main(SceneVOut i) : SV_Target0
     float3 spec     = f * (d * g / max(4.0f * ndv * ndl, 1e-6f));
     float3 kd       = (1.0f - f) * (1.0f - metallic);
 
-    /* scene_set_sun takes the direction toward the light, so there is nothing
-       to negate here; flipping it lights the far side of every surface. */
+    /* The direction is toward the light, so there is nothing to negate here;
+       flipping it lights the far side of every surface. */
     float3 diffuse = kd * albedo * (1.0f / 3.14159265f);
-    float3 direct  = (diffuse + spec) * ndl;
+    float3 direct  = (diffuse + spec) * ndl * env_sun_radiance();
 
-    /* No image-based lighting yet, so the ambient term stands in for the whole
-       environment: kd*albedo is the diffuse irradiance and f0*ambient is a flat
-       radiance reflection. Without that specular half every metal is black,
-       because kd -> 0 and there is no other light for it to reflect. */
-    float3 ambient = (kd * albedo + f0) * pc.sun.w * ao;
+    /* The ambient term stands in for the whole environment: kd*albedo is the
+       diffuse irradiance and f0*ambient is a flat radiance reflection. Without
+       that specular half every metal is black, because kd -> 0 and there is no
+       other light for it to reflect. */
+    float3 ambient = (kd * albedo + f0) * env_ambient(n, ao);
 
     /* Linear HDR. Tonemapping and the output gamma live in the post pass now,
        so exposure, bloom and color grading all see the same linear values

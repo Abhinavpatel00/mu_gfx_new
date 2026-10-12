@@ -6,6 +6,7 @@
    Output is linear HDR, like the PBR path: tonemap, exposure and bloom are the
    post pass's job, so both pipelines feed the same grade. */
 #include "common.slang"
+#include "lighting.slang"
 #include "../src/three_d/scene_shared.h"
 
 [[vk::push_constant]] SceneDrawPush pc;
@@ -101,30 +102,36 @@ float4 fs_main(SceneVOut i) : SV_Target0
         return float4(albedo, i.bloom);
 
     float3 v = normalize(pc.camera.xyz - i.world);
-    float3 l = pc.sun.xyz;
+    float3 l = env_sun_dir();
 
     /* Quantized diffuse ramp. The half-band is smoothed with smoothstep so the
        edge does not alias into a hard staircase as the surface turns. */
     float  lit  = saturate(dot(n, l));
     float  f    = lit * TOON_BANDS;
     float  lo   = floor(f);
-    float  ramp = (lo + smoothstep(0.42f, 0.58f, f - lo)) / TOON_BANDS;
+    float  ramp = (lo + smoothstep(0.40f, 0.60f, f - lo)) / TOON_BANDS;
 
+    /* Rim wraps toward the lit side so it reads as a bounce edge rather than a
+       uniform outline, and it takes the sky's color for the same reason the
+       ambient does: it is the sky leaning on the silhouette. */
     float  ndv  = saturate(dot(n, v));
-    float  rim  = pow(1.0f - ndv, 3.0f);
+    float  rim  = pow(1.0f - ndv, 2.5f) * (0.55f + 0.45f * lit);
 
     float3 h    = normalize(l + v);
-    float  spec = pow(saturate(dot(n, h)), 48.0f);
-    spec        = smoothstep(0.35f, 0.55f, spec);
+    float  spec = pow(saturate(dot(n, h)), 64.0f);
+    spec        = smoothstep(0.30f, 0.55f, spec);
 
     float  metallic  = saturate(m.metallic);
     float3 f0        = lerp(float3(0.04f), albedo, metallic);
     float3 kd        = (1.0f - f0) * (1.0f - metallic);
 
-    float3 ambient  = kd * albedo * pc.sun.w * ao;
-    float3 diffuse  = kd * albedo * ramp;
-    float3 specular = f0 * spec * ao;
-    float3 rim_light = float3(1.0f) * rim * pc.sun.w * 1.6f;
+    float3 sun      = env_sun_radiance();
+    float3 ambient  = kd * albedo * env_ambient(n, ao);
+    float3 diffuse  = kd * albedo * ramp * sun;
+    float3 specular = f0 * spec * sun * ao;
+    /* Sky-coloured, but scaled to an accent: at 1.4 the rim covered every
+       grazing leaf in sky blue and desaturated the whole canopy. */
+    float3 rim_light = env_sky_color() * rim * 0.5f;
 
     /* Linear HDR: exposure, bloom and the tonemap all happen in post. Alpha
        carries the per-instance bloom strength into the bloom bright-pass. */

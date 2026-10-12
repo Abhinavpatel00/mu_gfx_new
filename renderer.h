@@ -51,9 +51,33 @@ bool renderer_toon(Renderer *renderer);
 
 /* Feed the renderer this frame's view and projection (column-major, cglm
    layout). The renderer derives view-proj, its inverse, and keeps the previous
-   frame's view-proj so GPU effects that reconstruct world position (SSAO) can
-   reproject history across frames. Call once per frame before the passes. */
+   frame's view-proj. Call once per frame before the passes. */
 void renderer_set_camera(Renderer *renderer, const float *view, const float *projection);
+
+/* The world the shading paths light against. The renderer owns it — rather than
+   each scene pipeline carrying its own copy — so the sky pass and the PBR and
+   toon fragment stages cannot disagree about the sun or the ambient. Angles are
+   in radians; colors are linear. */
+typedef struct RenderEnvironment {
+    float sky[3];     /* ambient for up-facing normals; also the sky's zenith */
+    float horizon[3]; /* the sky gradient's bottom stop */
+    float ground[3];  /* ground bounce for down-facing normals */
+    float sun_dir[3]; /* direction toward the sun, normalized by the setter */
+    float sun_color[3];
+    float sun_intensity;
+    float ambient;    /* global scale on the ambient term */
+    /* Sky shape. A look knob, not a fact about the world, so it stays out of the
+       shading model even though it rides the same block. */
+    float sky_exponent;
+    float sun_glow;
+    float sun_glow_power;
+} RenderEnvironment;
+
+/* A bright outdoor standing point: blue sky, warm sun, plenty of bounce. */
+RenderEnvironment renderer_environment_default(void);
+void              renderer_set_environment(Renderer *renderer, const RenderEnvironment *env);
+/* The current environment, for an app that wants to tweak one field. */
+RenderEnvironment renderer_environment(const Renderer *renderer);
 
 /* Queue a line for the on-screen Game window. The queue clears every frame, so
    call it once per frame for each line you want. Silently drops overflow. */

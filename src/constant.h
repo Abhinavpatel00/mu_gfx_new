@@ -1,7 +1,10 @@
 // CONSTANTS
 
 
-#define CAPTURE_SLOTS 3   // must be >= MAX_FRAMES_IN_FLIGHT
+// Readback ring for screenshots and video. current_frame is the only index the
+// capture path has, and it cycles modulo MAX_FRAMES_IN_FLIGHT, so the ring has
+// to be exactly that size: slot current_frame % CAPTURE_SLOTS is the one whose
+// copy the fence wait at the top of this frame has just retired.
 #define BINDLESS_TEXTURE_BINDING 0
 #define BINDLESS_SAMPLER_BINDING 1
 #define BINDLESS_STORAGE_IMAGE_BINDING 2
@@ -15,6 +18,7 @@
 #define RT_MAX_MIPS 13
 #define MAX_SWAPCHAIN_IMAGES 8
 #define MAX_FRAMES_IN_FLIGHT 2
+#define CAPTURE_SLOTS        MAX_FRAMES_IN_FLIGHT
 
 
 #define MAX_PIPELINES                256

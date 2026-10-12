@@ -197,8 +197,6 @@ struct Scene {
     uint32_t       view_count;
 
     SceneViewDesc views[SCENE_MAX_VIEWS];
-    float         sun[3];
-    float         ambient;
     float         clear[4];
 
     /* counters */
@@ -256,10 +254,6 @@ Scene *scene_create(VkBackend *vk, const SceneDesc *desc) {
     if (s->dynamic_capacity + s->static_capacity > s->max_instances)
         s->static_capacity = s->max_instances - s->dynamic_capacity;
 
-    s->sun[0]   = 0.3f;
-    s->sun[1]   = 0.9f;
-    s->sun[2]   = 0.4f;
-    s->ambient  = 0.15f;
     s->clear[0] = 0.05f;
     s->clear[1] = 0.07f;
     s->clear[2] = 0.10f;
@@ -733,13 +727,6 @@ void scene_view_set(Scene *s, uint32_t view, const SceneViewDesc *vd) {
         s->view_count = view + 1;
 }
 
-void scene_set_sun(Scene *s, const float dir[3], float ambient) {
-    s->sun[0]  = dir[0];
-    s->sun[1]  = dir[1];
-    s->sun[2]  = dir[2];
-    s->ambient = ambient;
-}
-
 void scene_set_clear(Scene *s, const float rgba[4]) { memcpy(s->clear, rgba, sizeof(s->clear)); }
 
 /* ============================================================ upload (T0) */
@@ -986,15 +973,9 @@ static void build_draw_push(Scene *s, uint32_t view, uint32_t lane, struct Scene
         p->clip_rows[r].z = s->views[view].clip_rows[r][2];
         p->clip_rows[r].w = s->views[view].clip_rows[r][3];
     }
-    /* Normalized once here rather than per fragment; the sign is preserved so
-       a light pointing away still lights the back of nothing. */
-    float len = sqrtf(s->sun[0] * s->sun[0] + s->sun[1] * s->sun[1] + s->sun[2] * s->sun[2]);
-    float inv = len > 1e-8f ? 1.0f / len : 0.0f;
-    p->sun.x  = s->sun[0] * inv;
-    p->sun.y  = s->sun[1] * inv;
-    p->sun.z  = s->sun[2] * inv;
-    p->sun.w  = s->ambient;
-
+    /* The sun and the ambient ride in GlobalData, which the renderer owns, so
+       the sky pass and both scene pipelines share one description. This push
+       only carries what is per-view: the clip rows and the eye. */
     p->camera.x = s->views[view].camera_pos[0];
     p->camera.y = s->views[view].camera_pos[1];
     p->camera.z = s->views[view].camera_pos[2];

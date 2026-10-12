@@ -327,15 +327,14 @@ struct Renderer {
     RenderTarget       smaa_edges[MAX_SWAPCHAIN_IMAGES];
     RenderTarget       smaa_weights[MAX_SWAPCHAIN_IMAGES];
     RenderTarget       bloom_mip[MAX_SWAPCHAIN_IMAGES][BLOOM_MIPS];
-    /* SSAO temporal history, ping-pong. .r = accumulated AO, .g = sample count,
-       .b = the view distance the texel saw. Two buffers because a pass can't
-       read and write the same target. */
-    RenderTarget ssao_hist[MAX_SWAPCHAIN_IMAGES][2];
-    uint32_t     ssao_parity[MAX_SWAPCHAIN_IMAGES];
-    bool         ssao_history_valid[MAX_SWAPCHAIN_IMAGES];
+    /* SSAO target at half res, one per swapchain image. Written fresh every
+       frame; the pass is stateless, so there is no history to ping-pong. */
+    RenderTarget ssao[MAX_SWAPCHAIN_IMAGES];
     TextureID    lut_texture;
     uint32_t     lut_size;
     PostSettings post;
+    /* Published to every shading path through GlobalData. See renderer.h. */
+    RenderEnvironment env;
     /* Camera, fed by the app each frame via renderer_set_camera. cglm
        column-major. prev_viewproj is last frame's, for temporal reprojection. */
     mat4      cam_view;
@@ -587,11 +586,11 @@ static void capture_consume(Renderer *r) {
     if (!c->inited)
         return;
 
-    // Consume the slot recorded MAX_FRAMES_IN_FLIGHT - 1 submissions ago; the
-    // frame-slot timeline wait in frame_start already covered its submission.
-    // The submit_value check makes that coupling explicit and enforced: a slot
-    // is readable only when its covering timeline value has completed.
-    uint32_t slot = (r->vk.current_frame + CAPTURE_SLOTS - 1) % CAPTURE_SLOTS;
+    // The slot whose turn it is this frame is the one written MAX_FRAMES_IN_FLIGHT
+    // frames ago, and the fence wait in frame_start has already retired that
+    // submission. The submit_value check keeps that coupling explicit rather
+    // than assumed: a slot is readable only once its timeline value has passed.
+    uint32_t slot = r->vk.current_frame % CAPTURE_SLOTS;
     if (c->submit_value[slot] == 0)
         return;
 
@@ -976,12 +975,9 @@ static void renderer_resources_create(Renderer *r, VkBackendDesc *desc) {
                                          .debug_name = "bloom_mip"};
             rt_create(&r->vk, &r->bloom_mip[i][k], &mip_spec);
         }
-        /* SSAO temporal history at half resolution: the occlusion signal is
-           low-frequency and the bitmask algorithm is ALU-heavy, not
-           bandwidth-heavy. RGBA16F holds accumulated AO in .r, the sample count
-           in .g, and the view distance the texel saw in .b — the disocclusion
-           test reads it to tell our surface from whatever was there before.
-           Two buffers ping-pong across frames. */
+        /* SSAO at half resolution: the occlusion signal is low-frequency, and
+           the hemisphere march is a depth-sample gather, so half res halves the
+           tap count at no visible cost once the post pass averages it back. */
         uint32_t         aw        = MAX(r->vk.swapchain.extent.width / 2u, 1u);
         uint32_t         ah        = MAX(r->vk.swapchain.extent.height / 2u, 1u);
         RenderTargetSpec ssao_spec = {.width      = aw,
@@ -990,10 +986,8 @@ static void renderer_resources_create(Renderer *r, VkBackendDesc *desc) {
                                       .format     = VK_FORMAT_R16G16B16A16_SFLOAT,
                                       .usage      = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
                                       .mip_count  = 1,
-                                      .debug_name = "ssao_hist"};
-        rt_create(&r->vk, &r->ssao_hist[i][0], &ssao_spec);
-        rt_create(&r->vk, &r->ssao_hist[i][1], &ssao_spec);
-        r->ssao_parity[i] = 0u;
+                                      .debug_name = "ssao"};
+        rt_create(&r->vk, &r->ssao[i], &ssao_spec);
     }
 
     vk_mem_set_tag(&r->vk, MEM_TAG_CORE);
@@ -1122,6 +1116,7 @@ static void renderer_resources_create(Renderer *r, VkBackendDesc *desc) {
     }
 
     r->post = post_settings_cartoon();
+    r->env  = renderer_environment_default();
     post_settings_load(&r->post);
     create_identity_lut(r);
 
@@ -1396,8 +1391,7 @@ static MU_INLINE bool frame_start(Renderer *r) {
             rt_resize(&r->vk, &r->smaa_weights[i], fb_w, fb_h);
             forEach(k, BLOOM_MIPS) rt_resize(&r->vk, &r->bloom_mip[i][k], MAX((uint32_t)fb_w >> (k + 1u), 1u),
                                              MAX((uint32_t)fb_h >> (k + 1u), 1u));
-            rt_resize(&r->vk, &r->ssao_hist[i][0], MAX((uint32_t)fb_w / 2u, 1u), MAX((uint32_t)fb_h / 2u, 1u));
-            rt_resize(&r->vk, &r->ssao_hist[i][1], MAX((uint32_t)fb_w / 2u, 1u), MAX((uint32_t)fb_h / 2u, 1u));
+            rt_resize(&r->vk, &r->ssao[i], MAX((uint32_t)fb_w / 2u, 1u), MAX((uint32_t)fb_h / 2u, 1u));
         }
 
         capture_resize(r, (uint32_t)fb_w, (uint32_t)fb_h);
@@ -1435,6 +1429,22 @@ static void update_global_data(Renderer *r) {
     data.screen_params[1] = (float)r->vk.swapchain.extent.height;
     data.screen_params[2] = 1.0f / data.screen_params[0];
     data.screen_params[3] = 1.0f / data.screen_params[1];
+
+    /* Environment: one write, read by the sky pass and both scene pipelines. */
+    glm_vec3_copy(r->env.sky, data.env_sky);
+    glm_vec3_copy(r->env.horizon, data.env_horizon);
+    glm_vec3_copy(r->env.ground, data.env_ground);
+    data.env_sky[3] = r->env.ambient;
+    {
+        const float *d = r->env.sun_dir;
+        float        len = sqrtf(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+        float        inv = len > 1e-6f ? 1.0f / len : 0.0f;
+        data.sun_dir[0]  = d[0] * inv;
+        data.sun_dir[1]  = d[1] * inv;
+        data.sun_dir[2]  = d[2] * inv;
+    }
+    data.sun_dir[3] = r->env.sun_intensity;
+    glm_vec3_copy(r->env.sun_color, data.sun_color);
 
     Buffer *global_buffer = &r->global_ubo[r->vk.current_frame];
     memcpy(global_buffer->mapping, &data, sizeof(data));
@@ -1484,17 +1494,16 @@ PUSH_CONSTANT(PostPush, uint32_t src_texture_id; uint32_t output_image_id; uint3
               float sepia_intensity; float dither_strength; float lift_r; float lift_g; float lift_b; float gain_r;
               float gain_g; float gain_b; uint32_t lut_texture_id; uint32_t lut_size; float lut_strength;
               uint32_t bloom_texture_id; float bloom_strength; float time; uint32_t ssao_texture_id;
-              float                                                                 ssao_strength;);
+              uint32_t depth_texture_id; float ssao_strength;);
 
 PUSH_CONSTANT(BloomPush, uint32_t src_texture_id; uint32_t dst_image_id; uint32_t sampler_id; uint32_t width;
               uint32_t height; uint32_t pass; float radius; float threshold; float soft_knee; uint32_t prefilter;);
 
 PUSH_CONSTANT(SsaoPush, uint32_t depth_texture_id; uint32_t output_image_id; uint32_t sampler_id; uint32_t width;
-              uint32_t height; uint32_t sample_count; uint32_t mode; float proj_00; float proj_11; float radius;
-              float thickness; float bias; float intensity; float near_z; float far_z; float depth_scale;
-              uint32_t history_texture_id;);
+              uint32_t height; uint32_t sample_count; uint32_t frame; float proj_00; float proj_11; float radius;
+              float bias; float intensity; float near_z;);
 
-PUSH_CONSTANT(SkyPush, float top[4]; float bottom[4]; float exponent; float pad0; float pad1; float pad2;);
+PUSH_CONSTANT(SkyPush, float exponent; float glow_strength; float glow_power; float ground_fade;);
 PUSH_CONSTANT(EdgePush, uint32_t texture_id; uint32_t sampler_id;);
 
 PUSH_CONSTANT(BlendPush, uint32_t color_tex; uint32_t weight_tex; uint32_t sampler_id; uint32_t pad;);
@@ -1547,80 +1556,42 @@ static void pass_bloom(Renderer *r, VkCommandBuffer cmd, uint32_t image) {
             bloom_dispatch(r, cmd, &r->bloom_mip[image][k], &r->bloom_mip[image][k - 1u], 2u, r->post.bloom_radius);
     }
 }
-
-/* Resets both SSAO history buffers to neutral (AO=1, count=0) while SSAO is
-   disabled, flipping parity like pass_ssao so post reads a fresh buffer when
-   the effect comes back. Without this, re-enabling blends the frame's last
-   stale accumulation for up to MaxHistory frames. Depth is not read and no
-   history is sampled, so this is one half-res storage write. */
-static void pass_ssao_reset(Renderer *r, VkCommandBuffer cmd) {
-    uint32_t image  = r->vk.swapchain.current_image;
-    uint32_t parity = r->ssao_parity[image];
-
-    RenderTarget *hist_out = &r->ssao_hist[image][parity ^ 1u];
-    r->ssao_parity[image]  = parity ^ 1u;
-
-    RenderTarget *writes[] = {hist_out};
-    PassDesc      pd       = {.shader_writes      = writes,
-                              .shader_write_count = 1,
-                              .pipeline           = r->EnginePipelines.ssao};
-
-    SsaoPush p = {.output_image_id = hist_out->bindless_index,
-                  .width           = hist_out->width,
-                  .height          = hist_out->height,
-                  .mode            = 0u};
-
-    begin_pass(&r->vk, cmd, &pd);
-    dispatch_push(&r->vk, cmd, BYTE_SPAN(p), (p.width + 7) / 8, (p.height + 7) / 8, 1);
-    end_pass(&r->vk, cmd, &pd);
-}
-
-/* GT-VBAO compute pass. Reads depth and the previous history,
-   reconstructs normals from screen-space depth derivatives, runs the bitmask
-   horizon search, and in temporal mode blends one sample/frame into history.
-   Writes the current-parity history buffer; post reads it via bindless index. */
+/* Screen-space AO compute pass. Reads depth, reconstructs normals from its
+   derivatives, and marches a rotated Poisson hemisphere. Stateless: it writes
+   the half-res AO target fresh every frame, and post reads it via bindless
+   index. There is nothing to invalidate between frames. */
 static void pass_ssao(Renderer *r, VkCommandBuffer cmd) {
-    uint32_t image  = r->vk.swapchain.current_image;
-    uint32_t parity = r->ssao_parity[image];
+    uint32_t image = r->vk.swapchain.current_image;
 
-    RenderTarget *hist_in  = &r->ssao_hist[image][parity];
-    RenderTarget *hist_out = &r->ssao_hist[image][parity ^ 1u];
-    r->ssao_parity[image]  = parity ^ 1u; /* post reads hist_out next frame */
-
-    /* Unidirectional partial-slice + temporal: the shader reads last frame's
-       history and writes this frame's. */
-    RenderTarget *reads[]  = {&r->depth[image], hist_in};
-    RenderTarget *writes[] = {hist_out};
+    RenderTarget *reads[]  = {&r->depth[image]};
+    RenderTarget *writes[] = {&r->ssao[image]};
     PassDesc      pd       = {.shader_reads       = reads,
-                              .shader_read_count  = 2,
+                              .shader_read_count  = 1,
                               .shader_writes      = writes,
                               .shader_write_count = 1,
                               .pipeline           = r->EnginePipelines.ssao};
 
     const GlobalData *gd = (const GlobalData *)r->global_ubo[r->vk.current_frame].mapping;
-    SsaoPush          p  = {.depth_texture_id   = r->depth[image].bindless_index,
-                            .output_image_id    = hist_out->bindless_index,
-                            /* Depth is D32_SFLOAT, which is not a filterable format, and
-                               filtering it would invent geometry across silhouettes anyway.
-                               History taps are point samples for the same reason: a filtered
-                               tap blends AO across the edge it is meant to detect. */
-                            .sampler_id         = r->vk.default_samplers.samplers[SAMPLER_NEAREST_CLAMP],
-                            .width              = hist_out->width,
-                            .height             = hist_out->height,
-                            .proj_00            = gd->projection[0][0],
-                            .proj_11            = gd->projection[1][1],
-                            .radius             = 0.5f,
-                            /* Half the radius: the slab is the occluder's own depth, and at
-                               radius it swallows the whole neighbourhood and over-occludes. */
-                            .thickness          = 0.25f,
-                            .bias               = 0.025f,
-                            .intensity          = 1.0f,
-                            .sample_count       = 1u,
-                            .near_z             = 0.1f,
-                            .far_z              = 1000.0f,
-                            .depth_scale        = (float)r->depth[image].width / (float)hist_out->width,
-                            .history_texture_id = hist_in->bindless_index,
-                            .mode               = 1u};
+    SsaoPush          p  = {.depth_texture_id = r->depth[image].bindless_index,
+                            .output_image_id  = r->ssao[image].bindless_index,
+                            /* D32_SFLOAT is not filterable, and filtering a depth texel
+                               would invent geometry across the silhouette the AO is
+                               meant to detect, so the depth taps are point samples. */
+                            .sampler_id       = r->vk.default_samplers.samplers[SAMPLER_NEAREST_CLAMP],
+                            .width            = r->ssao[image].width,
+                            .height           = r->ssao[image].height,
+                            .sample_count     = 16u,
+                            .frame            = r->frame_count,
+                            .proj_00          = gd->projection[0][0],
+                            .proj_11          = gd->projection[1][1],
+                            /* Half a metre reads as contact shading on props this size;
+                               larger radii turn the scene into a grey wash. */
+                            .radius           = 0.5f,
+                            .bias             = 0.02f,
+                            /* >1 deepens the crevices the samples do find without
+                               letting a single occluded sample crush the pixel. */
+                            .intensity        = 1.4f,
+                            .near_z           = 0.1f};
 
     begin_pass(&r->vk, cmd, &pd);
     dispatch_push(&r->vk, cmd, BYTE_SPAN(p), (p.width + 7) / 8, (p.height + 7) / 8, 1);
@@ -1643,13 +1614,15 @@ static void post_pass(Renderer *r, VkCommandBuffer cmd) {
            transitions them to sampled reads. */
         /* Build the read set as a prefix so read_count stays correct when
            bloom and ssao are independently toggled. */
-        RenderTarget *reads[3];
+        RenderTarget *reads[4];
         uint32_t      read_count = 0;
         reads[read_count++]      = &r->hdr_color[image];
         if (bloom_on)
             reads[read_count++] = &r->bloom_mip[image][0];
-        if (ssao_on)
-            reads[read_count++] = &r->ssao_hist[image][r->ssao_parity[image]];
+        if (ssao_on) {
+            reads[read_count++] = &r->ssao[image];
+            reads[read_count++] = &r->depth[image];
+        }
         RenderTarget *writes[] = {&r->ldr_color[image]};
 
         begin_pass(&r->vk, cmd,
@@ -1662,7 +1635,7 @@ static void post_pass(Renderer *r, VkCommandBuffer cmd) {
                    });
 
         uint32_t bloom_id = bloom_on ? r->bloom_mip[image][0].bindless_index : 0xFFFFFFFFu;
-        uint32_t ssao_id  = ssao_on ? r->ssao_hist[image][r->ssao_parity[image]].bindless_index : 0xFFFFFFFFu;
+        uint32_t ssao_id  = ssao_on ? r->ssao[image].bindless_index : 0xFFFFFFFFu;
         PostPush push     = {
             .src_texture_id      = r->hdr_color[image].bindless_index,
             .output_image_id     = r->ldr_color[image].bindless_index,
@@ -1698,6 +1671,9 @@ static void post_pass(Renderer *r, VkCommandBuffer cmd) {
             .bloom_strength      = s->bloom_strength,
             .time                = (float)((double)(mu_time_now() - r->start_time) / mu_time_freq()),
             .ssao_texture_id     = ssao_id,
+            /* The AO bilateral upsample needs the full-res depth under each
+               half-res tap, so post names the depth target too. */
+            .depth_texture_id    = r->depth[image].bindless_index,
             .ssao_strength       = s->ssao_strength,
         };
 
@@ -2043,6 +2019,41 @@ VkBackend *renderer_vk(Renderer *r) { return &r->vk; }
 
 bool renderer_toon(Renderer *r) { return r ? r->post.toon : false; }
 
+RenderEnvironment renderer_environment_default(void) {
+    return (RenderEnvironment){
+        /* Both stops carry red on purpose. A physically blue sky has almost no
+           red, and a contrast curve crushes what little there is to zero, so
+           any honest blue lands on pure cyan. The red here is the grade's
+           inverse, not a claim about the sky. */
+        .sky       = {0.18f, 0.34f, 0.76f},
+        .horizon   = {0.40f, 0.62f, 0.96f},
+        .ground    = {0.46f, 0.32f, 0.17f},
+        .sun_dir   = {0.40f, 0.78f, 0.32f},
+        .sun_color = {1.00f, 0.93f, 0.78f},
+        /* The key carries the shape. Ambient this low is what keeps a shadowed
+           face reading as the object's own colour rather than as blue-grey
+           fill, and it leaves the tonemap headroom for the sun to clip into. */
+        .sun_intensity  = 1.70f,
+        .ambient        = 0.24f,
+        /* A camera near the horizon only samples the bottom of the gradient, so
+           this exponent, not the zenith colour, is what the sky actually shows.
+           Low enough that the gradient climbs to the zenith well inside the
+           visible slice, which is what puts a gradient on screen at all. */
+        .sky_exponent   = 0.15f,
+        .sun_glow       = 0.22f,
+        .sun_glow_power = 24.0f,
+    };
+}
+
+void renderer_set_environment(Renderer *r, const RenderEnvironment *env) {
+    if (r && env)
+        r->env = *env;
+}
+
+RenderEnvironment renderer_environment(const Renderer *r) {
+    return r ? r->env : renderer_environment_default();
+}
+
 void renderer_set_camera(Renderer *r, const float *view, const float *projection) {
     if (!r || !view || !projection)
         return;
@@ -2069,7 +2080,10 @@ static void pass_sky(Renderer *r, VkCommandBuffer cmd, RenderTarget *target) {
     PassAttachment color = {.target = target, .load = LOAD_CLEAR, .store = STORE_KEEP};
     PassDesc       pd    = {.colors = &color, .color_count = 1, .pipeline = r->EnginePipelines.sky};
     begin_pass(&r->vk, cmd, &pd);
-    SkyPush sp = {.top = {0.28f, 0.60f, 0.98f, 1.0f}, .bottom = {0.86f, 0.95f, 1.0f, 1.0f}, .exponent = 0.65f};
+    SkyPush sp = {.exponent        = r->env.sky_exponent,
+                  .glow_strength   = r->env.sun_glow,
+                  .glow_power      = r->env.sun_glow_power,
+                  .ground_fade     = 0.85f};
     push_constants(&r->vk, cmd, (ByteSpan){&sp, sizeof(sp)});
     vkCmdDraw(cmd, 3, 1, 0, 0);
     end_pass(&r->vk, cmd, &pd);
@@ -2148,25 +2162,24 @@ bool renderer_frame(Renderer *r) {
         r->debug_ui_open = !r->debug_ui_open;
 
     GPU_SCOPE(frame_prof, cmd, "SSAO", VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT) {
-        /* The checkbox gates the whole pass, not just the post blend: when
-           SSAO is off we skip sampling history, flip parity, and — important
-           for temporal — stamp a clean (ao=1, count=0) frame so toggling back
-           on reconverges instead of blending stale frames. */
+        /* The checkbox gates the pass itself: when SSAO is off post does not
+           name the target either, so there is nothing to reset — the pass is
+           stateless and next enabled frame recomputes it from scratch. */
         if ((r->post.flags & POST_SSAO) && r->post.ssao_strength > 0.0f)
             pass_ssao(r, cmd);
-        else
-            pass_ssao_reset(r, cmd);
     }
     post_pass(r, cmd);
     pass_smaa(r, cmd);
     pass_ldr_to_swapchain(r, cmd);
     render_gpu_profiler_ui(r);
 
+    /* The game HUD belongs to the game, not to the debug windows, so it draws
+       whether or not those are open — a health bar the player cannot see
+       without opening a settings panel is not a HUD. */
+    render_game_ui(r);
+
     if (r->debug_ui_open) {
-
-        render_game_ui(r);
         render_grade_ui(r);
-
         render_capture_ui(r);
     }
     pass_nuklear(r, cmd);
@@ -2204,8 +2217,7 @@ void renderer_destroy(Renderer *r) {
         rt_destroy(&r->vk, &r->smaa_edges[i]);
         rt_destroy(&r->vk, &r->smaa_weights[i]);
         forEach(k, BLOOM_MIPS) rt_destroy(&r->vk, &r->bloom_mip[i][k]);
-        rt_destroy(&r->vk, &r->ssao_hist[i][0]);
-        rt_destroy(&r->vk, &r->ssao_hist[i][1]);
+        rt_destroy(&r->vk, &r->ssao[i]);
     }
     if (r->two_d) {
         two_d_destroy(r->two_d);

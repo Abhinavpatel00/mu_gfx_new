@@ -162,6 +162,31 @@ bool scene_asset_probe(const char *path, SceneAssetProbe *out, char *err, uint32
     return true;
 }
 
+uint32_t scene_asset_mesh_names(const char *path, char *out, uint32_t cap, char *err, uint32_t err_cap) {
+    uint32_t size = 0;
+    uint8_t *file = (uint8_t *)read_whole_file(path, &size, err, err_cap);
+    if (!file)
+        return 0;
+
+    Muasset blob;
+    if (!muasset_open(file, size, &blob, err, err_cap)) {
+        free(file);
+        return 0;
+    }
+
+    uint32_t used = 0;
+    for (uint32_t i = 0; i < blob.mesh_count; ++i) {
+        const char *name = muasset_name_at(&blob, i); /* mesh names lead the section */
+        uint32_t    n    = (uint32_t)strlen(name) + 1u;
+        if (used + n > cap)
+            break;
+        memcpy(out + used, name, n);
+        used += n;
+    }
+    free(file);
+    return blob.mesh_count;
+}
+
 bool scene_asset_load(Scene *s, const char *path, SceneAssetLoad *out, char *err, uint32_t err_cap) {
     memset(out, 0, sizeof(*out));
 

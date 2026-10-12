@@ -17,62 +17,138 @@
 /* Room scene: static interior built from cooked KayKit pieces, not the old
    character grid. The compaction comment that lived here went with it. */
 
-/* SSAO test room: a dungeon shell (floor, walls, pillars) dressed with
-   furniture. Cooked with: build/muasset_cook <src.gltf> -o assets/interior_<name>.mua --lods 1
-   Yaws are about +Y; wall/floor pieces are solid boxes so facing is texture-only. */
-static const char *const pets_assets[] = {
-    "assets/interior_floor_tile_large.mua", /* 0: 4x4 floor tile            */
-    "assets/interior_wall.mua",             /* 1: 4m wall, 4 tall           */
-    "assets/interior_wall_corner.mua",      /* 2: L corner                  */
-    "assets/interior_pillar.mua",           /* 3: pillar, 4 tall            */
-    "assets/interior_table_medium.mua",     /* 4: 2x2 table, 1 tall         */
-    "assets/interior_chair_A.mua",          /* 5: chair                     */
-    "assets/interior_couch.mua",            /* 6: couch                     */
-    "assets/interior_lamp_table.mua",       /* 7: table lamp                */
+/* Meadow test scene: an outdoor clearing cooked out of the nature packs by
+   scripts/cook_meadow_assets.sh. Indices match that roster, and the table is
+   ordered so a species and its slot can be read together. */
+enum {
+    A_GROUND,
+    A_GROUND_ROCKY,
+    A_TREE_COMMON_A,
+    A_TREE_COMMON_B,
+    A_TREE_COMMON_C,
+    A_PINE_A,
+    A_PINE_B,
+    A_TREE_TWISTED_A,
+    A_TREE_TWISTED_B,
+    A_TREE_BIRCH_A,
+    A_TREE_BIRCH_B,
+    A_TREE_OAK_A,
+    A_TREE_OAK_B,
+    A_TREE_BARE_A,
+    A_BUSH_A,
+    A_BUSH_FLOWERS,
+    A_BUSH_B,
+    A_BUSH_C,
+    A_GRASS_TALL,
+    A_GRASS_WISPY,
+    A_GRASS_B,
+    A_GRASS_C,
+    A_ROCK_A,
+    A_ROCK_B,
+    A_ROCK_C,
+    A_PEBBLE_A,
+    A_ROCKPATH,
+    A_MUSHROOM,
+    A_FERN,
+    A_FLOWER_GROUP,
+    A_CLOVER,
+    A_COUNT
 };
-#define ROOM_MODELS (sizeof(pets_assets) / sizeof(pets_assets[0]))
-
-typedef struct RoomProp {
-    uint32_t asset; /* index into pets_assets */
-    float    x, y, z;
-    float    yaw; /* radians about Y; 0 = as authored */
-} RoomProp;
-
-#define YAW_0   0.0f
-#define YAW_90  1.5707963f
-#define YAW_180 3.1415927f
-#define YAW_270 -1.5707963f
-
-/* 12x12m room: 3x3 floor tiles, perimeter walls, corners, pillars, furniture.
-   Floor tile is 4x4 so 3x3 covers [-6,6]^2. Walls are 4m segments on the
-   perimeter; wall_corner is an L for the four corners. Quats are built from
-   yaw at placement time. */
-static const RoomProp room_props[] = {
-    /* 3x3 floor */
-    {0, -4.0f, 0.0f, -4.0f, YAW_0}, {0, 0.0f, 0.0f, -4.0f, YAW_0}, {0, 4.0f, 0.0f, -4.0f, YAW_0},
-    {0, -4.0f, 0.0f,  0.0f, YAW_0}, {0, 0.0f, 0.0f,  0.0f, YAW_0}, {0, 4.0f, 0.0f,  0.0f, YAW_0},
-    {0, -4.0f, 0.0f,  4.0f, YAW_0}, {0, 0.0f, 0.0f,  4.0f, YAW_0}, {0, 4.0f, 0.0f,  4.0f, YAW_0},
-    /* north wall (z=-6), running along x */
-    {1, -4.0f, 0.0f, -6.0f, YAW_0}, {1, 0.0f, 0.0f, -6.0f, YAW_0}, {1, 4.0f, 0.0f, -6.0f, YAW_0},
-    /* south wall (z=+6) */
-    {1, -4.0f, 0.0f, 6.0f, YAW_180}, {1, 0.0f, 0.0f, 6.0f, YAW_180}, {1, 4.0f, 0.0f, 6.0f, YAW_180},
-    /* west wall (x=-6), running along z */
-    {1, -6.0f, 0.0f, -4.0f, YAW_90}, {1, -6.0f, 0.0f, 0.0f, YAW_90}, {1, -6.0f, 0.0f, 4.0f, YAW_90},
-    /* east wall (x=+6) */
-    {1, 6.0f, 0.0f, -4.0f, YAW_270}, {1, 6.0f, 0.0f, 0.0f, YAW_270}, {1, 6.0f, 0.0f, 4.0f, YAW_270},
-    /* corners */
-    {2, -6.0f, 0.0f, -6.0f, YAW_0},   {2, 6.0f, 0.0f, -6.0f, YAW_90},
-    {2, 6.0f, 0.0f, 6.0f, YAW_180},   {2, -6.0f, 0.0f, 6.0f, YAW_270},
-    /* pillars */
-    {3, -3.0f, 0.0f, -3.0f, YAW_0}, {3, 3.0f, 0.0f, -3.0f, YAW_0},
-    {3, -3.0f, 0.0f, 3.0f, YAW_0},  {3, 3.0f, 0.0f, 3.0f, YAW_0},
-    /* table + chairs + couch + lamp */
-    {4, 0.0f, 0.0f, 1.0f, YAW_0},
-    {5, -1.8f, 0.0f, 1.0f, YAW_90}, {5, 1.8f, 0.0f, 1.0f, YAW_270}, {5, 0.0f, 0.0f, -1.0f, YAW_0},
-    {6, 0.0f, 0.0f, 4.3f, YAW_180},
-    {7, 0.0f, 1.0f, 1.0f, YAW_0},
+static const char *const pets_assets[A_COUNT] = {
+    [A_GROUND]         = "assets/md_ground.mua",
+    [A_GROUND_ROCKY]   = "assets/md_ground_rocky.mua",
+    [A_TREE_COMMON_A]  = "assets/md_tree_common_a.mua",
+    [A_TREE_COMMON_B]  = "assets/md_tree_common_b.mua",
+    [A_TREE_COMMON_C]  = "assets/md_tree_common_c.mua",
+    [A_PINE_A]         = "assets/md_pine_a.mua",
+    [A_PINE_B]         = "assets/md_pine_b.mua",
+    [A_TREE_TWISTED_A] = "assets/md_tree_twisted_a.mua",
+    [A_TREE_TWISTED_B] = "assets/md_tree_twisted_b.mua",
+    [A_TREE_BIRCH_A]   = "assets/md_tree_birch_a.mua",
+    [A_TREE_BIRCH_B]   = "assets/md_tree_birch_b.mua",
+    [A_TREE_OAK_A]     = "assets/md_tree_oak_a.mua",
+    [A_TREE_OAK_B]     = "assets/md_tree_oak_b.mua",
+    [A_TREE_BARE_A]    = "assets/md_tree_bare_a.mua",
+    [A_BUSH_A]         = "assets/md_bush_a.mua",
+    [A_BUSH_FLOWERS]   = "assets/md_bush_flowers.mua",
+    [A_BUSH_B]         = "assets/md_bush_b.mua",
+    [A_BUSH_C]         = "assets/md_bush_c.mua",
+    [A_GRASS_TALL]     = "assets/md_grass_tall.mua",
+    [A_GRASS_WISPY]    = "assets/md_grass_wispy.mua",
+    [A_GRASS_B]        = "assets/md_grass_b.mua",
+    [A_GRASS_C]        = "assets/md_grass_c.mua",
+    [A_ROCK_A]         = "assets/md_rock_a.mua",
+    [A_ROCK_B]         = "assets/md_rock_b.mua",
+    [A_ROCK_C]         = "assets/md_rock_c.mua",
+    [A_PEBBLE_A]       = "assets/md_pebble_a.mua",
+    [A_ROCKPATH]       = "assets/md_rockpath.mua",
+    [A_MUSHROOM]       = "assets/md_mushroom.mua",
+    [A_FERN]           = "assets/md_fern.mua",
+    [A_FLOWER_GROUP]   = "assets/md_flower_group.mua",
+    [A_CLOVER]         = "assets/md_clover.mua",
 };
-#define ROOM_PROPS (sizeof(room_props) / sizeof(room_props[0]))
+
+/* Ground tiles and the path that crosses them. The tile is 4x4, so spacing is
+   the tile size: any other number opens seams at the joins. */
+#define MEADOW_TILES      20
+#define MEADOW_TILE_STEP  4.0f
+#define MEADOW_PATH_STEPS 24
+/* Room left for props the game will move; the region is a fixed slot range, so
+   a scene with none still pays for its ceiling and nothing else. */
+#define MEADOW_MOVING     16
+
+/* A species' planting rule. Radial bands rather than a hand-placed list: a
+   couple of thousand props is past the point a table stays readable, and a
+   scatter retunes with one number instead of a text edit. min_gap is the
+   rejection distance against everything planted before it; 0 lets a species
+   overlap, which is what ground cover should do. */
+typedef struct Scatter {
+    uint32_t asset;
+    uint32_t count;
+    float    r_min, r_max; /* annulus around the clearing centre */
+    float    s_min, s_max; /* uniform scale band */
+    float    min_gap;
+} Scatter;
+
+/* Trees and their seedings, then rocks, then bushes, then ground cover. Order
+   is load-bearing: the rejection list is filled as this is walked, so anything
+   that must stand clear of a trunk has to be planted after one. */
+static const Scatter meadow_scatter[] = {
+    /* --- trees: the clearing's wall --------------------------------------- */
+    {A_TREE_COMMON_A, 16, 12.0f, 34.0f, 0.85f, 1.15f, 6.0f},
+    {A_TREE_COMMON_B, 14, 12.0f, 34.0f, 0.85f, 1.15f, 6.0f},
+    {A_TREE_COMMON_C, 14, 12.0f, 34.0f, 0.80f, 1.10f, 6.0f},
+    {A_PINE_A, 20, 14.0f, 36.0f, 0.85f, 1.20f, 5.5f},
+    {A_PINE_B, 20, 14.0f, 36.0f, 0.85f, 1.20f, 5.5f},
+    /* The twisted pair are the 16m ancients: kept large but rare and off centre. */
+    {A_TREE_TWISTED_A, 5, 17.0f, 32.0f, 0.50f, 0.70f, 9.0f},
+    {A_TREE_TWISTED_B, 5, 17.0f, 32.0f, 0.50f, 0.70f, 9.0f},
+    {A_TREE_BIRCH_A, 22, 11.0f, 34.0f, 0.90f, 1.30f, 4.5f},
+    {A_TREE_BIRCH_B, 20, 11.0f, 34.0f, 0.90f, 1.30f, 4.5f},
+    {A_TREE_OAK_A, 18, 12.0f, 34.0f, 0.90f, 1.25f, 5.0f},
+    {A_TREE_OAK_B, 16, 12.0f, 34.0f, 0.90f, 1.25f, 5.0f},
+    {A_TREE_BARE_A, 9, 13.0f, 33.0f, 1.10f, 1.60f, 6.0f},
+    /* --- rocks ------------------------------------------------------------ */
+    {A_ROCK_A, 12, 6.0f, 30.0f, 0.70f, 1.20f, 5.0f},
+    {A_ROCK_B, 12, 6.0f, 30.0f, 0.70f, 1.20f, 5.0f},
+    {A_ROCK_C, 26, 4.0f, 32.0f, 1.20f, 2.40f, 2.5f},
+    /* --- bushes ----------------------------------------------------------- */
+    {A_BUSH_A, 34, 5.0f, 30.0f, 0.80f, 1.30f, 2.5f},
+    {A_BUSH_FLOWERS, 22, 5.0f, 28.0f, 0.80f, 1.30f, 2.5f},
+    {A_BUSH_B, 40, 4.0f, 30.0f, 1.00f, 1.80f, 0.0f},
+    {A_BUSH_C, 34, 4.0f, 30.0f, 1.20f, 2.20f, 0.0f},
+    /* --- ground cover: dense, and free to overlap itself ------------------ */
+    {A_GRASS_TALL, 260, 2.0f, 34.0f, 0.70f, 1.40f, 0.0f},
+    {A_GRASS_WISPY, 220, 2.0f, 34.0f, 0.70f, 1.40f, 0.0f},
+    {A_GRASS_B, 300, 1.5f, 34.0f, 1.40f, 3.00f, 0.0f},
+    {A_GRASS_C, 260, 1.5f, 34.0f, 1.20f, 2.60f, 0.0f},
+    {A_PEBBLE_A, 60, 2.0f, 30.0f, 0.80f, 1.60f, 0.0f},
+    {A_CLOVER, 90, 2.0f, 28.0f, 0.80f, 1.40f, 0.0f},
+    {A_MUSHROOM, 44, 3.0f, 26.0f, 0.90f, 1.60f, 0.0f},
+    {A_FERN, 18, 6.0f, 28.0f, 0.35f, 0.60f, 3.0f},
+    {A_FLOWER_GROUP, 46, 2.0f, 26.0f, 0.80f, 1.30f, 0.0f},
+};
+#define MEADOW_SCATTER_COUNT (sizeof(meadow_scatter) / sizeof(meadow_scatter[0]))
 
 /* Cooked .mua room pieces (see the table above). Node transforms are baked
    into the vertices, so a model is a group of meshes in one space: every mesh
@@ -106,18 +182,74 @@ typedef struct CubePets {
 
 static CubePets g_pets;
 
-/* Cooks every room piece and plants the prop table. Each piece contributes
-   SceneAssetLoad.mesh_count instances per prop — a piece is a group of meshes
-   in one space, not one model — so the instance total is the mesh sum over
-   props.
- *
-   Returns the number of meshes registered, or UINT32_MAX on a hard load
-   failure; the caller has already created the scene with matching capacities
-   and cannot proceed without them. */
+/* Deterministic xorshift. A layout that reshuffles every launch cannot be
+   compared against a screenshot, and this is the whole cost of that property. */
+static uint32_t g_seed = 0x9E3779B9u;
+static float    frand(void) {
+    g_seed ^= g_seed << 13;
+    g_seed ^= g_seed >> 17;
+    g_seed ^= g_seed << 5;
+    return (float)(g_seed >> 8) * (1.0f / 16777216.0f);
+}
+static float frange(float lo, float hi) { return lo + (hi - lo) * frand(); }
+
+/* XZ of everything planted with a min_gap, as flat pairs. A few hundred entries
+   makes the linear scan cheaper than a grid would cost to build and update. */
+#define MEADOW_PLACED_MAX 1024
+static float    g_placed_xz[MEADOW_PLACED_MAX * 2];
+static uint32_t g_placed_count;
+
+static bool meadow_clear(float x, float z, float gap) {
+    if (gap <= 0.0f)
+        return true; /* ground cover is allowed to grow through itself */
+    for (uint32_t i = 0; i < g_placed_count; ++i) {
+        float dx = x - g_placed_xz[i * 2 + 0];
+        float dz = z - g_placed_xz[i * 2 + 1];
+        if (dx * dx + dz * dz < gap * gap)
+            return false;
+    }
+    return true;
+}
+
+static void meadow_record(float x, float z) {
+    if (g_placed_count >= MEADOW_PLACED_MAX)
+        return;
+    g_placed_xz[g_placed_count * 2 + 0] = x;
+    g_placed_xz[g_placed_count * 2 + 1] = z;
+    g_placed_count++;
+}
+
+/* A prop is a group of meshes in one space, so every mesh of the asset gets an
+   instance at the same transform. */
+static void plant(Scene *scene, const SceneAssetLoad *ld, float x, float y, float z, float yaw, float scale) {
+    float             half = yaw * 0.5f;
+    SceneInstanceDesc d    = {.pos = {x, y, z}, .quat = {0.0f, sinf(half), 0.0f, cosf(half)}, .scale = scale};
+    for (uint32_t i = 0; i < ld->mesh_count; ++i) {
+        d.mesh = ld->first_mesh + i;
+        scene_instance_create_static(scene, &d);
+    }
+}
+
+/* The instance total the scene must be created with, derived from the same two
+   tables the builder walks so the capacity and the planting cannot disagree. */
+static uint32_t pets_instance_total(const uint32_t asset_meshes[A_COUNT]) {
+    uint32_t total = MEADOW_TILES * MEADOW_TILES * asset_meshes[A_GROUND];
+    for (uint32_t i = 0; i < MEADOW_SCATTER_COUNT; ++i)
+        total += meadow_scatter[i].count * asset_meshes[meadow_scatter[i].asset];
+    return total + MEADOW_PATH_STEPS * asset_meshes[A_ROCKPATH];
+}
+
+/* Loads the roster, then plants the clearing.
+
+   Each prop contributes SceneAssetLoad.mesh_count instances — a prop is a group
+   of meshes in one space, not one model — so the instance total is a
+   mesh-weighted sum, not a prop count. Returns the meshes registered, or
+   UINT32_MAX on a hard load failure; the caller has already created the scene
+   with matching capacities and cannot proceed without them. */
 static uint32_t pets_build_assets(Scene *scene) {
-    uint32_t total_meshes = 0;
-    SceneAssetLoad loads[ROOM_MODELS];
-    for (uint32_t m = 0; m < ROOM_MODELS; ++m) {
+    uint32_t       total_meshes = 0;
+    SceneAssetLoad loads[A_COUNT];
+    for (uint32_t m = 0; m < A_COUNT; ++m) {
         char err[256];
         if (!scene_asset_load(scene, pets_assets[m], &loads[m], err, sizeof(err))) {
             log_error("[pets] %s: %s", pets_assets[m], err);
@@ -129,21 +261,55 @@ static uint32_t pets_build_assets(Scene *scene) {
         total_meshes += loads[m].mesh_count;
     }
 
-    /* Each room prop plants one instance per mesh of its asset at the prop's
-       transform, yawed about Y. Everything is static: the room doesn't move,
-       so the static region owns it. */
-    for (uint32_t p = 0; p < ROOM_PROPS; ++p) {
-        const RoomProp      *rp = &room_props[p];
-        const SceneAssetLoad *ld = &loads[rp->asset];
-        float half = rp->yaw * 0.5f;
-        for (uint32_t i = 0; i < ld->mesh_count; ++i)
-            scene_instance_create_static(
-                scene, &(SceneInstanceDesc){.pos   = {rp->x, rp->y, rp->z},
-                                            .quat  = {0.0f, sinf(half), 0.0f, cosf(half)},
-                                            .scale = 1.0f,
-                                            .mesh  = ld->first_mesh + i});
+    g_seed         = 0x9E3779B9u;
+    g_placed_count = 0;
+    uint32_t planted = 0;
+
+    /* Ground: one tile per cell at exactly the tile pitch — any other spacing
+       opens seams at the joins. Every fifth cell takes the rocky variant, a
+       deterministic wear pattern so the same tiles are worn every run. */
+    for (uint32_t z = 0; z < MEADOW_TILES; ++z) {
+        for (uint32_t x = 0; x < MEADOW_TILES; ++x) {
+            float    px    = ((float)x - (float)(MEADOW_TILES - 1) * 0.5f) * MEADOW_TILE_STEP;
+            float    pz    = ((float)z - (float)(MEADOW_TILES - 1) * 0.5f) * MEADOW_TILE_STEP;
+            uint32_t asset = ((x * 7u + z * 13u) % 5u == 0u) ? A_GROUND_ROCKY : A_GROUND;
+            plant(scene, &loads[asset], px, 0.0f, pz, 0.0f, 1.0f);
+            planted++;
+        }
     }
-    log_info("[pets] %u meshes registered from %u models, %u props", total_meshes, ROOM_MODELS, ROOM_PROPS);
+
+    /* Species, in table order. Drawing the radius from the band's squared range
+       keeps the density uniform over the annulus instead of piling up middle. */
+    for (uint32_t s = 0; s < MEADOW_SCATTER_COUNT; ++s) {
+        const Scatter        *sp     = &meadow_scatter[s];
+        const SceneAssetLoad *ld     = &loads[sp->asset];
+        uint32_t              placed = 0;
+        for (uint32_t tries = 0; tries < sp->count * 32u && placed < sp->count; ++tries) {
+            float ang = frand() * 6.2831853f;
+            float rad = sqrtf(frange(sp->r_min * sp->r_min, sp->r_max * sp->r_max));
+            float x   = cosf(ang) * rad;
+            float z   = sinf(ang) * rad;
+            if (!meadow_clear(x, z, sp->min_gap))
+                continue;
+            if (sp->min_gap > 0.0f)
+                meadow_record(x, z);
+            plant(scene, ld, x, 0.0f, z, frand() * 6.2831853f, frange(sp->s_min, sp->s_max));
+            planted++;
+            placed++;
+        }
+        if (placed < sp->count)
+            log_info("[pets] %s: placed %u of %u", pets_assets[sp->asset], placed, sp->count);
+    }
+
+    /* A worn path from the spawn into the trees, wobbling as it goes. */
+    for (uint32_t i = 0; i < MEADOW_PATH_STEPS; ++i) {
+        float t = (float)i / (float)(MEADOW_PATH_STEPS - 1u);
+        plant(scene, &loads[A_ROCKPATH], sinf(t * 5.0f) * 1.4f, 0.02f, 8.0f - t * 36.0f, t * 3.0f,
+              frange(0.9f, 1.15f));
+        planted++;
+    }
+
+    log_info("[pets] %u meshes registered, %u props planted", total_meshes, planted);
     return total_meshes;
 }
 
@@ -152,11 +318,13 @@ static void pets_start(void *user, Renderer *renderer) {
     p->vk         = renderer_vk(renderer);
     p->renderer   = renderer; /* TEMP */
     p->dist       = 14.0f;
+    /* Standing at the clearing's south edge, looking north across it along the
+       path, so the first frame already frames the thing the scene is for. */
     p->cam.pos[0] = 0.0f;
-    p->cam.pos[1] = 3.2f;
-    p->cam.pos[2] = 8.6f;
-    p->cam.yaw    = 0.0f; /* looking down -Z, into the room */
-    p->cam.pitch  = -0.18f;
+    p->cam.pos[1] = 2.6f;
+    p->cam.pos[2] = 14.0f;
+    p->cam.yaw    = 0.0f;
+    p->cam.pitch  = -0.10f;
     p->cam.speed  = 8.0f;
     glm_vec3_zero(p->cam.forward);
     glm_vec3_zero(p->cam.right);
@@ -301,9 +469,9 @@ static void pets_render(void *user, VkCommandBuffer cmd, RenderTarget *color, Re
            first time somebody adds a prop. */
         /* Capacities from the cooked assets: one instance per mesh of every
            prop, all placed static. */
-        uint32_t asset_meshes[ROOM_MODELS] = {0};
-        uint32_t max_meshes = 0, max_lod_rows = 0, max_materials = 0, total = 0;
-        for (uint32_t m = 0; m < ROOM_MODELS; ++m) {
+        uint32_t asset_meshes[A_COUNT] = {0};
+        uint32_t max_meshes = 0, max_materials = 0, max_rungs = 1;
+        for (uint32_t m = 0; m < A_COUNT; ++m) {
             SceneAssetProbe probe;
             char            err[256];
             if (!scene_asset_probe(pets_assets[m], &probe, err, sizeof(err))) {
@@ -311,20 +479,28 @@ static void pets_render(void *user, VkCommandBuffer cmd, RenderTarget *color, Re
                 return;
             }
             max_meshes += probe.mesh_count;
-            max_lod_rows += probe.lod_rows;
             max_materials += probe.material_count;
+            if (probe.max_lod_count > max_rungs)
+                max_rungs = probe.max_lod_count;
             asset_meshes[m] = probe.mesh_count;
         }
-        for (uint32_t p = 0; p < ROOM_PROPS; ++p)
-            total += asset_meshes[room_props[p].asset];
-        uint32_t half = total / 2;
-        Scene   *scene = scene_create(p->vk, &(SceneDesc){.max_instances    = total,
-                                                         .dynamic_capacity = half,
-                                                         .static_capacity  = total - half,
+        /* A mesh is charged the scene-wide rung count, not its own, because a
+           group id is mesh * lod_count + lod. So a roster that mixes a 1-rung
+           tile with a 2-rung tree needs max_meshes * 2 rows, not the sum of the
+           assets' own ladders — sizing it from the sum runs out mid-roster. */
+        uint32_t max_lod_rows = max_meshes * max_rungs;
+        uint32_t total = pets_instance_total(asset_meshes);
+        /* Everything here is static, so the static region holds the whole
+           clearing and the dynamic region is only the reserve: the split is
+           what makes the per-frame upload touch nothing at all. */
+        uint32_t slots = total + MEADOW_MOVING;
+        Scene   *scene = scene_create(p->vk, &(SceneDesc){.max_instances    = slots,
+                                                         .dynamic_capacity = MEADOW_MOVING,
+                                                         .static_capacity  = total,
                                                          .max_meshes       = max_meshes,
                                                          .max_lod_rows     = max_lod_rows,
                                                          .max_materials    = max_materials ? max_materials : 4,
-                                                         .max_survivors    = total});
+                                                         .max_survivors    = slots});
         if (!scene)
             return;
         if (pets_build_assets(scene) == UINT32_MAX) {
@@ -336,7 +512,6 @@ static void pets_render(void *user, VkCommandBuffer cmd, RenderTarget *color, Re
             scene_destroy(scene);
             return;
         }
-        scene_set_sun(scene, (const float[3]){0.4f, 0.8f, 0.3f}, 0.18f);
         p->scene = scene;
         log_info("[pets] scene live: %u instances, %u meshes, %u rungs, %u groups", total, max_meshes,
                  scene_lod_count(scene), max_meshes * scene_lod_count(scene));
@@ -409,8 +584,8 @@ static void pets_render(void *user, VkCommandBuffer cmd, RenderTarget *color, Re
     {
         bool       capture_take_screenshot(void *renderer, const char *path);
         static int shot = 0;
-        if (++shot == 180)
-            capture_take_screenshot(p->renderer, "/tmp/kilo/cubepets_shot.png");
+        if (++shot == 18)
+            capture_take_screenshot(p->renderer, "shot.png");
     }
 
     scene_frame(p->scene, cmd, color, depth);

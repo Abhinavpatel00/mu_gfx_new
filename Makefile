@@ -45,6 +45,9 @@ SRC_C := main.c vk.c ext.c renderer.c src/nuklear.c src/input.c \
          src/two_d/picture.c \
          src/three_d/scene.c \
          src/three_d/scene_asset.c \
+         src/game/level.c \
+         src/game/rig.c \
+         src/game/sim.c \
          muasset/muasset.c \
 
 

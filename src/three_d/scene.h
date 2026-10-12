@@ -118,7 +118,6 @@ extern const SceneInstanceDesc kSceneInstanceIdentity; /* zero-filled */
 bool scene_upload_scene(Scene *s, VkCommandBuffer cmd);
 
 void scene_view_set(Scene *s, uint32_t view, const SceneViewDesc *view_desc);
-void scene_set_sun(Scene *s, const float dir[3], float ambient);
 void scene_set_clear(Scene *s, const float rgba[4]);
 
 /* Record one frame: dirty upload, cull, compact, draw. Opens and closes its own
@@ -202,6 +201,13 @@ typedef struct EffectsTable{
 
 
 bool scene_asset_probe(const char *path, SceneAssetProbe *out, char *err, uint32_t err_cap);
+
+/* Mesh names of a cooked model, in registration order, as mesh_count adjacent
+   NUL-terminated strings packed into out. The cooker already stores them, and a
+   model cut into separate rigid parts has no index a caller may hard-code —
+   re-cooking the source can reorder the primitives. Returns the name count, or 0
+   on failure with err filled. Touches only the header and the name section. */
+uint32_t scene_asset_mesh_names(const char *path, char *out, uint32_t cap, char *err, uint32_t err_cap);
 
 /* Staging only: it fills the scene's CPU tables and must be followed by
    scene_upload_scene before the first frame. On failure nothing is added. */

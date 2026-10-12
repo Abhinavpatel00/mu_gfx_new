@@ -150,38 +150,48 @@ void cs_main(uint3 id : SV_DispatchThreadID)
     color = src.Load(int3(pix, 0)).rgb;
   }
 
-  /* Bloom is added in linear HDR, before exposure and the tonemap, so it
-     rolls off with the rest of the highlights instead of clipping. */
-  if (push.bloom_strength > 0.0 && push.bloom_texture_id != 0xFFFFFFFFu)
-    color += textures[push.bloom_texture_id].SampleLevel(smp, uv, 0).rgb * push.bloom_strength;
-
-  /* Ambient occlusion attenuates the indirect term, applied in linear HDR
-     before exposure so it scales correctly with the scene radiance. */
+  /* Ambient occlusion attenuates the scene color in linear HDR, before the
+     bloom is added: an occluded crevice should not still bloom at full
+     strength. The AO target is half resolution, so this is a 3x3 gather around
+     the nearest coarse texel, weighted by the full-res depth under each tap —
+     that is the denoise, and it keeps AO from bleeding across a silhouette. */
   if (has_flag(push.flags, FLAG_SSAO) && push.ssao_strength > 0.0 && push.ssao_texture_id != 0xFFFFFFFFu)
   {
     Texture2D depth = textures[push.depth_texture_id];
     float center_depth = depth.Load(int3(pix, 0)).r;
-    uint ao_width, ao_height;
-    textures[push.ssao_texture_id].GetDimensions(ao_width, ao_height);
-    float2 ao_position = uv * float2(ao_width, ao_height) - 0.5;
-    int2 ao_base = int2(floor(ao_position));
-    float ao_sum = 0.0;
-    float ao_weight_sum = 0.0;
-    for (int y = 0; y <= 1; ++y)
+    if (center_depth > 1e-4)
     {
-      for (int x = 0; x <= 1; ++x)
+      uint ao_width, ao_height;
+      textures[push.ssao_texture_id].GetDimensions(ao_width, ao_height);
+      int2 ao_c = int2(floor(uv * float2(ao_width, ao_height)));
+      int2 ao_max = int2(int(ao_width) - 1, int(ao_height) - 1);
+      int2 dscale = max(int2(1, 1), int2(int(push.width) / max(int(ao_width), 1),
+                                        int(push.height) / max(int(ao_height), 1)));
+      int2 dmax = int2(int(push.width) - 1, int(push.height) - 1);
+      float ao_sum = 0.0;
+      float ao_weight_sum = 0.0;
+      for (int y = -1; y <= 1; ++y)
       {
-        int2 ao_pix = clamp(ao_base + int2(x, y), int2(0, 0), int2(int(ao_width) - 1, int(ao_height) - 1));
-        float sample_depth = depth.Load(int3(ao_pix * 2 + int2(0, 0), 0)).r;
-        float depth_delta = abs(sample_depth - center_depth) / max(center_depth, 1e-4);
-        float weight = exp(-depth_delta * 32.0);
-        ao_sum += textures[push.ssao_texture_id].Load(int3(ao_pix, 0)).r * weight;
-        ao_weight_sum += weight;
+        for (int x = -1; x <= 1; ++x)
+        {
+          int2 tap = clamp(ao_c + int2(x, y), int2(0, 0), ao_max);
+          int2 tap_depth = clamp((tap + int2(1, 1)) * dscale, int2(0, 0), dmax);
+          float sample_depth = depth.Load(int3(tap_depth, 0)).r;
+          float depth_delta = abs(sample_depth - center_depth) / max(center_depth, 1e-4);
+          float weight = exp(-depth_delta * 32.0);
+          ao_sum += textures[push.ssao_texture_id].Load(int3(tap, 0)).r * weight;
+          ao_weight_sum += weight;
+        }
       }
+      float ao = ao_weight_sum > 1e-4 ? ao_sum / ao_weight_sum : 1.0;
+      color *= lerp(1.0, ao, push.ssao_strength);
     }
-    float ao = ao_weight_sum > 1e-4 ? ao_sum / ao_weight_sum : 1.0;
-    color *= lerp(1.0, ao, push.ssao_strength);
   }
+
+  /* Bloom is added in linear HDR, before exposure and the tonemap, so it
+     rolls off with the rest of the highlights instead of clipping. */
+  if (push.bloom_strength > 0.0 && push.bloom_texture_id != 0xFFFFFFFFu)
+    color += textures[push.bloom_texture_id].SampleLevel(smp, uv, 0).rgb * push.bloom_strength;
 
   if (has_flag(push.flags, FLAG_EXPOSURE))
     color *= exp2(push.exposure);
