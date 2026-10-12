@@ -1164,8 +1164,13 @@ Renderer *renderer_create(bool use_wayland, GameHooks game) {
         .width            = 1362,
         .height           = 749,
 
+        /* UNORM on purpose. The post pass applies the display gamma itself, and
+           an sRGB swapchain would encode a second time on every write into it —
+           a mid grey arrives near white and the whole image reads washed out.
+           post_pass also clears FLAG_GAMMA when it does get an sRGB surface, so
+           the encode happens exactly once either way. */
         .swapchain_preferred_color_space = VK_COLORSPACE_SRGB_NONLINEAR_KHR,
-        .swapchain_preferred_format      = VK_FORMAT_B8G8R8A8_SRGB,
+        .swapchain_preferred_format      = VK_FORMAT_B8G8R8A8_UNORM,
         .swapchain_extra_usage_flags =
             VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
         .vsync               = false,
@@ -1420,8 +1425,6 @@ static void update_global_data(Renderer *r) {
     glm_mat4_inv(r->cam_viewproj, data.inv_viewproj);
     glm_mat4_copy(r->cam_prev_viewproj, data.prev_viewproj);
 
-    r->dt = (float)((double)r->cpu_frame_ns / 1000000000.0);
-
     data.time             = (float)((double)(mu_time_now() - r->start_time) / mu_time_freq());
     data.delta_time       = r->dt;
     data.frame_count      = r->frame_count++;
@@ -1464,25 +1467,6 @@ static void update_global_data(Renderer *r) {
         .pBufferInfo     = &info,
     };
     vkUpdateDescriptorSets(r->vk.devc.device, 1, &write, 0, NULL);
-}
-
-/* The app sets the camera from its render hook, which runs after
-   update_global_data, so the matrices it wrote are a frame old by then. Copy
-   them into this frame's UBO once the scene pass has recorded, so every pass
-   that reprojects reads the camera that produced the depth it reads. A
-   frame-late camera never lands history back on itself, and SSAO smears
-   permanently instead of converging. Only the mapping changes: the descriptor
-   already points at this frame's buffer. */
-static void write_global_camera(Renderer *r) {
-    GlobalData *gd = (GlobalData *)r->global_ubo[r->vk.current_frame].mapping;
-    glm_mat4_copy(r->cam_view, gd->view);
-    glm_mat4_copy(r->cam_proj, gd->projection);
-    glm_mat4_copy(r->cam_viewproj, gd->viewproj);
-    glm_mat4_copy(r->cam_inv_view, gd->inv_view);
-    glm_mat4_inv(r->cam_proj, gd->inv_projection);
-    glm_mat4_inv(r->cam_viewproj, gd->inv_viewproj);
-    glm_mat4_copy(r->cam_prev_viewproj, gd->prev_viewproj);
-    vmaFlushAllocation(r->vk.devc.vmaallocator, r->global_ubo[r->vk.current_frame].allocation, 0, sizeof(*gd));
 }
 
 /* Field order is the shader's: both sides are flat scalars, so the layouts
@@ -1598,6 +1582,12 @@ static void pass_ssao(Renderer *r, VkCommandBuffer cmd) {
     end_pass(&r->vk, cmd, &pd);
 }
 
+/* An sRGB swapchain encodes on every write into it, including the blit that
+   lands the final image. The post pass must not have encoded first. */
+static bool swapchain_encodes_srgb(const Renderer *r) {
+    return r->vk.swapchain.format == VK_FORMAT_B8G8R8A8_SRGB || r->vk.swapchain.format == VK_FORMAT_R8G8B8A8_SRGB;
+}
+
 static void post_pass(Renderer *r, VkCommandBuffer cmd) {
     uint32_t image = r->vk.swapchain.current_image;
 
@@ -1644,7 +1634,8 @@ static void post_pass(Renderer *r, VkCommandBuffer cmd) {
             .height              = r->vk.swapchain.extent.height,
             .frame               = r->frame_count,
             .exposure            = s->exposure,
-            .flags               = s->flags,
+            /* Own the gamma or leave it to the swapchain, never both. */
+            .flags               = swapchain_encodes_srgb(r) ? (s->flags & ~POST_GAMMA) : s->flags,
             .tonemap_mode        = s->tonemap_mode,
             .gamma_value         = s->gamma,
             .contrast            = s->contrast,
@@ -2035,11 +2026,11 @@ RenderEnvironment renderer_environment_default(void) {
            fill, and it leaves the tonemap headroom for the sun to clip into. */
         .sun_intensity  = 1.70f,
         .ambient        = 0.24f,
-        /* A camera near the horizon only samples the bottom of the gradient, so
-           this exponent, not the zenith colour, is what the sky actually shows.
-           Low enough that the gradient climbs to the zenith well inside the
-           visible slice, which is what puts a gradient on screen at all. */
-        .sky_exponent   = 0.15f,
+        /* Measured, not guessed: this camera's sky covers dir.y 0.55..0.76, and
+           a low exponent maps that whole band to t 0.92..0.96 — a gradient with
+           4% of its range left, which is a flat band. Near 1 the exponent is the
+           plain zenith-to-horizon blend, and the visible slice lands across it. */
+        .sky_exponent   = 1.0f,
         .sun_glow       = 0.22f,
         .sun_glow_power = 24.0f,
     };
@@ -2101,7 +2092,10 @@ bool renderer_frame(Renderer *r) {
 
     if (!frame_start(r))
         return true; // swapchain out-of-date / minimized: nothing to record
-    update_global_data(r);
+
+    /* dt before the frame hook, because the hook reads it off GameFrame and
+       update_global_data no longer runs ahead of the hook. */
+    r->dt = (float)((double)r->cpu_frame_ns / 1000000000.0);
 
     if (r->game.frame) {
         r->hud_count    = 0;
@@ -2115,6 +2109,13 @@ bool renderer_frame(Renderer *r) {
         };
         r->game.frame(r->game.user, &frame);
     }
+
+    /* Published after the frame hook, and that ordering is load-bearing: the
+       hook is what sets the camera, and the sky pass — which records first —
+       builds its view ray from these matrices. Publishing ahead of the hook
+       left the sky one frame behind the geometry, so the gradient slid against
+       the terrain on every camera turn. */
+    update_global_data(r);
 
     VkCommandBuffer cmd        = r->vk.frames[r->vk.current_frame].cmdbuf;
     GpuProfiler    *frame_prof = &r->vk.gpuprofiler[r->vk.current_frame];
@@ -2153,8 +2154,6 @@ bool renderer_frame(Renderer *r) {
             r->game.render(r->game.user, cmd, &r->hdr_color[image], &r->depth[image]);
         }
     }
-
-    write_global_camera(r);
 
     /* Edge-triggered so the windows persist while you drag a slider; a held
        key toggling every frame is what the old local did. */

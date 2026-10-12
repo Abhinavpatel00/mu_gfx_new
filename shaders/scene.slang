@@ -71,7 +71,7 @@ SceneVOut vs_main(uint vid : SV_VertexID, uint iid : SV_InstanceID, uint base_in
     float3 ipos  = float3(inst.pos[0], inst.pos[1], inst.pos[2]);
     float3 world = ipos + quat_rotate(inst.quat, local * s);
 
-    if (pc.counts[5] != 0u && iid == 0u) /* DEBUG: one line per draw */
+    if (pc.counts[5] != 0u && iid == 0u) /* DEBUG: one line per draw, MU_SHADER_DEBUG */
         printf("[VS] base=%u iid=%u slot=%u pos=(%.4f, %.4f, %.4f)\n", base_inst, iid, slot, world.x, world.y, world.z);
 
     SceneVOut o;

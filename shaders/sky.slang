@@ -53,9 +53,6 @@ float4 fs_main(SkyVSOut input) : SV_Target0
   float  tan_h = abs(1.0 / global_data.projection[0][0]);
   float3 dir   = normalize(ndc.x * tan_h * right + ndc.y * tan_v * up + fwd);
 
-  /* PROBE: R = dir.y, G = t. Read with the post flags at 0. */
-  return float4(saturate(dir.y), pow(saturate(dir.y), push.exponent), 0.0, 0.0);
-
   float  t   = pow(saturate(dir.y), push.exponent);
   float3 col = lerp(global_data.env_horizon.rgb, global_data.env_sky.rgb, t);
 
