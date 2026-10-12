@@ -2024,8 +2024,8 @@ RenderEnvironment renderer_environment_default(void) {
         /* The key carries the shape. Ambient this low is what keeps a shadowed
            face reading as the object's own colour rather than as blue-grey
            fill, and it leaves the tonemap headroom for the sun to clip into. */
-        .sun_intensity  = 1.70f,
-        .ambient        = 0.24f,
+        .sun_intensity  = 1.20f,
+        .ambient        = 0.38f,
         /* Measured, not guessed: this camera's sky covers dir.y 0.55..0.76, and
            a low exponent maps that whole band to t 0.92..0.96 — a gradient with
            4% of its range left, which is a flat band. Near 1 the exponent is the

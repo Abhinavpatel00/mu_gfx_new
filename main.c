@@ -499,6 +499,7 @@ static void pets_render(void *user, VkCommandBuffer cmd, RenderTarget *color, Re
                                                          .static_capacity  = total,
                                                          .max_meshes       = max_meshes,
                                                          .max_lod_rows     = max_lod_rows,
+                                                         .lod_count        = max_rungs,
                                                          .max_materials    = max_materials ? max_materials : 4,
                                                          .max_survivors    = slots});
         if (!scene)

@@ -17,6 +17,7 @@ typedef struct SceneDesc {
     uint32_t static_capacity;
     uint32_t max_meshes;
     uint32_t max_lod_rows;
+      uint32_t lod_count; /* fixed scene-wide ladder width; zero keeps legacy growth */
     uint32_t max_materials;
     uint32_t max_survivors; /* candidates-style upper bound on visible entries */
 } SceneDesc;

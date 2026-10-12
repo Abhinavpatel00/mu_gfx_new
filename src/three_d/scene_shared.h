@@ -163,6 +163,7 @@ struct SceneGpuMaterial {
 #define SCENE_MAT_HAS_NORMAL 0x2u
 #define SCENE_MAT_UNLIT      0x4u
 #define SCENE_MAT_HAS_ORM    0x8u
+#define SCENE_MAT_ALPHA_TEST 0x10u
 
 /* ---- push constants. The cull kernel and the draw do not read the same
    tables, so they do not share a push constant: six pre-normalized frustum

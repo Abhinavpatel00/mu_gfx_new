@@ -112,7 +112,10 @@ void cs_main(uint3 id : SV_DispatchThreadID) {
     float3 T = normalize(cross(abs(N.z) < 0.999 ? float3(0.0, 0.0, 1.0) : float3(1.0, 0.0, 0.0), N));
     float3 B = cross(N, T);
 
-    float  ang = Rnd(pix, push.frame) * Pi2;
+    /* Keep the sample pattern stable. A new rotation every frame makes half-
+       resolution AO shimmer, while a per-pixel white-noise rotation remains
+       visible as grain after the low-resolution target is upsampled. */
+    float  ang = 0.0;
     float2 rot = float2(cos(ang), sin(ang));
 
     float occlusion = 0.0;
@@ -123,7 +126,7 @@ void cs_main(uint3 id : SV_DispatchThreadID) {
         /* Lift the disk point onto the hemisphere and jitter its length so the
            samples fill the volume rather than one shell. */
         float  zc     = sqrt(max(0.0, 1.0 - dot(d, d)));
-        float  jitter = 0.35 + 0.65 * Rnd(pix, (push.frame + 1u) * (i + 3u));
+        float  jitter = 1.0;
         float3 dir    = T * d.x + B * d.y + N * zc;
         float3 sPos   = pos + dir * (push.radius * jitter);
 

@@ -8,6 +8,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 COOK=build/muasset_cook
+FORCE_RECOOK=${FORCE_RECOOK:-0}
 
 # Stylized Nature and the Medieval Village path contain spaces and brackets, so
 # every roster element below is a single quoted word split on ':' alone.
@@ -66,7 +67,8 @@ ASSETS=(
 need_cook=0
 for a in "${ASSETS[@]}"; do
   name=${a%%:*}
-  [[ -f "assets/$name.mua" ]] || need_cook=1
+  [[ "$FORCE_RECOOK" == 1 || ! -f "assets/$name.mua" ]] || continue
+  need_cook=1
 done
 if (( need_cook == 0 )); then
   echo "all ${#ASSETS[@]} meadow assets cooked"
@@ -75,7 +77,7 @@ fi
 
 for a in "${ASSETS[@]}"; do
   IFS=: read -r name dir model lods <<<"$a"
-  if [[ -f "assets/$name.mua" ]]; then
+  if [[ "$FORCE_RECOOK" != 1 && -f "assets/$name.mua" ]]; then
     echo "  skip  $name"
     continue
   fi

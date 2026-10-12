@@ -341,7 +341,7 @@ static const cgltf_accessor *attr_of(const cgltf_primitive *prim, cgltf_attribut
 }
 
 static uint32_t batch_of(const cgltf_material *mat) {
-    if (mat && mat->alpha_mode == cgltf_alpha_mode_blend)
+    if (mat && mat->alpha_mode != cgltf_alpha_mode_opaque)
         return MUASSET_BATCH_BLEND;
     if (mat && mat->double_sided)
         return MUASSET_BATCH_DOUBLESIDE;
@@ -463,10 +463,20 @@ static bool bake_texture(const unsigned char *bytes, int len, TexScratch *sc, ui
             for (uint32_t x = 0; x < nw; ++x) {
                 uint32_t x0 = x * 2u, y0 = y * 2u;
                 uint32_t x1 = x0 + 1u < lw ? x0 + 1u : x0, y1 = y0 + 1u < lh ? y0 + 1u : y0;
-                for (uint32_t c = 0; c < 4u; ++c)
-                    dst[(y * nw + x) * 4u + c] =
-                        (uint8_t)((src[(y0 * lw + x0) * 4u + c] + src[(y0 * lw + x1) * 4u + c] +
-                                   src[(y1 * lw + x0) * 4u + c] + src[(y1 * lw + x1) * 4u + c] + 2u) >> 2);
+                const uint32_t samples[4] = {y0 * lw + x0, y0 * lw + x1, y1 * lw + x0, y1 * lw + x1};
+                float          alpha_sum = 0.0f;
+                float          color_sum[3] = {0.0f, 0.0f, 0.0f};
+                for (uint32_t k = 0; k < 4u; ++k) {
+                    const uint8_t *p = src + samples[k] * 4u;
+                    float           a = p[3] * (1.0f / 255.0f);
+                    alpha_sum += a;
+                    for (uint32_t c = 0; c < 3u; ++c)
+                        color_sum[c] += p[c] * a;
+                }
+                uint8_t *out = dst + (y * nw + x) * 4u;
+                out[3]       = (uint8_t)(alpha_sum * 63.75f + 0.5f);
+                for (uint32_t c = 0; c < 3u; ++c)
+                    out[c] = alpha_sum > 1e-6f ? (uint8_t)(color_sum[c] / alpha_sum + 0.5f) : 0u;
             }
         if (!buf_append(payload, dst, dst_n))
             return false;

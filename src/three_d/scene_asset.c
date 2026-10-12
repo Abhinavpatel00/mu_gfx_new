@@ -320,6 +320,8 @@ bool scene_asset_load(Scene *s, const char *path, SceneAssetLoad *out, char *err
                                   .orm_texture   = blob.materials[m->material].orm_texture != 0xFFFFFFFFu && tex_ids
                                                        ? tex_ids[blob.materials[m->material].orm_texture]
                                                        : 0xFFFFFFFFu};
+        if (m->batch == MUASSET_BATCH_BLEND)
+            row.flags |= SCENE_MAT_ALPHA_TEST;
         if (mat_map[m->material] == UINT32_MAX) {
             uint32_t id = scene_material_add(s, &row);
             if (id == UINT32_MAX) {

@@ -117,10 +117,18 @@ float4 fs_main(SceneVOut i) : SV_Target0
     /* glTF's baseColorFactor is a linear multiplier, and the base color texture
        is uploaded as an sRGB VkFormat so the sampler decodes it. Neither needs a
        gamma conversion here. */
-    float3 albedo = float3(m.base_color & 255u, (m.base_color >> 8) & 255u, (m.base_color >> 16) & 255u) *
-                    (1.0f / 255.0f);
+    float4 base = float4(m.base_color & 255u, (m.base_color >> 8) & 255u, (m.base_color >> 16) & 255u,
+                         (m.base_color >> 24) & 255u) * (1.0f / 255.0f);
+    float3 albedo = base.rgb;
+    float alpha = base.a;
     if ((m.flags & SCENE_MAT_HAS_ALBEDO) != 0u)
-        albedo *= textures[NonUniformResourceIndex(m.texture)].Sample(samplers[SCENE_SAMPLER], i.uv).rgb;
+    {
+        float4 texel = textures[NonUniformResourceIndex(m.texture)].Sample(samplers[SCENE_SAMPLER], i.uv);
+        albedo *= texel.rgb;
+        alpha *= texel.a;
+    }
+    if ((m.flags & SCENE_MAT_ALPHA_TEST) != 0u && alpha < 0.5f)
+        discard;
 
     if ((m.flags & SCENE_MAT_UNLIT) != 0u)
         return float4(albedo, i.bloom);

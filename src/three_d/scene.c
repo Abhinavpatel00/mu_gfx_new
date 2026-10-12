@@ -244,6 +244,7 @@ Scene *scene_create(VkBackend *vk, const SceneDesc *desc) {
     s->max_instances = desc->max_instances ? desc->max_instances : 4096;
     s->max_meshes    = desc->max_meshes ? desc->max_meshes : 64;
     s->max_lod_rows  = desc->max_lod_rows ? desc->max_lod_rows : 64;
+    s->lod_count     = desc->lod_count ? desc->lod_count : 1;
     s->max_materials = desc->max_materials ? desc->max_materials : 64;
     s->max_survivors = desc->max_survivors ? desc->max_survivors : s->max_instances;
 
