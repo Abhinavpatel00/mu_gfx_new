@@ -1207,7 +1207,6 @@ void scene_frame(Scene *s, VkCommandBuffer cmd, RenderTarget *color, RenderTarge
             .pipeline        = s->cs_cull,
         };
 
-
         begin_pass(vk, cmd, &cull_pass);
         dispatch_indirect(vk, cmd, (ByteSpan){&cp_push, (uint32_t)sizeof(cp_push)}, vf->cull_args);
         end_pass(vk, cmd, &cull_pass);

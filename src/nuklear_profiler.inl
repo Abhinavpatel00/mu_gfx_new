@@ -179,23 +179,25 @@ static void render_gpu_profiler_ui(Renderer *r) {
 }
 
 /* Lines the game queued through renderer_hud() this frame. */
-static void render_game_ui(Renderer *r) {
-    if (r->hud_count == 0)
-        return;
-
-    struct nk_context *ctx = &r->ui.context;
-    float              h   = 34.0f + 22.0f * (float)r->hud_count;
-    if (!nk_begin(ctx, "Game", nk_rect(10.0f, 340.0f, 420.0f, h),
-                  NK_WINDOW_BORDER | NK_WINDOW_MOVABLE | NK_WINDOW_NO_SCROLLBAR)) {
-        nk_end(ctx);
-        return;
-    }
-    nk_layout_row_dynamic(ctx, 22, 1);
-    for (uint32_t i = 0; i < r->hud_count; i++)
-        nk_label(ctx, r->hud_text[i], NK_TEXT_LEFT);
-    nk_end(ctx);
+static void render_game_ui(Renderer *r)
+{
+if (r->hud_count == 0)
+return;
+struct nk_context *ctx = &r->ui.context;
+float h = 34.0f + 22.0f * (float)r->hud_count;
+if (!nk_begin(ctx, "Game",
+nk_rect(10.0f, 10.0f, 420.0f, h),
+NK_WINDOW_BORDER |
+NK_WINDOW_NO_SCROLLBAR |
+NK_WINDOW_NO_INPUT)) {
+nk_end(ctx);
+return;
 }
-
+nk_layout_row_dynamic(ctx, 22.0f, 1);
+for (uint32_t i = 0; i < r->hud_count; i++)
+nk_label(ctx, r->hud_text[i], NK_TEXT_LEFT);
+nk_end(ctx);
+}
 /* Live color-grade controls. Every slider writes the same PostSettings the
    post pass reads, so tweaks land on the next frame with no rebuild. */
 static void render_grade_ui(Renderer *r) {
@@ -259,6 +261,19 @@ static void render_grade_ui(Renderer *r) {
     nk_property_float(ctx, "Sepia", 0.0f, &s->sepia, 1.0f, 0.01f, 0.01f);
     nk_property_float(ctx, "Dither", 0.0f, &s->dither, 2.0f, 0.01f, 0.01f);
     nk_property_float(ctx, "LUT strength", 0.0f, &s->lut_strength, 1.0f, 0.01f, 0.01f);
+    nk_layout_row_dynamic(ctx, 22, 1);
+    nk_label(ctx, "LUT file (.cube / strip .png)", NK_TEXT_LEFT);
+    nk_layout_row_dynamic(ctx, 24, 1);
+    nk_edit_string_zero_terminated(ctx, NK_EDIT_FIELD, s->lut_path, (int)sizeof(s->lut_path), nk_filter_default);
+    nk_layout_row_dynamic(ctx, 24, 2);
+    if (nk_button_label(ctx, "Load LUT"))
+        renderer_lut_load(r, s->lut_path);
+    if (nk_button_label(ctx, "Identity LUT")) {
+        s->lut_path[0] = '\0';
+        delete_queue_defer(&r->vk, r->vk.timeline_last_submitted + 1, deferred_destroy_texture,
+                           (void *)(uintptr_t)r->lut_texture);
+        create_identity_lut(r);
+    }
 
     nk_layout_row_dynamic(ctx, 26, 3);
     if (nk_button_label(ctx, "Save"))

@@ -1,7 +1,7 @@
 #include "vk.h"
 #include "external/mu/mu/mu_perf.h"
 #include <vulkan/vulkan_core.h>
-
+#define u32 uint32_t
 static bool is_instance_extension_supported(const char *extension_name) {
     uint32_t extensionCount = 0;
     vkEnumerateInstanceExtensionProperties(NULL, &extensionCount, NULL);

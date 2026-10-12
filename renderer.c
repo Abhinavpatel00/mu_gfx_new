@@ -90,6 +90,8 @@ typedef struct NuklearUi {
 #define POST_LIFT_GAIN     (1u << 12)
 #define POST_SSAO          (1u << 13)
 
+#define LUT_PATH_CHARS 512
+#define LUT_MAX_SIZE   64u
 typedef struct PostSettings {
     uint32_t flags;
     uint32_t tonemap_mode; /* 0 neutral 1 aces 2 reinhard 3 reinhard2 4 filmic 5 uncharted2 6 unreal */
@@ -115,6 +117,7 @@ typedef struct PostSettings {
     float    bloom_radius; /* upsample spread in destination texels */
     float    ssao_strength;
     bool     toon; /* cel-shade the scene instead of the PBR pipeline */
+    char     lut_path[LUT_PATH_CHARS]; /* .cube or strip .png; empty = identity */
 } PostSettings;
 
 /* The Slime-Rancher-ish starting point: bright, saturated, soft highlights.
@@ -180,6 +183,7 @@ static void post_settings_save(const PostSettings *s) {
             "  \"lift\": [%.6g, %.6g, %.6g],\n"
             "  \"gain\": [%.6g, %.6g, %.6g],\n"
             "  \"lut_strength\": %.6g,\n"
+            "  \"lut_path\": \"%s\",\n"
             "  \"bloom_strength\": %.6g,\n"
             "  \"bloom_threshold\": %.6g,\n"
             "  \"bloom_knee\": %.6g,\n"
@@ -189,7 +193,8 @@ static void post_settings_save(const PostSettings *s) {
             "}\n",
             s->flags, s->tonemap_mode, s->exposure, s->gamma, s->contrast, s->saturation, s->temperature, s->tint,
             s->vignette, s->vignette_smoothness, s->sharpen, s->ca, s->grain, s->sepia, s->dither, s->lift[0],
-            s->lift[1], s->lift[2], s->gain[0], s->gain[1], s->gain[2], s->lut_strength, s->bloom_strength,
+            s->lift[1], s->lift[2], s->gain[0], s->gain[1], s->gain[2], s->lut_strength, s->lut_path,
+            s->bloom_strength,
             s->bloom_threshold, s->bloom_knee, s->bloom_radius, s->ssao_strength, s->toon ? "true" : "false");
     fclose(f);
 }
@@ -207,6 +212,19 @@ static float json_prim_float(const char *js, const jsmntok_t *t) {
 static bool json_tok_eq(const char *js, const jsmntok_t *t, const char *key) {
     size_t klen = strlen(key);
     return (size_t)(t->end - t->start) == klen && memcmp(js + t->start, key, klen) == 0;
+}
+
+/* Copy a JSON string token into a fixed buffer, always NUL-terminated. */
+static void json_prim_string(const char *js, const jsmntok_t *t, char *out, size_t out_cap) {
+    if (!out_cap)
+        return;
+    int len = t->end - t->start;
+    if (len < 0)
+        len = 0;
+    if ((size_t)len >= out_cap)
+        len = (int)out_cap - 1;
+    memcpy(out, js + t->start, (size_t)len);
+    out[len] = '\0';
 }
 
 static void post_settings_load(PostSettings *s) {
@@ -275,7 +293,12 @@ static void post_settings_load(PostSettings *s) {
             s->dither = json_prim_float(js, v);
         else if (json_tok_eq(js, k, "lut_strength"))
             s->lut_strength = json_prim_float(js, v);
-        else if (json_tok_eq(js, k, "bloom_strength"))
+        else if (json_tok_eq(js, k, "lut_path")) {
+            if (v->type == JSMN_STRING)
+                json_prim_string(js, v, s->lut_path, sizeof(s->lut_path));
+            else
+                s->lut_path[0] = '\0';
+        } else if (json_tok_eq(js, k, "bloom_strength"))
             s->bloom_strength = json_prim_float(js, v);
         else if (json_tok_eq(js, k, "bloom_threshold"))
             s->bloom_threshold = json_prim_float(js, v);
@@ -740,6 +763,208 @@ static void capture_record(Renderer *r, VkCommandBuffer cmd) {
 }
 #include "src/nuklear_renderer.inl"
 
+/* LUT loading: .cube files and pre-flattened strip PNGs, both landing in the
+   strip layout sample_lut() expects (W=N*N, H=N, blue-major, R8G8B8A8).
+   Pure C on purpose: external/lut/lut.hpp is C++ with exceptions and streams,
+   which the project rule keeps out of engine code. */
+
+/* Deferred texture destroy through the submission timeline, same policy as the
+   pipeline hot-reload path: in-flight frames may still sample the old LUT. */
+static void deferred_destroy_texture(VkBackend *r, void *user) {
+    destroy_texture(r, (TextureID)(uintptr_t)user);
+}
+
+/* Swap the live LUT for new strip pixels. Same N re-uploads in place (no
+   bindless churn); a new N recreates and retires the old texture on the
+   timeline. Upload failure leaves the previous LUT live. */
+static bool lut_swap_pixels(Renderer *r, uint32_t n, const uint8_t *px, const char *path) {
+    uint32_t w = n * n;
+    if (n == r->lut_size) {
+        if (!texture_upload(&r->vk, r->lut_texture, 0, 0, (VkOffset3D){0, 0, 0}, (VkExtent3D){w, n, 1},
+                            (ByteSpan){(void *)px, (uint32_t)((size_t)w * n * 4u)})) {
+            fprintf(stderr, "[lut] %s: re-upload failed, keeping previous LUT\n", path);
+            return false;
+        }
+        return true;
+    }
+    TextureCreateDesc desc = {.width     = w,
+                              .height    = n,
+                              .mip_count = 1,
+                              .format    = VK_FORMAT_R8G8B8A8_UNORM,
+                              .usage     = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT};
+    TextureID         fresh = create_texture(&r->vk, &desc);
+    if (fresh == UINT32_MAX) {
+        fprintf(stderr, "[lut] %s: texture create failed, keeping previous LUT\n", path);
+        return false;
+    }
+    if (!texture_upload(&r->vk, fresh, 0, 0, (VkOffset3D){0, 0, 0}, (VkExtent3D){w, n, 1},
+                        (ByteSpan){(void *)px, (uint32_t)((size_t)w * n * 4u)})) {
+        fprintf(stderr, "[lut] %s: upload failed, keeping previous LUT\n", path);
+        destroy_texture(&r->vk, fresh);
+        return false;
+    }
+    TextureID old    = r->lut_texture;
+    r->lut_texture   = fresh;
+    r->lut_size      = n;
+    delete_queue_defer(&r->vk, r->vk.timeline_last_submitted + 1, deferred_destroy_texture,
+                       (void *)(uintptr_t)old);
+    return true;
+}
+
+static float lut_clamp01(double v) { return (float)(v < 0.0 ? 0.0 : v > 1.0 ? 1.0 : v); }
+
+
+/* A neutral (identity) strip LUT: n x n cells of n x n texels, blue major.
+/* Minimal Adobe .cube reader: LUT_3D_SIZE N followed by N^3 RGB triples in
+   r-fastest order. DOMAIN_MIN/MAX other than 0..1 and LUT_1D_SIZE are rejected
+   rather than silently rescaled. */
+static bool lut_load_cube(Renderer *r, const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        fprintf(stderr, "[lut] %s: cannot open\n", path);
+        return false;
+    }
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (sz <= 0 || sz > (16 << 20)) {
+        fprintf(stderr, "[lut] %s: bad size %ld\n", path, sz);
+        fclose(f);
+        return false;
+    }
+    char *text = (char *)malloc((size_t)sz + 1);
+    if (!text) {
+        fclose(f);
+        return false;
+    }
+    size_t rd = fread(text, 1, (size_t)sz, f);
+    fclose(f);
+    text[rd] = '\0';
+
+    uint32_t n = 0;
+    bool     has_1d = false, domain_ok = true;
+    for (char *line = text;;) {
+        char *nl = strchr(line, '\n');
+        if (nl)
+            *nl = '\0';
+        while (*line == ' ' || *line == '\t')
+            line++;
+        if (strncmp(line, "LUT_3D_SIZE", 11) == 0)
+            n = (uint32_t)strtoul(line + 11, NULL, 10);
+        else if (strncmp(line, "LUT_1D_SIZE", 11) == 0)
+            has_1d = true;
+        else if (strncmp(line, "DOMAIN_MIN", 10) == 0 || strncmp(line, "DOMAIN_MAX", 10) == 0) {
+            const char *p   = strchr(line, ' ');
+            bool        min = line[7] == 'I'; /* DOMAIN_MIN vs DOMAIN_MAX */
+            for (int c = 0; c < 3 && p && domain_ok; ++c) {
+                double v    = strtod(p, (char **)&p);
+                double want = min ? 0.0 : 1.0;
+                if (v < want - 1e-6 || v > want + 1e-6)
+                    domain_ok = false;
+            }
+        }
+        if (!nl)
+            break;
+        line = nl + 1;
+        if (*line == '\0')
+            break;
+    }
+    if (has_1d || n < 2u || n > LUT_MAX_SIZE || !domain_ok) {
+        fprintf(stderr, "[lut] %s: unsupported header (1d=%d N=%u domain=%d)\n", path, (int)has_1d, n,
+                (int)domain_ok);
+        free(text);
+        return false;
+    }
+
+    size_t   count = (size_t)n * n * n;
+    uint8_t *px    = (uint8_t *)malloc(count * 4u);
+    if (!px) {
+        free(text);
+        return false;
+    }
+    size_t idx = 0;
+    bool   ok  = true;
+    for (char *line = text; ok && idx < count;) {
+        char *nl = strchr(line, '\n');
+        if (nl)
+            *nl = '\0';
+        while (*line == ' ' || *line == '\t')
+            line++;
+        if (*line == '#' || *line == '\0' || (*line >= 'A' && *line <= 'Z')) {
+            /* comment, blank, or keyword line */
+        } else {
+            char *p = line, *start = line;
+            double c[3];
+            for (int k = 0; k < 3; ++k) {
+                c[k] = strtod(p, &p);
+                if (p == start && k == 0) {
+                    ok = false;
+                    break;
+                }
+                start = p;
+            }
+            if (ok) {
+                uint32_t rr  = (uint32_t)(idx % n);
+                uint32_t gg  = (uint32_t)((idx / n) % n);
+                uint32_t bb  = (uint32_t)(idx / ((size_t)n * n));
+                uint8_t *dst = px + ((size_t)gg * n * n + bb * n + rr) * 4u;
+                dst[0]       = (uint8_t)(lut_clamp01(c[0]) * 255.0f + 0.5f);
+                dst[1]       = (uint8_t)(lut_clamp01(c[1]) * 255.0f + 0.5f);
+                dst[2]       = (uint8_t)(lut_clamp01(c[2]) * 255.0f + 0.5f);
+                dst[3]       = 255u;
+                idx++;
+            }
+        }
+        if (!nl)
+            break;
+        line = nl + 1;
+        if (*line == '\0' && idx < count)
+            break;
+    }
+    free(text);
+    if (!ok || idx != count) {
+        fprintf(stderr, "[lut] %s: want %zu triples, got %zu\n", path, count, idx);
+        free(px);
+        return false;
+    }
+    bool swapped = lut_swap_pixels(r, n, px, path);
+    free(px);
+    if (swapped)
+        fprintf(stderr, "[lut] %s: cube N=%u\n", path, n);
+    return swapped;
+}
+
+/* Strip PNG: W must equal N*N with H=N. Vendored 289x17 files are N=17. */
+static bool lut_load_png(Renderer *r, const char *path) {
+    int            w, h, c;
+    unsigned char *src = stbi_load(path, &w, &h, &c, 4);
+    if (!src) {
+        fprintf(stderr, "[lut] %s: cannot decode: %s\n", path, stbi_failure_reason());
+        return false;
+    }
+    bool ok = false;
+    if (w > 0 && h > 0 && w == h * h && h <= (int)LUT_MAX_SIZE) {
+        ok = lut_swap_pixels(r, (uint32_t)h, src, path);
+        if (ok)
+            fprintf(stderr, "[lut] %s: strip N=%d\n", path, h);
+    } else {
+        fprintf(stderr, "[lut] %s: strip must be N*N x N, got %dx%d\n", path, w, h);
+    }
+    stbi_image_free(src);
+    return ok;
+}
+
+/* Dispatcher shared by boot (post_settings.json lut_path) and the grade UI. */
+static bool renderer_lut_load(Renderer *r, const char *path) {
+    if (!path || !*path)
+        return false;
+    const char *dot = strrchr(path, '.');
+    if (dot && (strcmp(dot, ".cube") == 0 || strcmp(dot, ".CUBE") == 0))
+        return lut_load_cube(r, path);
+    return lut_load_png(r, path);
+}
+
+
 /* A neutral (identity) strip LUT: n x n cells of n x n texels, blue major.
    Generated so the LUT path is always valid; dropping a real LUT in and setting
    lut_strength is all it takes to use one. */
@@ -1119,6 +1344,8 @@ static void renderer_resources_create(Renderer *r, VkBackendDesc *desc) {
     r->env  = renderer_environment_default();
     post_settings_load(&r->post);
     create_identity_lut(r);
+    if (r->post.lut_path[0])
+        renderer_lut_load(r, r->post.lut_path);
 
     if (r->game.two_d)
         r->two_d = two_d_create(&r->vk, &r->hdr_color[0].format);
