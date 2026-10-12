@@ -7,3 +7,18 @@
 *.rdi
 *.mp4
 .gdb_history
+# large generated / third-party assets: never track
+/assets/
+*.mua
+*.mua.tex
+/data/
+screenshot_*.png
+/shot.png
+*.zip
+*.glb
+*.gltf
+*.obj
+*.fbx
+*.blend
+*.spv
+/niagara/
