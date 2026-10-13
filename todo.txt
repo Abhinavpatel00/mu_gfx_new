@@ -10,3 +10,8 @@
 - experiment with different proc gen techniques
 - experiment with sdf deformable engine
 - in threed engine we will improve perf with time like cmd draw count , occlusion culling ,
+- dof , toon shading with vk_toon shader , 
+
+
+
+ - remove smearing,ghosting from ssao 

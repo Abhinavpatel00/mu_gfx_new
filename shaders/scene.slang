@@ -71,6 +71,19 @@ SceneVOut vs_main(uint vid : SV_VertexID, uint iid : SV_InstanceID, uint base_in
     float3 ipos  = float3(inst.pos[0], inst.pos[1], inst.pos[2]);
     float3 world = ipos + quat_rotate(inst.quat, local * s);
 
+    /* Gel jiggle: displace along the local normal by a per-instance amplitude,
+       phase-shifted per slot so a crowd of slimes does not wobble in lockstep.
+       The height factor keeps the base planted and wobbles the crown most, which
+       is what reads as gel rather than a rigid translate. amp==0 multiplies to a
+       zero offset, so every non-slime instance (the default) is bit-identical to
+       the rigid path with no branch. */
+    float amp = pc.wiggle[slot];
+    if (amp != 0.0f) {
+        float h  = local.y * 0.5f + 0.5f;
+        float ph = global_data.time * 6.0f + float(slot) * 2.399963f;
+        world += quat_rotate(inst.quat, unpack_oct(v.normal_oct)) * (sin(ph) * amp * h);
+    }
+
     if (pc.counts[5] != 0u && iid == 0u) /* DEBUG: one line per draw, MU_SHADER_DEBUG */
         printf("[VS] base=%u iid=%u slot=%u pos=(%.4f, %.4f, %.4f)\n", base_inst, iid, slot, world.x, world.y, world.z);
 
@@ -183,6 +196,14 @@ float4 fs_main(SceneVOut i) : SV_Target0
        that specular half every metal is black, because kd -> 0 and there is no
        other light for it to reflect. */
     float3 ambient = (kd * albedo + f0) * env_ambient(n, ao);
+
+    /* Gel rim: a fresnel edge tinted by the slime's own albedo, so the silhouette
+       glows like wet gel. Gated on the material flag so ordinary props are
+       untouched. */
+    if ((m.flags & SCENE_MAT_GEL) != 0u) {
+        float rim = pow(1.0f - saturate(ndv), 3.0f);
+        direct += albedo * rim * 0.8f;
+    }
 
     /* Linear HDR. Tonemapping and the output gamma live in the post pass now,
        so exposure, bloom and color grading all see the same linear values

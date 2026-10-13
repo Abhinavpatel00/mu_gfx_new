@@ -192,6 +192,14 @@ struct Scene {
     bool        bloom_dirty;
     BufferSlice bloom_table; /* max_instances x float on the GPU */
 
+    /* Wiggle: per-instance VS jiggle amplitude. A parallel table to bloom, but
+       far simpler — no membership set, no dense list. Amplitude is set once at
+       spawn and never changes, so the animation is purely time-driven in the VS
+       and the table is uploaded once (and again only if an amplitude changes). */
+    float      *wiggle_amp;   /* max_instances, 0 = static */
+    bool        wiggle_dirty; /* an amplitude changed; re-upload the table */
+    BufferSlice wiggle_table; /* max_instances x float on the GPU */
+
     /* per view, per frame-in-flight transient tables */
     SceneViewFrame view_frame[SCENE_MAX_VIEWS][MAX_FRAMES_IN_FLIGHT];
     uint32_t       view_count;
@@ -293,6 +301,7 @@ Scene *scene_create(VkBackend *vk, const SceneDesc *desc) {
         b += (uint64_t)s->max_instances * sizeof(struct SceneCullRow) * 2; /* candidate_upload_scratch + cpu_rows */
         b += (uint64_t)s->max_instances * sizeof(uint32_t) * 4;      /* dirty + static_dirty + row_of + bloom_dense */
         b += (uint64_t)s->max_instances * sizeof(float);             /* bloom_strength */
+        b += (uint64_t)s->max_instances * sizeof(float);             /* wiggle_amp */
         b += (uint64_t)s->max_instances * sizeof(uint32_t);          /* compact_dst */
         b += (uint64_t)s->max_meshes * sizeof(struct SceneCullMesh); /* cpu_cull */
         b += (uint64_t)s->max_meshes * SCENE_MAX_LODS * sizeof(struct SceneGroupShade);
@@ -300,7 +309,7 @@ Scene *scene_create(VkBackend *vk, const SceneDesc *desc) {
         b += (uint64_t)s->max_meshes * SCENE_MAX_LODS * sizeof(struct SceneGpuDraw);
         b += (uint64_t)s->max_lod_rows * sizeof(struct SceneLodRow);
         b += (uint64_t)s->max_materials * sizeof(struct SceneGpuMaterial);
-        b += 512; /* alignment slack for the 13 allocations above */
+        b += 512 + 16; /* alignment slack for the allocations above */
         s->arena.base     = malloc((size_t)b);
         s->arena.capacity = (uint32_t)b;
         s->arena.used     = 0;
@@ -338,6 +347,11 @@ Scene *scene_create(VkBackend *vk, const SceneDesc *desc) {
     memset(&s->bloom_bits, 0, sizeof(s->bloom_bits));
     mu_bitset_resize_words(&s->bloom_bits, (s->max_instances + 63u) / 64u);
     s->bloom_table = alloc_slice(s, (VkDeviceSize)s->max_instances * sizeof(float), 16);
+
+    s->wiggle_amp   = mu_arena_alloc(&s->arena, s->max_instances * sizeof(float), 16);
+    s->wiggle_dirty = false;
+    memset(s->wiggle_amp, 0, (size_t)s->max_instances * sizeof(float));
+    s->wiggle_table = alloc_slice(s, (VkDeviceSize)s->max_instances * sizeof(float), 16);
 
     s->cpu_cull = mu_arena_alloc(&s->arena, s->max_meshes * sizeof(struct SceneCullMesh), 16);
     s->cpu_group_shade =
@@ -382,6 +396,7 @@ void scene_destroy(Scene *s) {
     buffer_pool_free(s->materials);
     buffer_pool_free(s->cull_rows);
     buffer_pool_free(s->bloom_table);
+    buffer_pool_free(s->wiggle_table);
     buffer_pool_free(s->group_static);
     buffer_pool_free(s->group_shade);
     buffer_pool_free(s->vertex_arena);
@@ -590,6 +605,26 @@ float scene_instance_bloom(const Scene *s, uint32_t slot) {
     return s->bloom_strength[slot];
 }
 
+/* Per-instance jiggle amplitude. Set once at spawn (before the first upload);
+   the VS displaces the vertex by amp * sin(time*speed + slot*phi) * height.
+   0 keeps the instance rigid, which is the default for every non-slime prop. */
+void scene_set_instance_wiggle(Scene *s, uint32_t slot, float amp) {
+    if (!s || slot >= s->max_instances || !s->cpu_instances[slot].alive)
+        return;
+    if (amp < 0.0f)
+        amp = 0.0f;
+    if (s->wiggle_amp[slot] != amp) {
+        s->wiggle_amp[slot] = amp;
+        s->wiggle_dirty     = true;
+    }
+}
+
+float scene_instance_wiggle(const Scene *s, uint32_t slot) {
+    if (!s || slot >= s->max_instances)
+        return 0.0f;
+    return s->wiggle_amp[slot];
+}
+
 /* Removal is existence, not state: the candidate row goes away, so no hot loop
    ever asks whether this instance is alive. The slot is retired and becomes a
    hole; holes are reclaimed by scene_compact_slots() at load boundaries.
@@ -616,12 +651,14 @@ void scene_instance_destroy(Scene *s, uint32_t slot) {
         uint32_t moved_row      = s->row_of[last_slot];
         s->cpu_instances[slot]  = s->cpu_instances[last_slot];
         s->bloom_strength[slot] = s->bloom_strength[last_slot];
+        s->wiggle_amp[slot]     = s->wiggle_amp[last_slot];
         mu_bitset_set_bit(&s->bloom_bits, slot, mu_bitset_test(&s->bloom_bits, last_slot));
         s->row_of[slot]             = moved_row;
         s->cpu_rows[moved_row].slot = slot;
     }
     memset(&s->cpu_instances[last_slot], 0, sizeof(s->cpu_instances[last_slot]));
     s->bloom_strength[last_slot] = 0.0f;
+    s->wiggle_amp[last_slot]     = 0.0f;
     mu_bitset_reset(&s->bloom_bits, last_slot);
     s->bloom_dirty = true;
     s->instance_count--;
@@ -686,6 +723,7 @@ void scene_compact_slots(Scene *s) {
         if (to != i) {
             s->cpu_instances[to]      = s->cpu_instances[i];
             s->bloom_strength[to]     = s->bloom_strength[i];
+            s->wiggle_amp[to]         = s->wiggle_amp[i];
             s->cpu_instances[i].alive = 0;
             s->row_of[i]              = UINT32_MAX;
         }
@@ -701,10 +739,13 @@ void scene_compact_slots(Scene *s) {
     for (uint32_t i = 0; i < s->max_instances; ++i) {
         if (s->cpu_instances[i].alive && s->bloom_strength[i] > 0.0f)
             mu_bitset_set(&s->bloom_bits, i);
-        else if (!s->cpu_instances[i].alive)
+        else if (!s->cpu_instances[i].alive) {
             s->bloom_strength[i] = 0.0f;
+            s->wiggle_amp[i]     = 0.0f;
+        }
     }
-    s->bloom_dirty = true;
+    s->bloom_dirty  = true;
+    s->wiggle_dirty = true;
 
     s->dynamic_count      = dyn;
     s->static_count       = sta;
@@ -791,6 +832,9 @@ bool scene_upload_scene(Scene *s, VkCommandBuffer cmd) {
                                     (ByteSpan){s->cpu_rows, s->max_instances * sizeof(struct SceneCullRow)});
     renderer_upload_buffer_to_slice(vk, cmd, s->bloom_table,
                                     (ByteSpan){s->bloom_strength, (size_t)s->max_instances * sizeof(float)});
+    renderer_upload_buffer_to_slice(vk, cmd, s->wiggle_table,
+                                    (ByteSpan){s->wiggle_amp, (size_t)s->max_instances * sizeof(float)});
+    s->wiggle_dirty = false;
 
     /* Whole instance table, once. After this the dynamic prefix is rewritten by
        T1 each frame and the static suffix only when a static row actually
@@ -855,6 +899,7 @@ static void ensure_pipelines(Scene *s, RenderTarget *color, RenderTarget *depth)
     cfg.color_attachment_count = 1;
     cfg.color_formats          = &s->color_format;
     cfg.depth_format           = s->depth_format;
+//    cfg.polygon_mode=VK_POLYGON_MODE_LINE ;
     /* reverse-Z: near is 1.0 and the far limit is 0.0, so nearer geometry has
        the greater depth. Any Hi-Z pyramid built from this must MAX-reduce. */
     cfg.depth_compare_op = VK_COMPARE_OP_GREATER;
@@ -988,6 +1033,7 @@ static void build_draw_push(Scene *s, uint32_t view, uint32_t lane, struct Scene
     p->group_shade = slice_addr(vk, s->group_shade);
     p->materials   = slice_addr(vk, s->materials);
     p->bloom       = slice_addr(vk, s->bloom_table);
+    p->wiggle      = slice_addr(vk, s->wiggle_table);
 
     p->counts[5] = getenv("MU_SHADER_DEBUG") ? 1u : 0u;
 }
@@ -1098,6 +1144,14 @@ void scene_frame(Scene *s, VkCommandBuffer cmd, RenderTarget *color, RenderTarge
         renderer_upload_buffer_to_slice(vk, cmd, s->bloom_table,
                                         (ByteSpan){s->bloom_strength, (size_t)s->max_instances * sizeof(float)});
         s->bloom_dirty = false;
+    }
+
+    /* Wiggle amplitudes are set at spawn, but scene_set_instance_wiggle may run
+       after the first upload, so mirror bloom's dirty re-upload here. */
+    if (s->wiggle_dirty) {
+        renderer_upload_buffer_to_slice(vk, cmd, s->wiggle_table,
+                                        (ByteSpan){s->wiggle_amp, (size_t)s->max_instances * sizeof(float)});
+        s->wiggle_dirty = false;
     }
 
     /* Candidates mirror the live slot set; re-upload the prefix whenever the
@@ -1373,7 +1427,7 @@ void scene_frame(Scene *s, VkCommandBuffer cmd, RenderTarget *color, RenderTarge
         PassAttachment dep = {.target = depth, .load = LOAD_CLEAR, .store = STORE_KEEP};
         dep.clear[0]       = 0.0f; /* reverse-Z: the far plane is 0.0 */
 
-        BufferAccess draw_reads[10] = {
+        BufferAccess draw_reads[11] = {
             {.slice  = s->instances,
              .stage  = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT,
              .access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT},
@@ -1402,6 +1456,9 @@ void scene_frame(Scene *s, VkCommandBuffer cmd, RenderTarget *color, RenderTarge
              .stage  = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT,
              .access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT},
             {.slice  = s->bloom_table,
+             .stage  = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT,
+             .access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT},
+            {.slice  = s->wiggle_table,
              .stage  = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT,
              .access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT},
         };

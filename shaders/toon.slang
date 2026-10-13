@@ -141,6 +141,11 @@ float4 fs_main(SceneVOut i) : SV_Target0
        grazing leaf in sky blue and desaturated the whole canopy. */
     float3 rim_light = env_sky_color() * rim * 0.5f;
 
+    /* Gel slimes get a stronger, albedo-tinted fresnel rim on top of the shared
+       sky rim, so they read as wet while ordinary props keep the base look. */
+    if ((m.flags & SCENE_MAT_GEL) != 0u)
+        rim_light += albedo * pow(1.0f - ndv, 3.0f) * 0.8f;
+
     /* Linear HDR: exposure, bloom and the tonemap all happen in post. Alpha
        carries the per-instance bloom strength into the bloom bright-pass. */
     return float4(diffuse + ambient + specular + rim_light, i.bloom);

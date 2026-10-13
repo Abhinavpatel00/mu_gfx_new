@@ -109,6 +109,11 @@ bool scene_instance_alive(const Scene *s, uint32_t slot);
 void  scene_set_instance_bloom(Scene *s, uint32_t slot, float strength);
 float scene_instance_bloom(const Scene *s, uint32_t slot);
 
+/* Per-instance gel-slime jiggle amplitude (world units). 0 = rigid, the default.
+   Set before the first scene_upload_scene, or any time (the table re-uploads). */
+void  scene_set_instance_wiggle(Scene *s, uint32_t slot, float amp);
+float scene_instance_wiggle(const Scene *s, uint32_t slot);
+
 /* Reclaims retired slots. O(instances); call at load time, never per event. */
 void scene_compact_slots(Scene *s);
 

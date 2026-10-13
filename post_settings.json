@@ -1,7 +1,7 @@
 {
   "flags": 12287,
-  "tonemap_mode": 0,
-  "exposure": 0.89,
+  "tonemap_mode": 1,
+  "exposure": 1.27,
   "gamma": 2.2,
   "contrast": 1.02,
   "saturation": 1.14,
@@ -16,12 +16,12 @@
   "dither": 0,
   "lift": [0.09, 0.01, 0.018],
   "gain": [1, 1, 1],
-  "lut_strength": 1,
+  "lut_strength": 0.13,
   "lut_path": "external/lut/CandlelightLUT.png",
   "bloom_strength": 0.47,
   "bloom_threshold": 1.6,
   "bloom_knee": 0.5,
   "bloom_radius": 1,
-  "ssao_strength": 0.55,
+  "ssao_strength": 0.99,
   "toon": false
 }

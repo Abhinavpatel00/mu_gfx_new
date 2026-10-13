@@ -1343,8 +1343,7 @@ static void renderer_resources_create(Renderer *r, VkBackendDesc *desc) {
     r->post = post_settings_cartoon();
     r->env  = renderer_environment_default();
     post_settings_load(&r->post);
-    create_identity_lut(r);
-    if (r->post.lut_path[0])
+    create_identity_lut(r); if (r->post.lut_path[0])
         renderer_lut_load(r, r->post.lut_path);
 
     if (r->game.two_d)

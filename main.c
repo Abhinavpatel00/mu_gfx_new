@@ -313,6 +313,117 @@ static uint32_t pets_build_assets(Scene *scene) {
     return total_meshes;
 }
 
+/* ---- hero gel slime ------------------------------------------------------- */
+/* A procedural squashed UV-sphere carrying a gel material (SCENE_MAT_GEL): the
+   vertex shader jiggles it (scene_set_instance_wiggle) and the fragment shader
+   adds a fresnel rim. No asset and no recook — the geometry and material are
+   built in code and staged exactly like a cooked mesh. It is a dynamic instance
+   that never moves, so the camera (flycam) orbits it and the only per-frame cost
+   is the 20-byte dynamic-prefix rewrite the scene already does. */
+#define SLIME_SEG   24u /* longitude segments */
+#define SLIME_RING  16u /* latitude rings, poles excluded */
+#define SLIME_VERTS (2u + (SLIME_RING - 1u) * SLIME_SEG)
+/* indices: two SEG-triangle caps plus (RING-2) bands of SEG quads (6 each) */
+#define SLIME_INDXS (6u * SLIME_SEG * (SLIME_RING - 1u))
+
+static void slime_pack(struct ScenePackedVertex *out, float x, float y, float z, float u, float v) {
+    float inv = 1.0f / sqrtf(x * x + y * y + z * z);
+    float pos[3] = {x, y, z};
+    float nrm[3] = {x * inv, y * inv, z * inv};
+    float uv[2]  = {u, v};
+    scene_pack_vertex(out, pos, nrm, uv);
+}
+
+/* Stages the slime mesh + gel material and spawns one instance. Returns the
+   instance slot, or UINT32_MAX on failure. Must run before scene_upload_scene. */
+static uint32_t slime_build(Scene *scene) {
+    const float radius = 1.0f, squash = 0.8f;
+
+    static struct ScenePackedVertex verts[SLIME_VERTS];
+    static uint16_t                  idxs[SLIME_INDXS];
+
+    uint32_t n = 0;
+    slime_pack(&verts[n++], 0.0f, radius * squash, 0.0f, 0.5f, 0.0f); /* top pole */
+    for (uint32_t r = 1; r < SLIME_RING; ++r) {
+        float theta = 3.14159265f * (float)r / (float)SLIME_RING;
+        float ry    = cosf(theta) * radius * squash;
+        float rr    = sinf(theta) * radius;
+        for (uint32_t s = 0; s < SLIME_SEG; ++s) {
+            float phi = 6.2831853f * (float)s / (float)SLIME_SEG;
+            slime_pack(&verts[n++], cosf(phi) * rr, ry, sinf(phi) * rr, (float)s / SLIME_SEG,
+                       (float)r / SLIME_RING);
+        }
+    }
+    slime_pack(&verts[n++], 0.0f, -radius * squash, 0.0f, 0.5f, 1.0f); /* bottom pole */
+    uint32_t bottom = SLIME_VERTS - 1u;
+
+    uint32_t k = 0;
+    /* top cap */
+    for (uint32_t s = 0; s < SLIME_SEG; ++s) {
+        idxs[k++] = 0u;
+        idxs[k++] = (uint16_t)(1u + s);
+        idxs[k++] = (uint16_t)(1u + (s + 1u) % SLIME_SEG);
+    }
+    /* middle quads */
+    for (uint32_t r = 1; r + 1u < SLIME_RING; ++r) {
+        uint32_t a0 = 1u + (r - 1u) * SLIME_SEG;
+        uint32_t b0 = 1u + r * SLIME_SEG;
+        for (uint32_t s = 0; s < SLIME_SEG; ++s) {
+            uint32_t sn = (s + 1u) % SLIME_SEG;
+            idxs[k++] = (uint16_t)(a0 + s);
+            idxs[k++] = (uint16_t)(b0 + s);
+            idxs[k++] = (uint16_t)(b0 + sn);
+            idxs[k++] = (uint16_t)(a0 + s);
+            idxs[k++] = (uint16_t)(b0 + sn);
+            idxs[k++] = (uint16_t)(a0 + sn);
+        }
+    }
+    /* bottom cap */
+    {
+        uint32_t ring = 1u + (SLIME_RING - 2u) * SLIME_SEG;
+        for (uint32_t s = 0; s < SLIME_SEG; ++s) {
+            idxs[k++] = (uint16_t)bottom;
+            idxs[k++] = (uint16_t)(ring + (s + 1u) % SLIME_SEG);
+            idxs[k++] = (uint16_t)(ring + s);
+        }
+    }
+
+    struct SceneGpuMaterial mat = {0};
+    mat.base_color     = 240u | (150u << 8) | (190u << 16) | (255u << 24); /* slime pink */
+    mat.texture        = 0xFFFFFFFFu;
+    mat.normal_texture = 0xFFFFFFFFu;
+    mat.orm_texture    = 0xFFFFFFFFu;
+    mat.flags          = SCENE_MAT_GEL;
+    mat.roughness      = 0.25f; /* wet: tight, sharp specular */
+    uint32_t mi = scene_material_add(scene, &mat);
+    if (mi == UINT32_MAX)
+        return UINT32_MAX;
+
+    SceneLodDesc lod = {.first_vertex = 0, .first_index = 0, .index_count = k, .error = 1.0e9f};
+    SceneMeshDesc md = {.vertices     = verts,
+                        .vertex_count = n,
+                        .indices      = idxs,
+                        .index_count  = k,
+                        .lods         = &lod,
+                        .lod_count    = 1,
+                        .local_center = {0.0f, 0.0f, 0.0f},
+                        .local_radius = radius,
+                        .material     = mi};
+    uint32_t mesh = scene_mesh_add(scene, &md);
+    if (mesh == UINT32_MAX)
+        return UINT32_MAX;
+
+    float     scale = 1.7f;
+    uint32_t  slot  = scene_instance_create(scene, &(SceneInstanceDesc){.pos   = {2.5f, 0.8f * scale, 4.0f},
+                                                                       .scale = scale,
+                                                                       .mesh  = mesh});
+    if (slot == UINT32_MAX)
+        return UINT32_MAX;
+    scene_set_instance_wiggle(scene, slot, 0.06f);
+    log_info("[slime] mesh %u material %u instance %u (%u verts %u idx)", mesh, mi, slot, n, k);
+    return slot;
+}
+
 static void pets_start(void *user, Renderer *renderer) {
     CubePets *p   = (CubePets *)user;
     p->vk         = renderer_vk(renderer);
@@ -488,8 +599,19 @@ static void pets_render(void *user, VkCommandBuffer cmd, RenderTarget *color, Re
            group id is mesh * lod_count + lod. So a roster that mixes a 1-rung
            tile with a 2-rung tree needs max_meshes * 2 rows, not the sum of the
            assets' own ladders — sizing it from the sum runs out mid-roster. */
-        uint32_t max_lod_rows = max_meshes * max_rungs;
         uint32_t total = pets_instance_total(asset_meshes);
+        /* +1 mesh and +1 material for the procedural gel slime staged after the
+           cooked assets; mesh and material capacities are fixed at create. The
+           slime is a dynamic instance, so it draws from the MEADOW_MOVING reserve
+           and total (the static count) is unchanged. */
+        max_meshes += 1u;
+        max_materials += 1u;
+        /* A mesh is charged the scene-wide rung count, not its own, because a
+           group id is mesh * lod_count + lod. So a roster that mixes a 1-rung
+           tile with a 2-rung tree needs max_meshes * 2 rows, not the sum of the
+           assets' own ladders — sizing it from the sum runs out mid-roster. The
+           slime mesh is counted here too, so it gets its rungs as well. */
+        uint32_t max_lod_rows = max_meshes * max_rungs;
         /* Everything here is static, so the static region holds the whole
            clearing and the dynamic region is only the reserve: the split is
            what makes the per-frame upload touch nothing at all. */
@@ -508,6 +630,11 @@ static void pets_render(void *user, VkCommandBuffer cmd, RenderTarget *color, Re
             scene_destroy(scene);
             return;
         }
+
+        /* Hero gel slime: one dynamic instance out of the MEADOW_MOVING reserve.
+           Built before the upload so its mesh/material/instance are staged with
+           the rest. */
+        slime_build(scene);
 
         if (!scene_upload_scene(scene, cmd)) {
             scene_destroy(scene);

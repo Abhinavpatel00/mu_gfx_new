@@ -164,6 +164,7 @@ struct SceneGpuMaterial {
 #define SCENE_MAT_UNLIT      0x4u
 #define SCENE_MAT_HAS_ORM    0x8u
 #define SCENE_MAT_ALPHA_TEST 0x10u
+#define SCENE_MAT_GEL       0x20u /* gel slime: VS jiggle + fresnel rim in the FS */
 
 /* ---- push constants. The cull kernel and the draw do not read the same
    tables, so they do not share a push constant: six pre-normalized frustum
@@ -203,6 +204,7 @@ struct SceneDrawPush {
     SCENE_PTR(SceneGroupShade) group_shade;
     SCENE_PTR(SceneGpuMaterial) materials;
     SCENE_PTR(float) bloom;
+    SCENE_PTR(float) wiggle; /* per-instance jiggle amplitude; 0 = static */
     SCENE_U32 counts[8]; /* 5 shader printf */
 };
 
