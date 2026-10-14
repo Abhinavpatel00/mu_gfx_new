@@ -83,4 +83,8 @@ RenderEnvironment renderer_environment(const Renderer *renderer);
    call it once per frame for each line you want. Silently drops overflow. */
 void renderer_hud(Renderer *renderer, const char *fmt, ...);
 
+/* Programmatic screenshot (same path as the R hotkey): writes path on the
+   next presented frame. Handy for scripted verification without key input. */
+bool renderer_screenshot(Renderer *renderer, const char *path);
+
 #endif

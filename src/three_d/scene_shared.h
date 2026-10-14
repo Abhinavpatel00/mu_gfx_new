@@ -165,6 +165,15 @@ struct SceneGpuMaterial {
 #define SCENE_MAT_HAS_ORM    0x8u
 #define SCENE_MAT_ALPHA_TEST 0x10u
 #define SCENE_MAT_GEL       0x20u /* gel slime: VS jiggle + fresnel rim in the FS */
+#define SCENE_MAT_FACE      0x40u /* slime SDF face quad: VS Y-billboards it, FS resolves the face atlas */
+
+/* ---- slime face atlas: one tile per expression, 8x5 grid of 128px tiles ----
+   Placeholder tiles are the Slime Rancher rips in assets/slime_faces/ (mixed
+   64/128/256px sources, resampled to the tile at load). Channel packing follows
+   the article: R = eyes, A = mouth, B = eye whites, G = eye highlights. */
+#define SCENE_FACE_COLS 8u
+#define SCENE_FACE_ROWS 5u
+#define SCENE_FACE_TILE 128u
 
 /* ---- push constants. The cull kernel and the draw do not read the same
    tables, so they do not share a push constant: six pre-normalized frustum
@@ -206,6 +215,7 @@ struct SceneDrawPush {
     SCENE_PTR(float) bloom;
     SCENE_PTR(float) wiggle; /* per-instance jiggle amplitude; 0 = static */
     SCENE_PTR(float) squash; /* per-instance vertical squash; 1 = rest */
+    SCENE_PTR(SCENE_U32) face_id; /* per-instance face atlas tile; read only by FACE quads */
     SCENE_U32 counts[8]; /* 5 shader printf */
 };
 

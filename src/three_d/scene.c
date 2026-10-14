@@ -5,8 +5,13 @@
 
 #include "../../common.h"
 #include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <vulkan/vulkan_core.h>
+
+#include "../../external/stb/stb_image.h"
+#include "../../external/stb/stb_image_resize2.h"
 
 #define MU_ALLOCATORS_IMPLEMENTATION
 #include "../../external/mu/allocators.h"
@@ -207,6 +212,12 @@ struct Scene {
     bool        squash_dirty;
     BufferSlice squash_table; /* max_instances x float on the GPU */
 
+    /* Face: per-instance slime-face atlas tile, same machinery as wiggle.
+       Read only by FACE-material quads. 0 is the default tile. */
+    uint32_t   *face_id;    /* max_instances */
+    bool        face_dirty; /* a tile changed; re-upload the table */
+    BufferSlice face_table; /* max_instances x u32 on the GPU */
+
     /* per view, per frame-in-flight transient tables */
     SceneViewFrame view_frame[SCENE_MAX_VIEWS][MAX_FRAMES_IN_FLIGHT];
     uint32_t       view_count;
@@ -310,6 +321,7 @@ Scene *scene_create(VkBackend *vk, const SceneDesc *desc) {
         b += (uint64_t)s->max_instances * sizeof(float);             /* bloom_strength */
         b += (uint64_t)s->max_instances * sizeof(float);             /* wiggle_amp */
         b += (uint64_t)s->max_instances * sizeof(float);             /* squash_v */
+        b += (uint64_t)s->max_instances * sizeof(uint32_t);          /* face_id */
         b += (uint64_t)s->max_instances * sizeof(uint32_t);          /* compact_dst */
         b += (uint64_t)s->max_meshes * sizeof(struct SceneCullMesh); /* cpu_cull */
         b += (uint64_t)s->max_meshes * SCENE_MAX_LODS * sizeof(struct SceneGroupShade);
@@ -367,6 +379,11 @@ Scene *scene_create(VkBackend *vk, const SceneDesc *desc) {
         s->squash_v[i] = 1.0f; /* rest shape is the default, not 0 */
     s->squash_table = alloc_slice(s, (VkDeviceSize)s->max_instances * sizeof(float), 16);
 
+    s->face_id     = mu_arena_alloc(&s->arena, s->max_instances * sizeof(uint32_t), 16);
+    s->face_dirty  = false;
+    memset(s->face_id, 0, (size_t)s->max_instances * sizeof(uint32_t));
+    s->face_table = alloc_slice(s, (VkDeviceSize)s->max_instances * sizeof(uint32_t), 16);
+
     s->cpu_cull = mu_arena_alloc(&s->arena, s->max_meshes * sizeof(struct SceneCullMesh), 16);
     s->cpu_group_shade =
         mu_arena_alloc(&s->arena, (uint32_t)(s->max_meshes * SCENE_MAX_LODS * sizeof(struct SceneGroupShade)), 16);
@@ -412,6 +429,7 @@ void scene_destroy(Scene *s) {
     buffer_pool_free(s->bloom_table);
     buffer_pool_free(s->wiggle_table);
     buffer_pool_free(s->squash_table);
+    buffer_pool_free(s->face_table);
     buffer_pool_free(s->group_static);
     buffer_pool_free(s->group_shade);
     buffer_pool_free(s->vertex_arena);
@@ -661,6 +679,87 @@ float scene_instance_squash(const Scene *s, uint32_t slot) {
     return s->squash_v[slot];
 }
 
+/* Per-instance slime face tile. No clamping: the atlas has 40 slots and the
+   FS wraps with the grid arithmetic, so an out-of-range id still samples
+   defined texels rather than faulting. */
+void scene_set_instance_face(Scene *s, uint32_t slot, uint32_t face) {
+    if (!s || slot >= s->max_instances || !s->cpu_instances[slot].alive)
+        return;
+    if (s->face_id[slot] != face) {
+        s->face_id[slot] = face;
+        s->face_dirty    = true;
+    }
+}
+
+uint32_t scene_instance_face(const Scene *s, uint32_t slot) {
+    if (!s || slot >= s->max_instances)
+        return 0u;
+    return s->face_id[slot];
+}
+
+/* Slime face atlas: count source PNGs resampled to SCENE_FACE_TILE and packed
+   row-major into a fixed COLSxROWS grid, then uploaded as one linear-UNORM
+   texture. The grid is fixed even when count < COLS*ROWS so the shader's tile
+   arithmetic never depends on how many faces were staged. */
+TextureID scene_face_atlas_load(Scene *s, const char *const *paths, uint32_t count, char *err, uint32_t err_cap) {
+    if (!s || !paths || count == 0 || count > SCENE_FACE_COLS * SCENE_FACE_ROWS) {
+        snprintf(err, err_cap, "face atlas: need 1..%u paths", SCENE_FACE_COLS * SCENE_FACE_ROWS);
+        return UINT32_MAX;
+    }
+    const uint32_t T = SCENE_FACE_TILE, C = SCENE_FACE_COLS, R = SCENE_FACE_ROWS;
+    const uint32_t W = C * T, H = R * T;
+
+    uint8_t *atlas = (uint8_t *)calloc((size_t)W * H, 4u);
+    if (!atlas) {
+        snprintf(err, err_cap, "face atlas: out of memory");
+        return UINT32_MAX;
+    }
+    uint8_t tile[SCENE_FACE_TILE * SCENE_FACE_TILE * 4u];
+
+    for (uint32_t i = 0; i < count; ++i) {
+        int            w, h, c;
+        unsigned char *px = stbi_load(paths[i], &w, &h, &c, 4);
+        if (!px) {
+            snprintf(err, err_cap, "face atlas: cannot decode %s", paths[i]);
+            free(atlas);
+            return UINT32_MAX;
+        }
+        /* SDF edges survive bilinear resampling: the 0.5 isolevel stays where
+           it was, only the gradient steepness changes with scale. Sources must
+           use standard polarity (0.5 edge, 1.0 inside) on every channel. */
+        stbir_resize_uint8_linear(px, w, h, 0, tile, (int)T, (int)T, 0, STBIR_RGBA);
+        stbi_image_free(px);
+        uint32_t tx = (i % C) * T, ty = (i / C) * T;
+        for (uint32_t y = 0; y < T; ++y)
+            memcpy(atlas + ((size_t)(ty + y) * W + tx) * 4u, tile + (size_t)y * T * 4u, (size_t)T * 4u);
+    }
+
+    VkBackend *vk  = s->vk;
+    TextureID  tex = create_texture(vk, &(TextureCreateDesc){.width      = W,
+                                                            .height     = H,
+                                                            .depth      = 1,
+                                                            .layers     = 1,
+                                                            .mip_count  = 1,
+                                                            .format     = VK_FORMAT_R8G8B8A8_UNORM,
+                                                            .usage      = IMG_SAMPLED | IMG_XFER_DST,
+                                                            .debug_name = "slime_face_atlas"});
+    if (tex == UINT32_MAX) {
+        snprintf(err, err_cap, "face atlas: texture pool exhausted");
+        free(atlas);
+        return UINT32_MAX;
+    }
+    if (!texture_upload(vk, tex, 0, 0, (VkOffset3D){0, 0, 0}, (VkExtent3D){W, H, 1},
+                        (ByteSpan){atlas, W * H * 4u})) {
+        snprintf(err, err_cap, "face atlas: upload failed");
+        destroy_texture(vk, tex);
+        free(atlas);
+        return UINT32_MAX;
+    }
+    free(atlas);
+    log_info("[scene] face atlas: %u tiles in %ux%u", count, W, H);
+    return tex;
+}
+
 /* Removal is existence, not state: the candidate row goes away, so no hot loop
    ever asks whether this instance is alive. The slot is retired and becomes a
    hole; holes are reclaimed by scene_compact_slots() at load boundaries.
@@ -689,6 +788,7 @@ void scene_instance_destroy(Scene *s, uint32_t slot) {
         s->bloom_strength[slot] = s->bloom_strength[last_slot];
         s->wiggle_amp[slot]     = s->wiggle_amp[last_slot];
         s->squash_v[slot]       = s->squash_v[last_slot];
+        s->face_id[slot]        = s->face_id[last_slot];
         mu_bitset_set_bit(&s->bloom_bits, slot, mu_bitset_test(&s->bloom_bits, last_slot));
         s->row_of[slot]             = moved_row;
         s->cpu_rows[moved_row].slot = slot;
@@ -697,6 +797,7 @@ void scene_instance_destroy(Scene *s, uint32_t slot) {
     s->bloom_strength[last_slot] = 0.0f;
     s->wiggle_amp[last_slot]     = 0.0f;
     s->squash_v[last_slot]       = 1.0f;
+    s->face_id[last_slot]        = 0u;
     mu_bitset_reset(&s->bloom_bits, last_slot);
     s->bloom_dirty = true;
     s->instance_count--;
@@ -763,6 +864,7 @@ void scene_compact_slots(Scene *s) {
             s->bloom_strength[to]     = s->bloom_strength[i];
             s->wiggle_amp[to]         = s->wiggle_amp[i];
             s->squash_v[to]           = s->squash_v[i];
+            s->face_id[to]            = s->face_id[i];
             s->cpu_instances[i].alive = 0;
             s->row_of[i]              = UINT32_MAX;
         }
@@ -782,11 +884,13 @@ void scene_compact_slots(Scene *s) {
             s->bloom_strength[i] = 0.0f;
             s->wiggle_amp[i]     = 0.0f;
             s->squash_v[i]       = 1.0f;
+            s->face_id[i]        = 0u;
         }
     }
     s->bloom_dirty  = true;
     s->wiggle_dirty = true;
     s->squash_dirty = true;
+    s->face_dirty   = true;
 
     s->dynamic_count      = dyn;
     s->static_count       = sta;
@@ -877,8 +981,11 @@ bool scene_upload_scene(Scene *s, VkCommandBuffer cmd) {
                                     (ByteSpan){s->wiggle_amp, (size_t)s->max_instances * sizeof(float)});
     renderer_upload_buffer_to_slice(vk, cmd, s->squash_table,
                                     (ByteSpan){s->squash_v, (size_t)s->max_instances * sizeof(float)});
+    renderer_upload_buffer_to_slice(vk, cmd, s->face_table,
+                                    (ByteSpan){s->face_id, (size_t)s->max_instances * sizeof(uint32_t)});
     s->wiggle_dirty = false;
     s->squash_dirty = false;
+    s->face_dirty   = false;
 
     /* Whole instance table, once. After this the dynamic prefix is rewritten by
        T1 each frame and the static suffix only when a static row actually
@@ -1079,6 +1186,7 @@ static void build_draw_push(Scene *s, uint32_t view, uint32_t lane, struct Scene
     p->bloom       = slice_addr(vk, s->bloom_table);
     p->wiggle      = slice_addr(vk, s->wiggle_table);
     p->squash      = slice_addr(vk, s->squash_table);
+    p->face_id     = slice_addr(vk, s->face_table);
 
     p->counts[5] = getenv("MU_SHADER_DEBUG") ? 1u : 0u;
 }
@@ -1192,14 +1300,18 @@ void scene_frame(Scene *s, VkCommandBuffer cmd, RenderTarget *color, RenderTarge
     }
 
     /* Wiggle amplitudes are set at spawn, but scene_set_instance_wiggle may run
-       after the first upload, so mirror bloom's dirty re-upload here. */
-    if (s->wiggle_dirty || s->squash_dirty) {
+       after the first upload, so mirror bloom's dirty re-upload here. Face and
+       squash ride along: all three are small whole-table uploads. */
+    if (s->wiggle_dirty || s->squash_dirty || s->face_dirty) {
         renderer_upload_buffer_to_slice(vk, cmd, s->wiggle_table,
                                         (ByteSpan){s->wiggle_amp, (size_t)s->max_instances * sizeof(float)});
         renderer_upload_buffer_to_slice(vk, cmd, s->squash_table,
                                         (ByteSpan){s->squash_v, (size_t)s->max_instances * sizeof(float)});
+        renderer_upload_buffer_to_slice(vk, cmd, s->face_table,
+                                        (ByteSpan){s->face_id, (size_t)s->max_instances * sizeof(uint32_t)});
         s->wiggle_dirty = false;
         s->squash_dirty = false;
+        s->face_dirty   = false;
     }
 
     /* Candidates mirror the live slot set; re-upload the prefix whenever the
@@ -1510,6 +1622,9 @@ void scene_frame(Scene *s, VkCommandBuffer cmd, RenderTarget *color, RenderTarge
              .stage  = STAGE_VERT,
              .access = ACCESS_SSBO_R},
             {.slice  = s->squash_table,
+             .stage  = STAGE_VERT,
+             .access = ACCESS_SSBO_R},
+            {.slice  = s->face_table,
              .stage  = STAGE_VERT,
              .access = ACCESS_SSBO_R},
         };

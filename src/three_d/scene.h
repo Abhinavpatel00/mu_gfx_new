@@ -120,6 +120,21 @@ float scene_instance_wiggle(const Scene *s, uint32_t slot);
 void  scene_set_instance_squash(Scene *s, uint32_t slot, float v);
 float scene_instance_squash(const Scene *s, uint32_t slot);
 
+/* Per-instance slime face: an index into the face atlas built by
+   scene_face_atlas_load. Read only by FACE-material quads; every other
+   instance ignores it. Set any time, re-uploaded whole when dirty like
+   wiggle/squash. Defaults to 0. Change only on expression change, not per
+   frame. */
+void     scene_set_instance_face(Scene *s, uint32_t slot, uint32_t face);
+uint32_t scene_instance_face(const Scene *s, uint32_t slot);
+
+/* Builds the slime face atlas: an 8x5 grid of 128px RGBA tiles, one source
+   PNG per tile in row-major order (resampled, so mixed 64/128/256px sources
+   are fine). Linear UNORM on purpose: the channels carry SDF distance, not
+   color, so sRGB decoding would corrupt the 0.5 edge. One mip; distant faces
+   may shimmer until mips are added. Returns the bindless id, or UINT32_MAX. */
+TextureID scene_face_atlas_load(Scene *s, const char *const *paths, uint32_t count, char *err, uint32_t err_cap);
+
 /* Reclaims retired slots. O(instances); call at load time, never per event. */
 void scene_compact_slots(Scene *s);
 

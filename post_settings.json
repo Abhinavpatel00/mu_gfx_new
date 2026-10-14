@@ -1,12 +1,12 @@
 {
   "flags": 12287,
   "tonemap_mode": 1,
-  "exposure": 1.27,
+  "exposure": 0.93,
   "gamma": 2.36,
-  "contrast": 1.04,
-  "saturation": 2.17,
-  "temperature": -0.05,
-  "tint": 0.03,
+  "contrast": 1.06,
+  "saturation": 1.36,
+  "temperature": -0.36,
+  "tint": 0.09,
   "vignette": 0.12,
   "vignette_smoothness": 0.55,
   "sharpen": 0,
@@ -22,6 +22,6 @@
   "bloom_threshold": 1.6,
   "bloom_knee": 0.5,
   "bloom_radius": 1,
-  "ssao_strength": 0.99,
+  "ssao_strength": 0.96,
   "toon": false
 }

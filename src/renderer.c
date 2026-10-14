@@ -556,7 +556,11 @@ void capture_resize(Renderer *r, uint32_t w, uint32_t h) {
 
 // ---- public API ----------------------------------------------
 
-bool capture_take_screenshot(Renderer *r, const char *path) {
+static bool capture_take_screenshot(Renderer *r, const char *path);
+
+bool renderer_screenshot(Renderer *r, const char *path) { return capture_take_screenshot(r, path); }
+
+static bool capture_take_screenshot(Renderer *r, const char *path) {
     CaptureState *c = &r->capture;
     if (!c->inited || !path)
         return false;

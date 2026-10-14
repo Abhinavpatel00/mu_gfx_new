@@ -43,6 +43,7 @@ struct SceneVOut {
     nointerpolation uint material : TEXCOORD2;
     float3               world    : TEXCOORD3; /* the eye vector needs the world point, not the clip one */
     nointerpolation float bloom  : TEXCOORD4; /* per-instance bloom strength, 0 = excluded */
+    nointerpolation uint face    : TEXCOORD5; /* slime face atlas tile; only FACE quads read it */
 };
 
 [shader("vertex")]
@@ -77,6 +78,35 @@ SceneVOut vs_main(uint vid : SV_VertexID, uint iid : SV_InstanceID, uint base_in
     float  sy      = pc.squash[slot];
     float  widen   = rsqrt(max(sy, 1e-3f));
     float3 su      = float3(widen, sy, widen);
+
+    SceneVOut o;
+    o.face = pc.face_id[slot];
+
+    /* SDF face quad: a Y-billboard anchored to the body's camera-facing surface
+       so the expression stays readable from any orbit angle. The anchor rides
+       the same squash (height) and widen (width) as the body, and sits 2%
+       proud of the unit body radius so the GREATER depth test keeps the quad.
+       Group-uniform branch: the material is per group, never per lane. */
+    if ((pc.materials[gs.material].flags & SCENE_MAT_FACE) != 0u) {
+        float3 to_cam = pc.camera.xyz - ipos;
+        to_cam.y      = 0.0f;
+        float dl      = max(length(to_cam), 1e-4f);
+        to_cam /= dl;
+        float3 right  = float3(-to_cam.z, 0.0f, to_cam.x);
+        float3 anchor = ipos + to_cam * (1.02f * s) + float3(0.0f, 0.12f * s * sy, 0.0f);
+        /* Quad verts are authored +/-0.5 in x/y. */
+        float3 world = anchor + right * (local.x * 1.05f * s * widen)
+                              + float3(0.0f, local.y * 0.85f * s * sy, 0.0f);
+        o.position = float4(dot(pc.clip_rows[0], float4(world, 1.0f)), dot(pc.clip_rows[1], float4(world, 1.0f)),
+                            dot(pc.clip_rows[2], float4(world, 1.0f)), dot(pc.clip_rows[3], float4(world, 1.0f)));
+        o.normal   = -to_cam; /* unused: the face fragment path is unlit */
+        o.uv       = unpack_half2(v.uv);
+        o.material = gs.material;
+        o.world    = world;
+        o.bloom    = pc.bloom[slot];
+        return o;
+    }
+
     float3 squishy = local * su;
     float3 world   = ipos + quat_rotate(inst.quat, squishy * s);
 
@@ -89,18 +119,17 @@ SceneVOut vs_main(uint vid : SV_VertexID, uint iid : SV_InstanceID, uint base_in
     float amp = pc.wiggle[slot];
     if (amp != 0.0f) {
         float h  = local.y * 0.5f + 0.5f;
-        /* Phase from the instance *triple* index, not the raw slot: a slime is
-           three slots (body, dark features, white glints) sharing one transform,
-           and they must jiggle in lockstep or the face slides off the body.
-           Different triples still land on unrelated phases. */
-        float ph = global_data.time * 6.0f + float(slot / 3u) * 2.399963f;
+        /* Phase from the instance *pair* index, not the raw slot: a slime is
+           two slots (body, face quad) sharing one transform, and they must
+           jiggle in lockstep or the face slides off the body. Different pairs
+           still land on unrelated phases. */
+        float ph = global_data.time * 6.0f + float(slot / 2u) * 2.399963f;
         world += quat_rotate(inst.quat, unpack_oct(v.normal_oct)) * (sin(ph) * amp * h);
     }
 
     if (pc.counts[5] != 0u && iid == 0u) /* DEBUG: one line per draw, MU_SHADER_DEBUG */
         printf("[VS] base=%u iid=%u slot=%u pos=(%.4f, %.4f, %.4f)\n", base_inst, iid, slot, world.x, world.y, world.z);
 
-    SceneVOut o;
     o.position = float4(dot(pc.clip_rows[0], float4(world, 1.0f)), dot(pc.clip_rows[1], float4(world, 1.0f)),
                         dot(pc.clip_rows[2], float4(world, 1.0f)), dot(pc.clip_rows[3], float4(world, 1.0f)));
     /* Inverse squash for the normal: the surface was scaled by (widen, sy,
@@ -159,6 +188,36 @@ float4 fs_main(SceneVOut i) : SV_Target0
     }
     if ((m.flags & SCENE_MAT_ALPHA_TEST) != 0u && alpha < 0.5f)
         discard;
+
+    /* SDF slime face: one atlas tile per expression (R = eyes, A = mouth,
+       B = eye whites, G = eye highlights, 0.5 = shape edge). Edge width comes
+       from screen-space derivatives so faces stay crisp at any distance — the
+       whole point of SDF faces. Unlit: expressions must read in shadow. */
+    if ((m.flags & SCENE_MAT_FACE) != 0u) {
+        uint   tile    = i.face % (SCENE_FACE_COLS * SCENE_FACE_ROWS);
+        float2 tile_xy = float2(tile % SCENE_FACE_COLS, tile / SCENE_FACE_COLS);
+        float2 fuv     = (i.uv + tile_xy) * float2(1.0f / float(SCENE_FACE_COLS), 1.0f / float(SCENE_FACE_ROWS));
+        float4 sdf     = textures[NonUniformResourceIndex(m.texture)].Sample(samplers[SCENE_SAMPLER], fuv);
+        float  w       = max(max(fwidth(sdf.r), fwidth(sdf.a)), 1e-4f);
+        float  eye     = smoothstep(0.5f - w, 0.5f + w, sdf.r);
+        float  mouth   = smoothstep(0.5f - w, 0.5f + w, sdf.a);
+        float  white   = smoothstep(0.5f - w, 0.5f + w, sdf.b);
+        if (max(max(eye, mouth), white) < 0.02f)
+            discard;
+        float3 dark = float3(0.05f, 0.055f, 0.09f); /* the old geometry navy */
+        /* G is a sheen ramp across the eye, not a glint dot: shade the pupil
+           by it and add a hot core where it peaks. Mouths stay flat dark. */
+        float3 eye_col = dark * (0.25f + 0.75f * sdf.g) + float3(1.0f) * (smoothstep(0.75f, 0.95f, sdf.g) * 0.8f);
+        float3 col     = float3(1.0f) * white;          /* hunter-style eye whites */
+        col            = lerp(col, eye_col, clamp(eye, 0.0f, 1.0f));
+        col            = lerp(col, dark, clamp(mouth, 0.0f, 1.0f));
+        /* Outline ring just outside the eye/mouth edge, like SR's mouth
+           outlines: one band, no extra textures. */
+        float ring = (smoothstep(0.5f - 3.5f * w, 0.5f - w, sdf.r) - eye)
+                   + (smoothstep(0.5f - 3.5f * w, 0.5f - w, sdf.a) - mouth);
+        col = lerp(col, dark * 0.45f, clamp(ring, 0.0f, 1.0f));
+        return float4(col, i.bloom);
+    }
 
     if ((m.flags & SCENE_MAT_UNLIT) != 0u)
         return float4(albedo, i.bloom);

@@ -12,6 +12,8 @@
 #include "external/stb/stb_image_write.h"
 #define STB_IMAGE_IMPLEMENTATION
 #include "external/stb/stb_image.h"
+#define STB_IMAGE_RESIZE_IMPLEMENTATION
+#include "external/stb/stb_image_resize2.h"
 
 #define CGLTF_IMPLEMENTATION
 #include "external/cgltf/cgltf.h"

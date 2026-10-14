@@ -15,4 +15,20 @@
 
 
  - remove smearing,ghosting from ssao 
-- trasparent pass for particles and sparkles 
+- trasparent pass for particles and sparkles
+
+- render enviroment with normal mesh rendering pipeline but have another pass for rendering slimes because slime rendering have diffrent amount of work and can have its own optimized format 
+it uses sdf textures for faces 
+i guess that compute shader must be efficient for rendering a large amount of slimes and updating their positions and simulating ai and may be telling what kind of sdf to apply on slimes while rendering them 
+ its we get positions and other info on compute and vs is used to render
+ - TODO(faces): DONE replaced with home-cooked SDF faces (assets/slime_faces_ours/, scripts/author_faces.py, standard polarity all channels); rips kept in assets/slime_faces/ as reference only
+ 
+ 
+ 
+ - Happy faces emit sparkles
+- Angry faces emit steam/smoke
+
+Blend between SDF textures based on game state:
+- Health low → blend toward "scared" face
+- Near food → blend toward "happy" face
+- Time of day → "sleepy" faces at night
