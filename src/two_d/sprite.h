@@ -17,7 +17,7 @@
  * MAX_FRAMES_IN_FLIGHT regions hold one full-size flush each. Several smaller
  * flushes share a region until it is full. */
 
-#include "../../vk.h"
+#include "../vk.h"
 #include "sprite_data.h"
 #include "../../external/mu/allocators.h"
 

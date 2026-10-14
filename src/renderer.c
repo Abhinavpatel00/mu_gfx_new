@@ -12,6 +12,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <sys/stat.h>
 
 #define JSMN_STATIC
 #define JSMN_IMPLEMENTATION
@@ -21,7 +22,7 @@
 static void install_callbacks(Renderer *r);
 
 #include "src/two_d/two_d.h"
-#include "vk.h"
+#include "src/vk.h"
 
 /* How many HUD lines the game can queue per frame, and how long each may be. */
 #define GAME_HUD_LINES 12
@@ -493,6 +494,12 @@ void capture_init(Renderer *r, uint32_t w, uint32_t h) {
         if (!capture_alloc_slot(r, &c->readback[i], c->bytes_per_frame))
             log_error("[capture] slot %u alloc failed", i);
     }
+
+    // Output tree is gitignored; create it once here so every later write can
+    // assume it exists. EEXIST means it already does, which is the common case.
+    mkdir(CAPTURE_DIR, 0755);
+    mkdir(CAPTURE_SCREENSHOT_DIR, 0755);
+    mkdir(CAPTURE_VIDEO_DIR, 0755);
 
     c->png_scratch = malloc((size_t)w * h * 4);
     c->inited      = true;
@@ -2114,7 +2121,7 @@ static void on_key(GLFWwindow *w, int key, int scancode, int action, int mods) {
 
     if (key == GLFW_KEY_R) {
         char path[256];
-        snprintf(path, sizeof(path), "screenshot_%llu.png",
+        snprintf(path, sizeof(path), CAPTURE_SCREENSHOT_DIR "/screenshot_%llu.png",
                  (unsigned long long)(mu_time_now() * 1000.0 / mu_time_freq()));
         capture_take_screenshot(r, path);
     } else if (key == GLFW_KEY_F9) {
@@ -2122,7 +2129,8 @@ static void on_key(GLFWwindow *w, int key, int scancode, int action, int mods) {
             capture_stop_video(r);
         } else {
             char path[256];
-            snprintf(path, sizeof(path), "recording_%llu.mp4", (unsigned long long)(mu_time_now() / mu_time_freq()));
+            snprintf(path, sizeof(path), CAPTURE_VIDEO_DIR "/recording_%llu.mp4",
+                     (unsigned long long)(mu_time_now() / mu_time_freq()));
             capture_start_video(r, path, 60);
         }
     }

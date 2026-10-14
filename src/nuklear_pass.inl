@@ -97,14 +97,16 @@ static void render_capture_ui(Renderer *r) {
         nk_layout_row_dynamic(ctx, 28, 1);
         if (nk_button_label(ctx, "Screenshot")) {
             char path[256];
-            snprintf(path, sizeof(path), "screenshot_%llu.png", (unsigned long long)(mu_time_now() / 1000000ull));
+            snprintf(path, sizeof(path), CAPTURE_SCREENSHOT_DIR "/screenshot_%llu.png",
+                     (unsigned long long)(mu_time_now() / 1000000ull));
             if (!capture_take_screenshot(r, path))
                 log_warn("[ui] screenshot request rejected");
         }
         if (!c->recording) {
             if (nk_button_label(ctx, "Start Recording")) {
                 char path[256];
-                snprintf(path, sizeof(path), "recording_%llu.mp4", (unsigned long long)(mu_time_now() / 1000000000ull));
+                snprintf(path, sizeof(path), CAPTURE_VIDEO_DIR "/recording_%llu.mp4",
+                         (unsigned long long)(mu_time_now() / 1000000000ull));
                 if (!capture_start_video(r, path, 60))
                     log_error("[ui] failed to start recording");
             }

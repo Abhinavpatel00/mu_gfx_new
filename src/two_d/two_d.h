@@ -8,7 +8,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-#include "../../vk.h"
+#include "../vk.h"
 
 typedef struct TwoD TwoD;
 struct SpriteSystem;

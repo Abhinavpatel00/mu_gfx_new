@@ -37,7 +37,7 @@ GLFW_CMAKE_ARGS := \
 # =========================================================
 # Sources
 # =========================================================
-SRC_C := main.c vk.c ext.c renderer.c src/nuklear.c src/input.c \
+SRC_C := main.c src/vk.c ext.c src/renderer.c src/nuklear.c src/input.c \
          external/mu/offset_allocator.c \
          external/mu/mu.c \
          src/two_d/sprite.c \
@@ -45,9 +45,6 @@ SRC_C := main.c vk.c ext.c renderer.c src/nuklear.c src/input.c \
          src/two_d/picture.c \
          src/three_d/scene.c \
          src/three_d/scene_asset.c \
-         src/game/level.c \
-         src/game/rig.c \
-         src/game/sim.c \
          muasset/muasset.c \
 
 
@@ -92,7 +89,11 @@ OBJ := $(addprefix $(BUILD_DIR)/, $(SRC_C:.c=.o)) \
 # =========================================================
 # Includes
 # =========================================================
-INCLUDES := -Iexternal/vulkan/include \
+# Project root: quoted includes inside headers under src/ resolve relative to
+# their own directory first, so root-relative paths like "external/..." and
+# "src/..." need the root on the search path.
+INCLUDES := -I. \
+            -Iexternal/vulkan/include \
             -Iexternal/glfw/include \
             -Iexternal/tree-sitter/lib/include \
             -Iexternal/tree-sitter-c/bindings/c \

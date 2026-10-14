@@ -1,4 +1,4 @@
-#include "renderer.h"
+#include "src/renderer.h"
 
 #include "src/input.h"
 #include "src/three_d/scene.h"
@@ -173,7 +173,7 @@ typedef struct FlyCam {
 typedef struct CubePets {
     VkBackend *vk;
     Scene     *scene;
-    void      *renderer; /* TEMP: for the auto-screenshot probe */
+    void      *renderer;
 
     FlyCam cam;
     float  yaw;
@@ -740,7 +740,7 @@ static void slime_frame(Scene *scene, float dt) {
 static void pets_start(void *user, Renderer *renderer) {
     CubePets *p   = (CubePets *)user;
     p->vk         = renderer_vk(renderer);
-    p->renderer   = renderer; /* TEMP */
+    p->renderer   = renderer;
     p->dist       = 14.0f;
     /* Standing at the clearing's south edge, looking north across it along the
        path, so the first frame already frames the thing the scene is for. */
@@ -1026,14 +1026,6 @@ static void pets_render(void *user, VkCommandBuffer cmd, RenderTarget *color, Re
     vd.near_z        = 0.1f;
     vd.far_z         = 400.0f;
     scene_view_set(p->scene, 0, &vd);
-
-    /* TEMP instrumentation: auto-screenshot once the scene has rendered. */
-    {
-        bool       capture_take_screenshot(void *renderer, const char *path);
-        static int shot = 0;
-        if (++shot == 18)
-            capture_take_screenshot(p->renderer, "shot.png");
-    }
 
     scene_frame(p->scene, cmd, color, depth);
 }

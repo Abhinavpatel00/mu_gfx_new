@@ -2,7 +2,7 @@
 
 ## Coordinate conventions
 
-`begin_pass` (`vk.c`) calls `vk_cmd_set_viewport_scissor(cmd, extent)` for every
+`begin_pass` (`src/vk.c`) calls `vk_cmd_set_viewport_scissor(cmd, extent)` for every
 pass, and that helper installs a **negative-height** viewport:
 
 ```c

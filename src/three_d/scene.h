@@ -5,7 +5,7 @@
 #define MU_GFX_SCENE_H
 
 #include "scene_shared.h"
-#include "../../vk.h"
+#include "../vk.h"
 
 #define SCENE_MAX_VIEWS 4
 

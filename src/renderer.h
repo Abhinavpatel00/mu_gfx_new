@@ -3,7 +3,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-#include "src/input.h"
+#include "input.h"
 #include "vk.h"
 
 typedef struct Renderer Renderer;

@@ -1,8 +1,8 @@
 #ifndef MU_GFX_VK_H
 #define MU_GFX_VK_H
-#include "external/mu/mu/mu_span.h"
-#include "external/mu/offset_allocator.h"
-#include "src/helpers.h"
+#include "../external/mu/mu/mu_span.h"
+#include "../external/mu/offset_allocator.h"
+#include "helpers.h"
 
 typedef uint32_t TextureID;
 typedef uint32_t SamplerID;
