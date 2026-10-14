@@ -1,5 +1,31 @@
 # mu_gfx
 
+## Short sync, layout and usage names
+
+`src/vk.h` defines short enums for the noisiest Vulkan vocabulary — the same
+bits, shorter names, usable anywhere the Vulkan name was:
+
+| type | example |
+|---|---|
+| `Stage` (`VkPipelineStageFlags2`) | `STAGE_CS`, `STAGE_FRAG`, `STAGE_DRAW`, `STAGE_ALL` |
+| `Access` (`VkAccessFlags2`) | `ACCESS_SSBO_R`, `ACCESS_SAMPLED`, `ACCESS_INDIRECT`, `ACCESS_SSBO_RW` |
+| `Layout` (`VkImageLayout`) | `LAYOUT_SHADER_RO`, `LAYOUT_XFER_DST`, `LAYOUT_PRESENT` |
+| `ImgUsage` / `BufUsage` | `IMG_SAMPLED \| IMG_XFER_DST`, `BUF_STORAGE \| BUF_DEVICE_ADDR` |
+
+```c
+BufferAccess reads[] = {
+    {.slice = s->instances, .stage = STAGE_CS, .access = ACCESS_SSBO_R},
+    {.slice = vf->cull_args, .stage = STAGE_DRAW, .access = ACCESS_INDIRECT},
+};
+cmd_buffer_barrier(cmd, buf.buffer, off, size, STAGE_XFER, ACCESS_XFER_W, STAGE_CS, ACCESS_SSBO_R);
+```
+
+The stage/access values seed enums even though `vulkan_core.h` declares them as
+`static const` 64-bit flags: clang folds them and the enums come out 64-bit
+(`sizeof(Stage) == 8`). The project is clang-only, so this holds everywhere it
+builds. `src/vk.c` keeps the full Vulkan names on purpose — it is the boundary
+these names exist to keep clean.
+
 ## Coordinate conventions
 
 `begin_pass` (`src/vk.c`) calls `vk_cmd_set_viewport_scissor(cmd, extent)` for every

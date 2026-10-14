@@ -455,7 +455,7 @@ static bool capture_alloc_slot(Renderer *r, Buffer *b, VkDeviceSize size) {
     VkBufferCreateInfo bi = {
         .sType       = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
         .size        = size,
-        .usage       = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        .usage       = BUF_XFER_DST,
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
     };
     VmaAllocationCreateInfo ai = {
@@ -706,12 +706,12 @@ static void capture_record(Renderer *r, VkCommandBuffer cmd) {
 
     VkImageMemoryBarrier2 to_src = {
         .sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
-        .srcStageMask        = prev_stage ? prev_stage : VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
-        .srcAccessMask       = prev_access ? prev_access : VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
-        .dstStageMask        = VK_PIPELINE_STAGE_2_TRANSFER_BIT,
-        .dstAccessMask       = VK_ACCESS_2_TRANSFER_READ_BIT,
+        .srcStageMask        = prev_stage ? prev_stage : STAGE_COLOR,
+        .srcAccessMask       = prev_access ? prev_access : ACCESS_COLOR_W,
+        .dstStageMask        = STAGE_XFER,
+        .dstAccessMask       = ACCESS_XFER_R,
         .oldLayout           = prev_layout,
-        .newLayout           = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        .newLayout           = LAYOUT_XFER_SRC,
         .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
         .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
         .image               = src,
@@ -738,15 +738,15 @@ static void capture_record(Renderer *r, VkCommandBuffer cmd) {
             },
         .imageExtent = {c->width, c->height, 1},
     };
-    vkCmdCopyImageToBuffer(cmd, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, c->readback[slot].buffer, 1, &region);
+    vkCmdCopyImageToBuffer(cmd, src, LAYOUT_XFER_SRC, c->readback[slot].buffer, 1, &region);
 
     VkImageMemoryBarrier2 to_att = to_src;
-    to_att.srcStageMask          = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
-    to_att.srcAccessMask         = VK_ACCESS_2_TRANSFER_READ_BIT;
-    to_att.dstStageMask          = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
-    to_att.dstAccessMask         = VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
-    to_att.oldLayout             = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-    to_att.newLayout             = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    to_att.srcStageMask          = STAGE_XFER;
+    to_att.srcAccessMask         = ACCESS_XFER_R;
+    to_att.dstStageMask          = STAGE_COLOR;
+    to_att.dstAccessMask         = ACCESS_COLOR_R | ACCESS_COLOR_W;
+    to_att.oldLayout             = LAYOUT_XFER_SRC;
+    to_att.newLayout             = LAYOUT_COLOR;
     dep.pImageMemoryBarriers     = &to_att;
     vkCmdPipelineBarrier2(cmd, &dep);
 
@@ -798,7 +798,7 @@ static bool lut_swap_pixels(Renderer *r, uint32_t n, const uint8_t *px, const ch
                               .height    = n,
                               .mip_count = 1,
                               .format    = VK_FORMAT_R8G8B8A8_UNORM,
-                              .usage     = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT};
+                              .usage     = IMG_SAMPLED | IMG_XFER_DST};
     TextureID         fresh = create_texture(&r->vk, &desc);
     if (fresh == UINT32_MAX) {
         fprintf(stderr, "[lut] %s: texture create failed, keeping previous LUT\n", path);
@@ -991,7 +991,7 @@ static void create_identity_lut(Renderer *r) {
                               .height    = N,
                               .mip_count = 1,
                               .format    = VK_FORMAT_R8G8B8A8_UNORM,
-                              .usage     = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT};
+                              .usage     = IMG_SAMPLED | IMG_XFER_DST};
     r->lut_texture         = create_texture(&r->vk, &desc);
     r->lut_size            = N;
     texture_upload(&r->vk, r->lut_texture, 0, 0, (VkOffset3D){0, 0, 0}, (VkExtent3D){W, N, 1},
@@ -1011,7 +1011,7 @@ static void renderer_resources_create(Renderer *r, VkBackendDesc *desc) {
 
                                    .format = depth_format,
 
-                                   .usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                                   .usage = IMG_DEPTH | IMG_SAMPLED,
 
                                    .aspect = VK_IMAGE_ASPECT_DEPTH_BIT,
 
@@ -1021,8 +1021,8 @@ static void renderer_resources_create(Renderer *r, VkBackendDesc *desc) {
                                    .height     = r->vk.swapchain.extent.height,
                                    .layers     = 1,
                                    .format     = hdr_format,
-                                   .usage      = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
-                                                 VK_IMAGE_USAGE_SAMPLED_BIT,
+                                   .usage      = IMG_COLOR | IMG_STORAGE |
+                                                 IMG_SAMPLED,
                                    .mip_count  = 1,
                                    .debug_name = "hdr_color"};
     RenderTargetSpec ldr_spec   = {.width  = r->vk.swapchain.extent.width,
@@ -1031,12 +1031,12 @@ static void renderer_resources_create(Renderer *r, VkBackendDesc *desc) {
 
                                    .format = VK_FORMAT_R8G8B8A8_UNORM,
 
-                                   .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                                   .usage = IMG_COLOR |
 
-                                            VK_IMAGE_USAGE_STORAGE_BIT |      // compute writes tonemap result
-                                            VK_IMAGE_USAGE_TRANSFER_SRC_BIT | // copy → swapchain
-                                            VK_IMAGE_USAGE_TRANSFER_DST_BIT | // optional clears
-                                            VK_IMAGE_USAGE_SAMPLED_BIT,       // future post effects
+                                            IMG_STORAGE |      // compute writes tonemap result
+                                            IMG_XFER_SRC | // copy → swapchain
+                                            IMG_XFER_DST | // optional clears
+                                            IMG_SAMPLED,       // future post effects
 
                                    .aspect = VK_IMAGE_ASPECT_COLOR_BIT,
 
@@ -1051,7 +1051,7 @@ static void renderer_resources_create(Renderer *r, VkBackendDesc *desc) {
 
                                        .format = VK_FORMAT_R8G8_UNORM,
 
-                                       .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                                       .usage = IMG_COLOR | IMG_SAMPLED,
 
                                        .aspect = VK_IMAGE_ASPECT_COLOR_BIT,
 
@@ -1064,7 +1064,7 @@ static void renderer_resources_create(Renderer *r, VkBackendDesc *desc) {
 
                                          .format = VK_FORMAT_R8G8B8A8_UNORM,
 
-                                         .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                                         .usage = IMG_COLOR | IMG_SAMPLED,
 
                                          .aspect = VK_IMAGE_ASPECT_COLOR_BIT,
 
@@ -1085,7 +1085,7 @@ static void renderer_resources_create(Renderer *r, VkBackendDesc *desc) {
                                       .height    = AREATEX_HEIGHT,
                                       .mip_count = 1,
                                       .format    = VK_FORMAT_R8G8_UNORM,
-                                      .usage     = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT};
+                                      .usage     = IMG_SAMPLED | IMG_XFER_DST};
 
             smaa_area    = create_texture(&r->vk, &desc);
             Texture *tex = &r->vk.texture_system.textures[smaa_area];
@@ -1093,15 +1093,15 @@ static void renderer_resources_create(Renderer *r, VkBackendDesc *desc) {
             VkDeviceSize size = AREATEX_SIZE;
 
             Buffer staging;
-            create_buffer(&r->vk, size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VMA_MEMORY_USAGE_CPU_ONLY, &staging);
+            create_buffer(&r->vk, size, BUF_XFER_SRC, VMA_MEMORY_USAGE_CPU_ONLY, &staging);
 
             memcpy(staging.mapping, areaTexBytes, size);
 
             VkCommandBuffer cmd = vk_begin_one_time_cmd(r->vk.devc.device, r->vk.one_time_gfx_pool);
 
             VkImageMemoryBarrier barrier = {.sType                       = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-                                            .oldLayout                   = VK_IMAGE_LAYOUT_UNDEFINED,
-                                            .newLayout                   = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                            .oldLayout                   = LAYOUT_UNDEFINED,
+                                            .newLayout                   = LAYOUT_XFER_DST,
                                             .srcAccessMask               = 0,
                                             .dstAccessMask               = VK_ACCESS_TRANSFER_WRITE_BIT,
                                             .image                       = tex->image,
@@ -1116,10 +1116,10 @@ static void renderer_resources_create(Renderer *r, VkBackendDesc *desc) {
                                         .imageSubresource.layerCount = 1,
                                         .imageExtent                 = {AREATEX_WIDTH, AREATEX_HEIGHT, 1}};
 
-            vkCmdCopyBufferToImage(cmd, staging.buffer, tex->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+            vkCmdCopyBufferToImage(cmd, staging.buffer, tex->image, LAYOUT_XFER_DST, 1, &region);
 
-            barrier.oldLayout     = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-            barrier.newLayout     = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            barrier.oldLayout     = LAYOUT_XFER_DST;
+            barrier.newLayout     = LAYOUT_SHADER_RO;
             barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
             barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
 
@@ -1136,7 +1136,7 @@ static void renderer_resources_create(Renderer *r, VkBackendDesc *desc) {
                                       .height    = SEARCHTEX_HEIGHT,
                                       .mip_count = 1,
                                       .format    = VK_FORMAT_R8_UNORM,
-                                      .usage     = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT};
+                                      .usage     = IMG_SAMPLED | IMG_XFER_DST};
 
             smaa_search  = create_texture(&r->vk, &desc);
             Texture *tex = &r->vk.texture_system.textures[smaa_search];
@@ -1144,15 +1144,15 @@ static void renderer_resources_create(Renderer *r, VkBackendDesc *desc) {
             VkDeviceSize size = SEARCHTEX_SIZE;
 
             Buffer staging;
-            create_buffer(&r->vk, size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VMA_MEMORY_USAGE_CPU_ONLY, &staging);
+            create_buffer(&r->vk, size, BUF_XFER_SRC, VMA_MEMORY_USAGE_CPU_ONLY, &staging);
 
             memcpy(staging.mapping, searchTexBytes, size);
 
             VkCommandBuffer cmd = vk_begin_one_time_cmd(r->vk.devc.device, r->vk.one_time_gfx_pool);
 
             VkImageMemoryBarrier barrier = {.sType                       = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-                                            .oldLayout                   = VK_IMAGE_LAYOUT_UNDEFINED,
-                                            .newLayout                   = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                            .oldLayout                   = LAYOUT_UNDEFINED,
+                                            .newLayout                   = LAYOUT_XFER_DST,
                                             .srcAccessMask               = 0,
                                             .dstAccessMask               = VK_ACCESS_TRANSFER_WRITE_BIT,
                                             .image                       = tex->image,
@@ -1167,10 +1167,10 @@ static void renderer_resources_create(Renderer *r, VkBackendDesc *desc) {
                                         .imageSubresource.layerCount = 1,
                                         .imageExtent                 = {SEARCHTEX_WIDTH, SEARCHTEX_HEIGHT, 1}};
 
-            vkCmdCopyBufferToImage(cmd, staging.buffer, tex->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+            vkCmdCopyBufferToImage(cmd, staging.buffer, tex->image, LAYOUT_XFER_DST, 1, &region);
 
-            barrier.oldLayout     = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-            barrier.newLayout     = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            barrier.oldLayout     = LAYOUT_XFER_DST;
+            barrier.newLayout     = LAYOUT_SHADER_RO;
             barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
             barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
 
@@ -1202,7 +1202,7 @@ static void renderer_resources_create(Renderer *r, VkBackendDesc *desc) {
                                          .height     = mh,
                                          .layers     = 1,
                                          .format     = hdr_format,
-                                         .usage      = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                                         .usage      = IMG_STORAGE | IMG_SAMPLED,
                                          .mip_count  = 1,
                                          .debug_name = "bloom_mip"};
             rt_create(&r->vk, &r->bloom_mip[i][k], &mip_spec);
@@ -1216,7 +1216,7 @@ static void renderer_resources_create(Renderer *r, VkBackendDesc *desc) {
                                       .height     = ah,
                                       .layers     = 1,
                                       .format     = VK_FORMAT_R16G16B16A16_SFLOAT,
-                                      .usage      = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                                      .usage      = IMG_STORAGE | IMG_SAMPLED,
                                       .mip_count  = 1,
                                       .debug_name = "ssao"};
         rt_create(&r->vk, &r->ssao[i], &ssao_spec);
@@ -1236,15 +1236,15 @@ static void renderer_resources_create(Renderer *r, VkBackendDesc *desc) {
                                   .height    = h,
                                   .mip_count = 1,
                                   .format    = VK_FORMAT_R8G8B8A8_UNORM,
-                                  .usage     = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
-                                               VK_IMAGE_USAGE_STORAGE_BIT};
+                                  .usage     = IMG_SAMPLED | IMG_XFER_DST |
+                                               IMG_STORAGE};
         TextureID         id   = create_texture(&r->vk, &desc);
         Texture          *tex  = &r->vk.texture_system.textures[id];
 
         TextureInfo *texinfo    = &r->vk.texture_system.info[id];
         VkDeviceSize image_size = w * h * 4;
         Buffer       staging;
-        create_buffer(&r->vk, image_size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+        create_buffer(&r->vk, image_size, BUF_XFER_SRC, VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
                       &staging);
 
         memcpy(staging.mapping, pixels, image_size);
@@ -1252,8 +1252,8 @@ static void renderer_resources_create(Renderer *r, VkBackendDesc *desc) {
         VkCommandBuffer      cmd      = vk_begin_one_time_cmd(r->vk.devc.device, r->vk.one_time_gfx_pool);
         VkImageMemoryBarrier barrier1 = {
             .sType                       = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-            .oldLayout                   = VK_IMAGE_LAYOUT_UNDEFINED,
-            .newLayout                   = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            .oldLayout                   = LAYOUT_UNDEFINED,
+            .newLayout                   = LAYOUT_XFER_DST,
             .srcAccessMask               = 0,
             .dstAccessMask               = VK_ACCESS_TRANSFER_WRITE_BIT,
             .image                       = tex->image,
@@ -1266,10 +1266,10 @@ static void renderer_resources_create(Renderer *r, VkBackendDesc *desc) {
         VkBufferImageCopy region = {.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
                                     .imageSubresource.layerCount = 1,
                                     .imageExtent                 = {w, h, 1}};
-        vkCmdCopyBufferToImage(cmd, staging.buffer, tex->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+        vkCmdCopyBufferToImage(cmd, staging.buffer, tex->image, LAYOUT_XFER_DST, 1, &region);
         VkImageMemoryBarrier barrier2 = barrier1;
-        barrier2.oldLayout            = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-        barrier2.newLayout            = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        barrier2.oldLayout            = LAYOUT_XFER_DST;
+        barrier2.newLayout            = LAYOUT_SHADER_RO;
         barrier2.srcAccessMask        = VK_ACCESS_TRANSFER_WRITE_BIT;
         barrier2.dstAccessMask        = VK_ACCESS_SHADER_READ_BIT;
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0,
@@ -1282,12 +1282,12 @@ static void renderer_resources_create(Renderer *r, VkBackendDesc *desc) {
     {
         VkDeviceSize size = r->vk.swapchain.extent.width * r->vk.swapchain.extent.height * 4; // RGBA8
 
-        create_buffer(&r->vk, size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+        create_buffer(&r->vk, size, BUF_XFER_DST, VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
                       &r->readback_buffer);
     }
     {
         forEach(i, MAX_FRAMES_IN_FLIGHT) {
-            create_buffer(&r->vk, sizeof(GlobalData), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, VMA_MEMORY_USAGE_CPU_TO_GPU,
+            create_buffer(&r->vk, sizeof(GlobalData), BUF_UNIFORM, VMA_MEMORY_USAGE_CPU_TO_GPU,
                           &r->global_ubo[i]);
         }
     }
@@ -1405,7 +1405,7 @@ Renderer *renderer_create(bool use_wayland, GameHooks game) {
         .swapchain_preferred_color_space = VK_COLORSPACE_SRGB_NONLINEAR_KHR,
         .swapchain_preferred_format      = VK_FORMAT_B8G8R8A8_UNORM,
         .swapchain_extra_usage_flags =
-            VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+            IMG_XFER_DST | IMG_SAMPLED | IMG_XFER_SRC,
         .vsync               = false,
         .enable_debug_printf = true,
 
@@ -1761,7 +1761,7 @@ static void pass_bloom(Renderer *r, VkCommandBuffer cmd, uint32_t image) {
         return;
 
     GpuProfiler *frame_prof = &r->vk.gpuprofiler[r->vk.current_frame];
-    GPU_SCOPE(frame_prof, cmd, "Bloom", VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT) {
+    GPU_SCOPE(frame_prof, cmd, "Bloom", STAGE_CS) {
         /* pass 0 extracts HDR into the half-res head; later passes convolve
            already-extracted light, so upsample reads the small level straight. */
         bloom_dispatch(r, cmd, &r->hdr_color[image], &r->bloom_mip[image][0], 0u, 1.0f);
@@ -1831,7 +1831,7 @@ static void post_pass(Renderer *r, VkCommandBuffer cmd) {
     bool                ssao_on  = (s->flags & POST_SSAO) && s->ssao_strength > 0.0f;
 
     GpuProfiler *frame_prof = &r->vk.gpuprofiler[r->vk.current_frame];
-    GPU_SCOPE(frame_prof, cmd, "Tonemap", VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT) {
+    GPU_SCOPE(frame_prof, cmd, "Tonemap", STAGE_CS) {
         /* bloom mip[0] was written as a storage image by the bloom passes, and
            the ssao target by the ssao pass, so naming them here is what
            transitions them to sampled reads. */
@@ -1911,7 +1911,7 @@ static void pass_smaa(Renderer *r, VkCommandBuffer cmd) {
 
     {
         /* 1. Edge detection */
-        GPU_SCOPE(frame_prof, cmd, "SMAA Edge", VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT) {
+        GPU_SCOPE(frame_prof, cmd, "SMAA Edge", STAGE_COLOR) {
             PassAttachment color   = {.target = &r->smaa_edges[image], .load = LOAD_CLEAR};
             RenderTarget  *reads[] = {&r->ldr_color[image]};
 
@@ -1935,7 +1935,7 @@ static void pass_smaa(Renderer *r, VkCommandBuffer cmd) {
     }
     {
         /* 2. Weight calculation */
-        GPU_SCOPE(frame_prof, cmd, "SMAA Weight", VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT) {
+        GPU_SCOPE(frame_prof, cmd, "SMAA Weight", STAGE_COLOR) {
             PassAttachment color   = {.target = &r->smaa_weights[image], .load = LOAD_CLEAR};
             RenderTarget  *reads[] = {&r->smaa_edges[image]};
 
@@ -1961,7 +1961,7 @@ static void pass_smaa(Renderer *r, VkCommandBuffer cmd) {
     }
     {
         /* 3. Blend LDR + SMAA into FINAL */
-        GPU_SCOPE(frame_prof, cmd, "SMAA Blend", VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT) {
+        GPU_SCOPE(frame_prof, cmd, "SMAA Blend", STAGE_COLOR) {
             PassAttachment color   = {.target = &r->smaa_final[image], .load = LOAD_CLEAR};
             RenderTarget  *reads[] = {&r->ldr_color[image], &r->smaa_weights[image]};
 
@@ -1988,14 +1988,14 @@ static void pass_smaa(Renderer *r, VkCommandBuffer cmd) {
 
 static void pass_ldr_to_swapchain(Renderer *r, VkCommandBuffer cmd) {
     GpuProfiler *frame_prof = &r->vk.gpuprofiler[r->vk.current_frame];
-    GPU_SCOPE(frame_prof, cmd, "Blit Swapchain", VK_PIPELINE_STAGE_2_TRANSFER_BIT) {
+    GPU_SCOPE(frame_prof, cmd, "Blit Swapchain", STAGE_XFER) {
         uint32_t image = r->vk.swapchain.current_image;
 
-        rt_transition_all(&r->vk, cmd, &r->smaa_final[image], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                          VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+        rt_transition_all(&r->vk, cmd, &r->smaa_final[image], LAYOUT_XFER_SRC,
+                          STAGE_XFER, ACCESS_XFER_R);
 
-        image_transition_swapchain(&r->vk, cmd, &r->vk.swapchain, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                                   VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+        image_transition_swapchain(&r->vk, cmd, &r->vk.swapchain, LAYOUT_XFER_DST,
+                                   STAGE_XFER, ACCESS_XFER_W);
 
         flush_barriers(&r->vk, cmd);
 
@@ -2029,8 +2029,8 @@ static void pass_ldr_to_swapchain(Renderer *r, VkCommandBuffer cmd) {
                 },
         };
 
-        vkCmdBlitImage(cmd, r->smaa_final[image].image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                       r->vk.swapchain.images[image], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
+        vkCmdBlitImage(cmd, r->smaa_final[image].image, LAYOUT_XFER_SRC,
+                       r->vk.swapchain.images[image], LAYOUT_XFER_DST, 1, &blit,
                        VK_FILTER_NEAREST);
     }
 }
@@ -2370,15 +2370,15 @@ bool renderer_frame(Renderer *r) {
                                     &r->vk.bindless_system.set, 0, NULL);
 
             rt_transition_all(
-                &r->vk, cmd, &r->depth[r->vk.swapchain.current_image], VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
-                VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
-                VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT);
+                &r->vk, cmd, &r->depth[r->vk.swapchain.current_image], LAYOUT_DEPTH,
+                STAGE_EARLY_Z | STAGE_LATE_Z,
+                ACCESS_DEPTH_W | ACCESS_DEPTH_R);
 
             flush_barriers(&r->vk, cmd);
         }
     }
     RenderTarget *hdr = &r->hdr_color[r->vk.swapchain.current_image];
-    GPU_SCOPE(frame_prof, cmd, "Scene", VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT) {
+    GPU_SCOPE(frame_prof, cmd, "Scene", STAGE_COLOR) {
         if (r->two_d)
             two_d_render(r->two_d, cmd, hdr, kSceneClear);
         else
@@ -2394,7 +2394,7 @@ bool renderer_frame(Renderer *r) {
     if (key_pressed(&r->input, KEY_TAB))
         r->debug_ui_open = !r->debug_ui_open;
 
-    GPU_SCOPE(frame_prof, cmd, "SSAO", VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT) {
+    GPU_SCOPE(frame_prof, cmd, "SSAO", STAGE_CS) {
         /* The checkbox gates the pass itself: when SSAO is off post does not
            name the target either, so there is nothing to reset — the pass is
            stateless and next enabled frame recomputes it from scratch. */
@@ -2417,8 +2417,8 @@ bool renderer_frame(Renderer *r) {
     }
     pass_nuklear(r, cmd);
     capture_record(r, cmd);
-    image_transition_swapchain(&r->vk, cmd, &r->vk.swapchain, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
-                               VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, 0);
+    image_transition_swapchain(&r->vk, cmd, &r->vk.swapchain, LAYOUT_PRESENT,
+                               STAGE_COLOR, 0);
 
     flush_barriers(&r->vk, cmd);
 

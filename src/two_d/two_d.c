@@ -97,14 +97,14 @@ static void sprite_system_init(SpriteSystem *s, VkBackend *vk, const VkFormat *c
     VkDeviceSize out_bytes    = (VkDeviceSize)SPRITE_OUT_REGION * MAX_FRAMES_IN_FLIGHT;
 
     if (!create_device_buffer(vk, stream_bytes,
-                              VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-                                  VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
+                              BUF_XFER_DST | BUF_STORAGE |
+                                  BUF_INDIRECT,
                               &s->stream)) {
         log_fatal("[sprite] failed to allocate the stream buffer");
         exit(EXIT_FAILURE);
     }
     if (!create_device_buffer(vk, out_bytes,
-                              VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &s->out)) {
+                              BUF_XFER_DST | BUF_STORAGE, &s->out)) {
         log_fatal("[sprite] failed to allocate the compacted stream buffer");
         exit(EXIT_FAILURE);
     }
@@ -221,9 +221,9 @@ void sprite_flush(SpriteSystem *s, VkCommandBuffer cmd, RenderTarget *target, Lo
     renderer_upload_buffer_to_slice(vk, cmd, fblock,
                                     (ByteSpan){s->first_block, (layout.batch_count + 1) * sizeof(uint32_t)});
 
-    cmd_buffer_barrier(cmd, s->stream.buffer, layout.stream_base, flush_bytes, VK_PIPELINE_STAGE_2_TRANSFER_BIT,
-                       VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                       VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+    cmd_buffer_barrier(cmd, s->stream.buffer, layout.stream_base, flush_bytes, STAGE_XFER,
+                       ACCESS_XFER_W, STAGE_CS,
+                       ACCESS_SSBO_R | ACCESS_SSBO_W);
 
     GpuProfiler *frame_prof = &vk->gpuprofiler[vk->current_frame];
 
@@ -231,31 +231,31 @@ void sprite_flush(SpriteSystem *s, VkCommandBuffer cmd, RenderTarget *target, Lo
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vk->render_pipelines.pipelines[s->cs_count - 1]);
     dispatch_push(vk, cmd, BYTE_SPAN(pc), layout.block_count, 1, 1);
     cmd_buffer_barrier(cmd, s->stream.buffer, layout.stream_base, flush_bytes,
-                       VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-                       VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+                       STAGE_CS, ACCESS_SSBO_W,
+                       STAGE_CS, ACCESS_SSBO_R);
 
     /* 2. block prefix sum, then each batch's output base and indirect command */
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vk->render_pipelines.pipelines[s->cs_prefix - 1]);
     dispatch_push(vk, cmd, BYTE_SPAN(pc), 1, 1, 1);
     cmd_buffer_barrier(cmd, s->stream.buffer, layout.stream_base, flush_bytes,
-                       VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-                       VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT,
-                       VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+                       STAGE_CS, ACCESS_SSBO_W,
+                       STAGE_CS | STAGE_VERT,
+                       ACCESS_SSBO_R);
 
     /* 3. gather the survivors into the compacted stream, keeping batch order */
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vk->render_pipelines.pipelines[s->cs_compact - 1]);
     dispatch_push(vk, cmd, BYTE_SPAN(pc), layout.block_count, 1, 1);
 
     cmd_buffer_barrier(cmd, s->out.buffer, layout.out_base, (VkDeviceSize)layout.padded_count * SPRITE_INST_BYTES,
-                       VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-                       VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+                       STAGE_CS, ACCESS_SSBO_W,
+                       STAGE_VERT, ACCESS_SSBO_R);
     cmd_buffer_barrier(cmd, s->stream.buffer, layout.stream_base, flush_bytes,
-                       VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-                       VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT,
-                       VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+                       STAGE_CS, ACCESS_SSBO_W,
+                       STAGE_DRAW | STAGE_VERT,
+                       ACCESS_INDIRECT | ACCESS_SSBO_R);
 
     uint32_t draws = 0;
-    GPU_SCOPE(frame_prof, cmd, "Sprites", VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT) {
+    GPU_SCOPE(frame_prof, cmd, "Sprites", STAGE_COLOR) {
         PassAttachment color = {.target = target, .load = load, .store = STORE_KEEP};
         if (clear) {
             forEach(i, 4) color.clear[i] = clear[i];

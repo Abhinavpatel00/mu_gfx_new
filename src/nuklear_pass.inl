@@ -31,7 +31,7 @@ static void pass_nuklear(Renderer *r, VkCommandBuffer cmd) {
             capacity *= 2;
         destroy_buffer(&r->vk, upload);
         if (!create_buffer(&r->vk, capacity,
-                           VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+                           BUF_DEVICE_ADDR | BUF_INDEX,
                            VMA_MEMORY_USAGE_AUTO_PREFER_HOST, upload)) {
             log_fatal("[nuklear] failed to grow draw upload buffer");
             exit(EXIT_FAILURE);
@@ -42,7 +42,7 @@ static void pass_nuklear(Renderer *r, VkCommandBuffer cmd) {
         memcpy(upload->mapping + index_offset, nk_buffer_memory_const(&ui->indices), ui->indices.allocated);
         vmaFlushAllocation(r->vk.devc.vmaallocator, upload->allocation, 0, bytes);
         GpuProfiler *frame_prof = &r->vk.gpuprofiler[r->vk.current_frame];
-        GPU_SCOPE(frame_prof, cmd, "Nuklear Render", VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT) {
+        GPU_SCOPE(frame_prof, cmd, "Nuklear Render", STAGE_COLOR) {
             PassAttachment color = {.swapchain_view = r->vk.swapchain.image_views[r->vk.swapchain.current_image],
                                      .load = LOAD_KEEP, .store = STORE_KEEP};
             PassDesc pd = {.colors = &color, .color_count = 1};

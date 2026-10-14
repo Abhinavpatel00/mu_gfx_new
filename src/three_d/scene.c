@@ -286,7 +286,7 @@ Scene *scene_create(VkBackend *vk, const SceneDesc *desc) {
        reading it through .mapping is undefined. */
     forEach(i, MAX_FRAMES_IN_FLIGHT) {
         s->counters[i] = alloc_slice(s, sizeof(uint32_t) * SCENE_COUNTERS, 16);
-        if (!create_buffer(vk, sizeof(uint32_t) * SCENE_COUNTERS, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        if (!create_buffer(vk, sizeof(uint32_t) * SCENE_COUNTERS, BUF_XFER_DST,
                            VMA_MEMORY_USAGE_CPU_TO_GPU, &s->counters_host[i]))
             log_error("[scene] counters host buffer failed");
     }
@@ -1270,34 +1270,34 @@ void scene_frame(Scene *s, VkCommandBuffer cmd, RenderTarget *color, RenderTarge
            order 32 KB of counts. */
         BufferAccess cull_reads[7] = {
             {.slice  = s->instances,
-             .stage  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-             .access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT},
+             .stage  = STAGE_CS,
+             .access = ACCESS_SSBO_R},
             {.slice  = s->cull_meshes,
-             .stage  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-             .access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT},
+             .stage  = STAGE_CS,
+             .access = ACCESS_SSBO_R},
             {.slice  = s->cull_rows,
-             .stage  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-             .access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT},
+             .stage  = STAGE_CS,
+             .access = ACCESS_SSBO_R},
             {.slice  = s->lod_rows,
-             .stage  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-             .access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT},
+             .stage  = STAGE_CS,
+             .access = ACCESS_SSBO_R},
             {.slice  = vf->survivor_count,
-             .stage  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-             .access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT},
+             .stage  = STAGE_CS,
+             .access = ACCESS_SSBO_R | ACCESS_SSBO_W},
             {.slice  = s->counters[lane],
-             .stage  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-             .access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT},
+             .stage  = STAGE_CS,
+             .access = ACCESS_SSBO_R | ACCESS_SSBO_W},
             {.slice  = vf->cull_args,
-             .stage  = VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT,
-             .access = VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT},
+             .stage  = STAGE_DRAW,
+             .access = ACCESS_INDIRECT},
         };
         BufferAccess cull_writes[2] = {
             {.slice  = vf->survivors,
-             .stage  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-             .access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT},
+             .stage  = STAGE_CS,
+             .access = ACCESS_SSBO_W},
             {.slice  = vf->survivor_count,
-             .stage  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-             .access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT},
+             .stage  = STAGE_CS,
+             .access = ACCESS_SSBO_W},
         };
 
         /* T2: cull */
@@ -1316,16 +1316,16 @@ void scene_frame(Scene *s, VkCommandBuffer cmd, RenderTarget *color, RenderTarge
         /* T3a: histogram survivors by (mesh,lod) group */
         BufferAccess count_reads[2] = {
             {.slice  = vf->survivors,
-             .stage  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-             .access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT},
+             .stage  = STAGE_CS,
+             .access = ACCESS_SSBO_R},
             {.slice  = vf->survivor_count,
-             .stage  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-             .access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT},
+             .stage  = STAGE_CS,
+             .access = ACCESS_SSBO_R},
         };
         BufferAccess count_writes[1] = {
             {.slice  = vf->group_count,
-             .stage  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-             .access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT},
+             .stage  = STAGE_CS,
+             .access = ACCESS_SSBO_W},
         };
         PassDesc count_pass = {
             .buf_reads       = count_reads,
@@ -1344,41 +1344,41 @@ void scene_frame(Scene *s, VkCommandBuffer cmd, RenderTarget *color, RenderTarge
            scan_aux carries the per-block totals between the two levels. */
         BufferAccess scan_reads[2] = {
             {.slice  = vf->group_count,
-             .stage  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-             .access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT},
+             .stage  = STAGE_CS,
+             .access = ACCESS_SSBO_R},
             {.slice  = s->group_static,
-             .stage  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-             .access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT},
+             .stage  = STAGE_CS,
+             .access = ACCESS_SSBO_R},
         };
         BufferAccess scan_writes[8] = {
             {.slice  = vf->vis_base,
-             .stage  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-             .access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT},
+             .stage  = STAGE_CS,
+             .access = ACCESS_SSBO_W | ACCESS_SSBO_W},
             {.slice  = vf->cmd_index,
-             .stage  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-             .access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT},
+             .stage  = STAGE_CS,
+             .access = ACCESS_SSBO_W},
             {.slice  = vf->cursor,
-             .stage  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-             .access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT},
+             .stage  = STAGE_CS,
+             .access = ACCESS_SSBO_W},
             {.slice  = vf->draws,
-             .stage  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-             .access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT},
+             .stage  = STAGE_CS,
+             .access = ACCESS_SSBO_W},
             {.slice  = vf->draw_count,
-             .stage  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-             .access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT},
+             .stage  = STAGE_CS,
+             .access = ACCESS_SSBO_W},
             {.slice  = vf->scan_aux,
-             .stage  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-             .access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT},
+             .stage  = STAGE_CS,
+             .access = ACCESS_SSBO_W},
             /* cs_scan_blocks mirrors the command count here; without this
                declaration the write is not published before the readback copy. */
             {.slice  = s->counters[lane],
-             .stage  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-             .access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT},
+             .stage  = STAGE_CS,
+             .access = ACCESS_SSBO_W},
             /* cs_emit records vis_base -> group id so the VS can resolve mesh
                from a uniform per-draw row instead of decoding a packed key */
             {.slice  = vf->group_base,
-             .stage  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-             .access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT},
+             .stage  = STAGE_CS,
+             .access = ACCESS_SSBO_W},
         };
         PassDesc scan_pass = {
             .buf_reads       = scan_reads,
@@ -1398,8 +1398,8 @@ void scene_frame(Scene *s, VkCommandBuffer cmd, RenderTarget *color, RenderTarge
            missing slots in vis[] that changed as the camera culled instances. */
         BufferAccess block_reads[1] = {
             {.slice  = vf->scan_aux,
-             .stage  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-             .access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT},
+             .stage  = STAGE_CS,
+             .access = ACCESS_SSBO_R},
         };
         PassDesc block_pass = {
             .buf_reads       = block_reads,
@@ -1416,14 +1416,14 @@ void scene_frame(Scene *s, VkCommandBuffer cmd, RenderTarget *color, RenderTarge
            scan_aux regions 1 and 2. */
         BufferAccess emit_reads[3] = {
             {.slice  = vf->group_count,
-             .stage  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-             .access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT},
+             .stage  = STAGE_CS,
+             .access = ACCESS_SSBO_R},
             {.slice  = s->group_static,
-             .stage  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-             .access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT},
+             .stage  = STAGE_CS,
+             .access = ACCESS_SSBO_R},
             {.slice  = vf->scan_aux,
-             .stage  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-             .access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT},
+             .stage  = STAGE_CS,
+             .access = ACCESS_SSBO_R},
         };
         PassDesc emit_pass = {
             .buf_reads       = emit_reads,
@@ -1439,22 +1439,22 @@ void scene_frame(Scene *s, VkCommandBuffer cmd, RenderTarget *color, RenderTarge
         /* T3c: scatter survivors into their group's contiguous vis range */
         BufferAccess scatter_reads[4] = {
             {.slice  = vf->survivors,
-             .stage  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-             .access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT},
+             .stage  = STAGE_CS,
+             .access = ACCESS_SSBO_R},
             {.slice  = vf->survivor_count,
-             .stage  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-             .access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT},
+             .stage  = STAGE_CS,
+             .access = ACCESS_SSBO_R},
             {.slice  = vf->vis_base,
-             .stage  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-             .access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT},
+             .stage  = STAGE_CS,
+             .access = ACCESS_SSBO_R},
             {.slice  = vf->cursor,
-             .stage  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-             .access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT},
+             .stage  = STAGE_CS,
+             .access = ACCESS_SSBO_R | ACCESS_SSBO_W},
         };
         BufferAccess scatter_writes[1] = {
             {.slice  = vf->vis,
-             .stage  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-             .access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT},
+             .stage  = STAGE_CS,
+             .access = ACCESS_SSBO_W},
         };
         PassDesc scatter_pass = {
             .buf_reads       = scatter_reads,
@@ -1477,41 +1477,41 @@ void scene_frame(Scene *s, VkCommandBuffer cmd, RenderTarget *color, RenderTarge
 
         BufferAccess draw_reads[12] = {
             {.slice  = s->instances,
-             .stage  = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT,
-             .access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT},
+             .stage  = STAGE_VERT,
+             .access = ACCESS_SSBO_R},
             {.slice  = s->vertex_arena,
-             .stage  = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT,
-             .access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT},
+             .stage  = STAGE_VERT,
+             .access = ACCESS_SSBO_R},
             {.slice  = s->group_shade,
-             .stage  = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT,
-             .access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT},
+             .stage  = STAGE_VERT,
+             .access = ACCESS_SSBO_R},
             {.slice  = s->materials,
-             .stage  = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
-             .access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT},
+             .stage  = STAGE_FRAG,
+             .access = ACCESS_SSBO_R},
             {.slice  = vf->vis,
-             .stage  = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT,
-             .access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT},
+             .stage  = STAGE_VERT,
+             .access = ACCESS_SSBO_R},
             {.slice  = vf->draws,
-             .stage  = VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT,
-             .access = VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT},
+             .stage  = STAGE_DRAW,
+             .access = ACCESS_INDIRECT},
             {.slice  = vf->draw_count,
-             .stage  = VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT,
-             .access = VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT},
+             .stage  = STAGE_DRAW,
+             .access = ACCESS_INDIRECT},
             {.slice  = s->index_arena,
-             .stage  = VK_PIPELINE_STAGE_2_INDEX_INPUT_BIT,
-             .access = VK_ACCESS_2_INDEX_READ_BIT},
+             .stage  = STAGE_INDEX,
+             .access = ACCESS_INDEX},
             {.slice  = vf->group_base,
-             .stage  = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT,
-             .access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT},
+             .stage  = STAGE_VERT,
+             .access = ACCESS_SSBO_R},
             {.slice  = s->bloom_table,
-             .stage  = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT,
-             .access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT},
+             .stage  = STAGE_VERT,
+             .access = ACCESS_SSBO_R},
             {.slice  = s->wiggle_table,
-             .stage  = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT,
-             .access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT},
+             .stage  = STAGE_VERT,
+             .access = ACCESS_SSBO_R},
             {.slice  = s->squash_table,
-             .stage  = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT,
-             .access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT},
+             .stage  = STAGE_VERT,
+             .access = ACCESS_SSBO_R},
         };
         PassDesc draw_pass = {
             .colors         = &col,

@@ -340,7 +340,7 @@ FORCE_INLINE uint64_t hash64_bytes(const void* data, size_t size)
         .sharingMode   = VK_SHARING_MODE_EXCLUSIVE,                                                                    \
         .queueFamilyIndexCount = 0,                                                                                    \
         .pQueueFamilyIndices   = NULL,                                                                                 \
-        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,                                                                    \
+        .initialLayout = LAYOUT_UNDEFINED,                                                                    \
     }
 
 

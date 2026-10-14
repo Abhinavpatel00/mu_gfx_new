@@ -29,8 +29,8 @@ static bool atlas_create(SpriteSystem *s, uint32_t width, uint32_t height) {
         .height     = height,
         .mip_count  = 1,
         .format     = VK_FORMAT_R8G8B8A8_SRGB,
-        .usage      = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
-                 VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+        .usage      = IMG_SAMPLED | IMG_XFER_DST |
+                 IMG_XFER_SRC,
         .debug_name = "sprite_atlas",
     };
 
@@ -81,8 +81,8 @@ static bool atlas_grow(SpriteSystem *s, uint32_t index) {
         .height     = new_height,
         .mip_count  = 1,
         .format     = VK_FORMAT_R8G8B8A8_SRGB,
-        .usage      = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
-                  VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+        .usage      = IMG_SAMPLED | IMG_XFER_DST |
+                  IMG_XFER_SRC,
         .debug_name = "sprite_atlas",
     };
 
@@ -106,8 +106,8 @@ static bool atlas_grow(SpriteSystem *s, uint32_t index) {
         .sType                 = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
         .srcAccessMask         = VK_ACCESS_SHADER_READ_BIT,
         .dstAccessMask         = VK_ACCESS_TRANSFER_READ_BIT,
-        .oldLayout             = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-        .newLayout             = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        .oldLayout             = LAYOUT_SHADER_RO,
+        .newLayout             = LAYOUT_XFER_SRC,
         .srcQueueFamilyIndex   = VK_QUEUE_FAMILY_IGNORED,
         .dstQueueFamilyIndex   = VK_QUEUE_FAMILY_IGNORED,
         .image                 = old_image->image,
@@ -117,8 +117,8 @@ static bool atlas_grow(SpriteSystem *s, uint32_t index) {
         .sType                 = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
         .srcAccessMask         = 0,
         .dstAccessMask         = VK_ACCESS_TRANSFER_WRITE_BIT,
-        .oldLayout             = VK_IMAGE_LAYOUT_UNDEFINED,
-        .newLayout             = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        .oldLayout             = LAYOUT_UNDEFINED,
+        .newLayout             = LAYOUT_XFER_DST,
         .srcQueueFamilyIndex   = VK_QUEUE_FAMILY_IGNORED,
         .dstQueueFamilyIndex   = VK_QUEUE_FAMILY_IGNORED,
         .image                 = new_image->image,
@@ -138,14 +138,14 @@ static bool atlas_grow(SpriteSystem *s, uint32_t index) {
         .dstOffset      = {0, 0, 0},
         .extent         = {a->width, a->height, 1},
     };
-    vkCmdCopyImage(cmd, old_image->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, new_image->image,
-                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+    vkCmdCopyImage(cmd, old_image->image, LAYOUT_XFER_SRC, new_image->image,
+                   LAYOUT_XFER_DST, 1, &copy);
 
     VkImageMemoryBarrier to_read = to_dst;
     to_read.srcAccessMask        = VK_ACCESS_TRANSFER_WRITE_BIT;
     to_read.dstAccessMask        = VK_ACCESS_SHADER_READ_BIT;
-    to_read.oldLayout            = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    to_read.newLayout            = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    to_read.oldLayout            = LAYOUT_XFER_DST;
+    to_read.newLayout            = LAYOUT_SHADER_RO;
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
                          VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, 0,
                          NULL, 1, &to_read);
@@ -204,7 +204,7 @@ static bool atlas_upload(SpriteSystem *s, uint32_t atlas_index, uint32_t x, uint
     VkDeviceSize bytes = (VkDeviceSize)w * h * 4u;
 
     Buffer staging;
-    if (!create_buffer(vk, bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VMA_MEMORY_USAGE_CPU_ONLY, &staging))
+    if (!create_buffer(vk, bytes, BUF_XFER_SRC, VMA_MEMORY_USAGE_CPU_ONLY, &staging))
         return false;
     memcpy(staging.mapping, pixels, (size_t)bytes);
 
@@ -214,8 +214,8 @@ static bool atlas_upload(SpriteSystem *s, uint32_t atlas_index, uint32_t x, uint
         .sType                = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
         .srcAccessMask        = a->uploaded ? VK_ACCESS_SHADER_READ_BIT : 0,
         .dstAccessMask        = VK_ACCESS_TRANSFER_WRITE_BIT,
-        .oldLayout            = a->uploaded ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED,
-        .newLayout            = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        .oldLayout            = a->uploaded ? LAYOUT_SHADER_RO : LAYOUT_UNDEFINED,
+        .newLayout            = LAYOUT_XFER_DST,
         .srcQueueFamilyIndex  = VK_QUEUE_FAMILY_IGNORED,
         .dstQueueFamilyIndex  = VK_QUEUE_FAMILY_IGNORED,
         .image                = tex->image,
@@ -235,13 +235,13 @@ static bool atlas_upload(SpriteSystem *s, uint32_t atlas_index, uint32_t x, uint
         .imageOffset       = {(int32_t)x, (int32_t)y, 0},
         .imageExtent       = {w, h, 1},
     };
-    vkCmdCopyBufferToImage(cmd, staging.buffer, tex->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+    vkCmdCopyBufferToImage(cmd, staging.buffer, tex->image, LAYOUT_XFER_DST, 1, &region);
 
     VkImageMemoryBarrier to_read = to_dst;
     to_read.srcAccessMask        = VK_ACCESS_TRANSFER_WRITE_BIT;
     to_read.dstAccessMask        = VK_ACCESS_SHADER_READ_BIT;
-    to_read.oldLayout            = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    to_read.newLayout            = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    to_read.oldLayout            = LAYOUT_XFER_DST;
+    to_read.newLayout            = LAYOUT_SHADER_RO;
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
                          VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, 0,
                          NULL, 1, &to_read);

@@ -73,8 +73,8 @@ static uint32_t *load_textures(VkBackend *vk, const Muasset *blob, const char *m
                                                                .layers    = 1,
                                                                .mip_count = t->mip_count,
                                                                .format    = fmt,
-                                                               .usage     = VK_IMAGE_USAGE_SAMPLED_BIT |
-                                                                         VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                                                               .usage     = IMG_SAMPLED |
+                                                                         IMG_XFER_DST,
                                                                .debug_name = "mua_tex"});
         if (tex == UINT32_MAX) {
             snprintf(err, err_cap, "%s: texture pool exhausted", tex_path);
