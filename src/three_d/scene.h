@@ -114,6 +114,12 @@ float scene_instance_bloom(const Scene *s, uint32_t slot);
 void  scene_set_instance_wiggle(Scene *s, uint32_t slot, float amp);
 float scene_instance_wiggle(const Scene *s, uint32_t slot);
 
+/* Per-instance vertical squash for hop squash-and-stretch. 1 = rest shape, <1
+   squashed, >1 stretched; the VS widens x/z to preserve volume. Mirrors the
+   wiggle table: set any time, re-uploaded whole when dirty. Defaults to 1. */
+void  scene_set_instance_squash(Scene *s, uint32_t slot, float v);
+float scene_instance_squash(const Scene *s, uint32_t slot);
+
 /* Reclaims retired slots. O(instances); call at load time, never per event. */
 void scene_compact_slots(Scene *s);
 

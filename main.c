@@ -94,8 +94,9 @@ static const char *const pets_assets[A_COUNT] = {
 #define MEADOW_TILE_STEP  4.0f
 #define MEADOW_PATH_STEPS 24
 /* Room left for props the game will move; the region is a fixed slot range, so
-   a scene with none still pays for its ceiling and nothing else. */
-#define MEADOW_MOVING     16
+   a scene with none still pays for its ceiling and nothing else. The slime
+   crowd is 3 instances per slime (body, dark features, white glints) x 12. */
+#define MEADOW_MOVING     48
 
 /* A species' planting rule. Radial bands rather than a hand-placed list: a
    couple of thousand props is past the point a table stays readable, and a
@@ -313,18 +314,65 @@ static uint32_t pets_build_assets(Scene *scene) {
     return total_meshes;
 }
 
-/* ---- hero gel slime ------------------------------------------------------- */
-/* A procedural squashed UV-sphere carrying a gel material (SCENE_MAT_GEL): the
-   vertex shader jiggles it (scene_set_instance_wiggle) and the fragment shader
-   adds a fresnel rim. No asset and no recook — the geometry and material are
-   built in code and staged exactly like a cooked mesh. It is a dynamic instance
-   that never moves, so the camera (flycam) orbits it and the only per-frame cost
-   is the 20-byte dynamic-prefix rewrite the scene already does. */
-#define SLIME_SEG   24u /* longitude segments */
-#define SLIME_RING  16u /* latitude rings, poles excluded */
-#define SLIME_VERTS (2u + (SLIME_RING - 1u) * SLIME_SEG)
-/* indices: two SEG-triangle caps plus (RING-2) bands of SEG quads (6 each) */
-#define SLIME_INDXS (6u * SLIME_SEG * (SLIME_RING - 1u))
+/* ---- slime crowd ----------------------------------------------------------- */
+/* Twelve expressive gel slimes that bounce instead of walk: each one is a
+   dynamic instance whose pos/scale the CPU rewrites every frame from a cheap
+   hop integrator, while the GPU adds idle jiggle (wiggle table, subscribed
+   once) plus air/land squash from a second per-instance channel. Rounded
+   procedural geometry: squashed UV-sphere body, big glossy eyes + smiling
+   mouth as one dark inset face mesh, and a pair of stubby horn/ear cones. All
+   gel material, all vibrant base colors, zero cooked assets. */
+
+#define SLIME_COUNT 12u
+#define SLIME_GRAV  14.0f /* world units / s^2: snappy, cartoon falls */
+#define SLIME_GROUND_Y 0.0f
+
+/* Lat/long UV-sphere: 2 poles + (SLIME_RING-1) rings of SLIME_SEG verts. */
+#define SLIME_SEG   16u
+#define SLIME_RING   9u
+/* One sphere of seg x ring divisions: 2 poles + (ring-1) interior rows. */
+#define SPHERE_VERTS(seg, ring) (2u + ((ring) - 1u) * (seg))
+#define SPHERE_IDXS(seg, ring)  ((seg) * 3u + ((ring) - 2u) * (seg) * 6u + (seg) * 3u)
+#define SLIME_VERTS SPHERE_VERTS(SLIME_SEG, SLIME_RING)
+#define SLIME_INDXS SPHERE_IDXS(SLIME_SEG, SLIME_RING)
+/* Per-mesh arena sizes: body + 2 ears, eyes + 7 smile beads, 2 glints. */
+#define DARK_VERTS (2u * SPHERE_VERTS(12u, 6u) + 7u * SPHERE_VERTS(8u, 5u))
+#define DARK_INDXS (2u * SPHERE_IDXS(12u, 6u) + 7u * SPHERE_IDXS(8u, 5u))
+
+typedef struct Slime {
+    uint32_t slot;      /* body instance slot (dynamic) */
+    uint32_t slot_dark; /* eye/smile instance: shares the body transform */
+    uint32_t slot_glint;/* white eye-shine instance: shares the body transform */
+    uint32_t tint;      /* 0..2: body mesh/material variant */
+    float    home[2];   /* wander anchor (x, z) */
+    float    pos[3];    /* contact point (bottom) in world space */
+    float    vel[3];    /* hop velocity while airborne */
+    float    scale;     /* uniform body scale */
+    float    dwell;     /* seconds on the ground until the next hop */
+    float    yaw;       /* facing, smoothed toward travel */
+    float    yaw_tgt;
+    float    squash;    /* current vertical squash, 1 = rest */
+    bool     air;       /* true while the hop arc is above ground */
+} Slime;
+
+typedef struct SlimeCrowd {
+    Slime    slimes[SLIME_COUNT];
+    uint32_t body_mesh[3]; /* one per tint: a mesh owns one material */
+    uint32_t dark_mesh;    /* eyes + smile */
+    uint32_t glint_mesh;   /* white eye shine */
+    uint32_t mat_body[3];
+    uint32_t mat_dark;
+    uint32_t mat_white;
+} SlimeCrowd;
+
+static SlimeCrowd g_slimes;
+
+/* Vibrant gel base colors, opaque. */
+static const uint32_t kSlimeTint[3] = {
+    240u | (120u << 8) | (190u << 16) | (255u << 24), /* berry pink  */
+    130u | (230u << 8) | (170u << 16) | (255u << 24), /* mint        */
+    255u | (160u << 8) | ( 90u << 16) | (255u << 24), /* tangerine   */
+};
 
 static void slime_pack(struct ScenePackedVertex *out, float x, float y, float z, float u, float v) {
     float inv = 1.0f / sqrtf(x * x + y * y + z * z);
@@ -334,13 +382,70 @@ static void slime_pack(struct ScenePackedVertex *out, float x, float y, float z,
     scene_pack_vertex(out, pos, nrm, uv);
 }
 
-/* Stages the slime mesh + gel material and spawns one instance. Returns the
-   instance slot, or UINT32_MAX on failure. Must run before scene_upload_scene. */
-static uint32_t slime_build(Scene *scene) {
+/* Appends a UV-sphere centred at (cx,cy,cz) with the same pole/ring layout the
+   body builder uses. Normals radiate from the sphere's own centre, so features
+   (ears, eyes, smile, glints) shade as round solids rather than as bumps on the
+   body. *nv/*ni advance; idxs are relative to the array base. */
+static void slime_sphere(struct ScenePackedVertex *verts, uint16_t *idxs, uint32_t *nv, uint32_t *ni, float cx, float cy,
+                         float cz, float r, uint32_t seg, uint32_t ring) {
+    uint32_t b = *nv, k = *ni;
+
+    uint32_t top = b;
+    ++b;
+    for (uint32_t ri = 1; ri < ring; ++ri) {
+        float theta = 3.14159265f * (float)ri / (float)ring;
+        float py    = cosf(theta) * r;
+        float pr    = sinf(theta) * r;
+        for (uint32_t s = 0; s < seg; ++s) {
+            float phi = 6.2831853f * (float)s / (float)seg;
+            float dx  = cosf(phi) * pr, dy = py, dz = sinf(phi) * pr;
+            float inv = 1.0f / sqrtf(dx * dx + dy * dy + dz * dz);
+            float pos[3] = {cx + dx, cy + dy, cz + dz};
+            float nrm[3] = {dx * inv, dy * inv, dz * inv};
+            float uv[2]  = {(float)s / (float)seg, (float)ri / (float)ring};
+            scene_pack_vertex(&verts[b++], pos, nrm, uv);
+        }
+    }
+    uint32_t bot = b;
+    ++b;
+
+    for (uint32_t s = 0; s < seg; ++s) {
+        idxs[k++] = (uint16_t)top;
+        idxs[k++] = (uint16_t)(top + 1u + s);
+        idxs[k++] = (uint16_t)(top + 1u + (s + 1u) % seg);
+    }
+    for (uint32_t ri = 1; ri + 1u < ring; ++ri) {
+        uint32_t a0 = top + 1u + (ri - 1u) * seg;
+        uint32_t b0 = top + 1u + ri * seg;
+        for (uint32_t s = 0; s < seg; ++s) {
+            uint32_t sn = (s + 1u) % seg;
+            idxs[k++] = (uint16_t)(a0 + s);
+            idxs[k++] = (uint16_t)(b0 + s);
+            idxs[k++] = (uint16_t)(b0 + sn);
+            idxs[k++] = (uint16_t)(a0 + s);
+            idxs[k++] = (uint16_t)(b0 + sn);
+            idxs[k++] = (uint16_t)(a0 + sn);
+        }
+    }
+    uint32_t ring0 = top + 1u + (ring - 2u) * seg;
+    for (uint32_t s = 0; s < seg; ++s) {
+        idxs[k++] = (uint16_t)bot;
+        idxs[k++] = (uint16_t)(ring0 + (s + 1u) % seg);
+        idxs[k++] = (uint16_t)(ring0 + s);
+    }
+
+    *nv = b;
+    *ni = k;
+}
+
+/* Stages the slime crowd: three tinted body meshes (sphere + ear nubs), the
+   dark eye/smile mesh, the white glint mesh, their materials, and 12 dynamic
+   instance triples. Returns false on failure. Runs before scene_upload_scene. */
+static bool slime_build(Scene *scene) {
     const float radius = 1.0f, squash = 0.8f;
 
-    static struct ScenePackedVertex verts[SLIME_VERTS];
-    static uint16_t                  idxs[SLIME_INDXS];
+    static struct ScenePackedVertex verts[SLIME_VERTS + 2u * SPHERE_VERTS(10u, 6u)];
+    static uint16_t                  idxs[SLIME_INDXS + 2u * SPHERE_IDXS(10u, 6u)];
 
     uint32_t n = 0;
     slime_pack(&verts[n++], 0.0f, radius * squash, 0.0f, 0.5f, 0.0f); /* top pole */
@@ -388,40 +493,248 @@ static uint32_t slime_build(Scene *scene) {
         }
     }
 
-    struct SceneGpuMaterial mat = {0};
-    mat.base_color     = 240u | (150u << 8) | (190u << 16) | (255u << 24); /* slime pink */
-    mat.texture        = 0xFFFFFFFFu;
-    mat.normal_texture = 0xFFFFFFFFu;
-    mat.orm_texture    = 0xFFFFFFFFu;
-    mat.flags          = SCENE_MAT_GEL;
-    mat.roughness      = 0.25f; /* wet: tight, sharp specular */
-    uint32_t mi = scene_material_add(scene, &mat);
-    if (mi == UINT32_MAX)
-        return UINT32_MAX;
+    /* Ear nubs: small spheres half-buried in the crown, sharing the body
+       material so they take the tint, the jiggle and the squash. */
+    slime_sphere(verts, idxs, &n, &k, -0.47f, 0.70f, 0.0f, 0.19f, 10u, 6u);
+    slime_sphere(verts, idxs, &n, &k, 0.47f, 0.70f, 0.0f, 0.19f, 10u, 6u);
 
-    SceneLodDesc lod = {.first_vertex = 0, .first_index = 0, .index_count = k, .error = 1.0e9f};
+    SceneLodDesc body_lod = {.first_vertex = 0, .first_index = 0, .index_count = k, .error = 1.0e9f};
     SceneMeshDesc md = {.vertices     = verts,
                         .vertex_count = n,
                         .indices      = idxs,
                         .index_count  = k,
-                        .lods         = &lod,
+                        .lods         = &body_lod,
                         .lod_count    = 1,
                         .local_center = {0.0f, 0.0f, 0.0f},
                         .local_radius = radius,
-                        .material     = mi};
-    uint32_t mesh = scene_mesh_add(scene, &md);
-    if (mesh == UINT32_MAX)
-        return UINT32_MAX;
+                        .material     = 0};
 
-    float     scale = 1.7f;
-    uint32_t  slot  = scene_instance_create(scene, &(SceneInstanceDesc){.pos   = {2.5f, 0.8f * scale, 4.0f},
-                                                                       .scale = scale,
-                                                                       .mesh  = mesh});
-    if (slot == UINT32_MAX)
-        return UINT32_MAX;
-    scene_set_instance_wiggle(scene, slot, 0.06f);
-    log_info("[slime] mesh %u material %u instance %u (%u verts %u idx)", mesh, mi, slot, n, k);
-    return slot;
+    /* One mesh owns one material, so the three tints are three meshes over the
+       same staged geometry. */
+    for (uint32_t t = 0; t < 3u; ++t) {
+        struct SceneGpuMaterial mat = {0};
+        mat.base_color     = kSlimeTint[t];
+        mat.texture        = 0xFFFFFFFFu;
+        mat.normal_texture = 0xFFFFFFFFu;
+        mat.orm_texture    = 0xFFFFFFFFu;
+        mat.flags          = SCENE_MAT_GEL;
+        mat.roughness      = 0.25f; /* wet: tight, sharp specular */
+        uint32_t mi = scene_material_add(scene, &mat);
+        if (mi == UINT32_MAX)
+            return false;
+        md.material           = mi;
+        uint32_t mesh         = scene_mesh_add(scene, &md);
+        if (mesh == UINT32_MAX)
+            return false;
+        g_slimes.mat_body[t]  = mi;
+        g_slimes.body_mesh[t] = mesh;
+    }
+
+    /* Dark features: two large eyes on the front (+Z) and a seven-bead smile
+       arc whose corners ride higher than its centre. */
+    static struct ScenePackedVertex dverts[DARK_VERTS];
+    static uint16_t                  didxs[DARK_INDXS];
+    uint32_t dn = 0, dk = 0;
+    slime_sphere(dverts, didxs, &dn, &dk, -0.30f, 0.18f, 0.86f, 0.20f, 12u, 6u);
+    slime_sphere(dverts, didxs, &dn, &dk, 0.30f, 0.18f, 0.86f, 0.20f, 12u, 6u);
+    for (uint32_t i = 0; i < 7u; ++i) {
+        float x = -0.30f + 0.10f * (float)i;
+        float q = x / 0.30f;
+        float y = -0.24f + 0.20f * q * q;
+        float z = sqrtf(1.0f - x * x - (y / squash) * (y / squash)) + 0.015f;
+        slime_sphere(dverts, didxs, &dn, &dk, x, y, z, 0.055f, 8u, 5u);
+    }
+
+    struct SceneGpuMaterial dark = {0};
+    dark.base_color     = 24u | (28u << 8) | (44u << 16) | (255u << 24); /* near-black navy */
+    dark.texture        = 0xFFFFFFFFu;
+    dark.normal_texture = 0xFFFFFFFFu;
+    dark.orm_texture    = 0xFFFFFFFFu;
+    dark.flags          = SCENE_MAT_GEL;
+    dark.roughness      = 0.12f; /* glossy: the eyes catch a specular glint */
+    uint32_t dmi        = scene_material_add(scene, &dark);
+    if (dmi == UINT32_MAX)
+        return false;
+    SceneLodDesc dark_lod = {.first_vertex = 0, .first_index = 0, .index_count = dk, .error = 1.0e9f};
+    g_slimes.dark_mesh = scene_mesh_add(scene, &(SceneMeshDesc){.vertices     = dverts,
+                                                                 .vertex_count = dn,
+                                                                 .indices      = didxs,
+                                                                 .index_count  = dk,
+                                                                 .lods         = &dark_lod,
+                                                                 .lod_count    = 1,
+                                                                 .local_center = {0.0f, 0.0f, 0.0f},
+                                                                 .local_radius = 1.2f,
+                                                                 .material     = dmi});
+    if (g_slimes.dark_mesh == UINT32_MAX)
+        return false;
+    g_slimes.mat_dark = dmi;
+
+    /* White eye shine, sitting on each eye's upper-outer surface: the fixed
+       highlight that makes the eyes read as expressive at any camera angle. */
+    static struct ScenePackedVertex wverts[2u * SPHERE_VERTS(8u, 5u)];
+    static uint16_t                  widxs[2u * SPHERE_IDXS(8u, 5u)];
+    uint32_t wn = 0, wk = 0;
+    for (uint32_t i = 0; i < 2u; ++i) {
+        float sx = i ? 1.0f : -1.0f;
+        float dx = -sx * 0.16f, dy = 0.45f, dz = 0.88f; /* roughly unit */
+        slime_sphere(wverts, widxs, &wn, &wk, sx * 0.30f + dx * 0.20f, 0.18f + dy * 0.20f, 0.86f + dz * 0.20f, 0.07f,
+                     8u, 5u);
+    }
+
+    struct SceneGpuMaterial white = {0};
+    white.base_color     = 255u | (255u << 8) | (255u << 16) | (255u << 24);
+    white.texture        = 0xFFFFFFFFu;
+    white.normal_texture = 0xFFFFFFFFu;
+    white.orm_texture    = 0xFFFFFFFFu;
+    white.flags          = SCENE_MAT_GEL;
+    white.roughness      = 0.35f;
+    uint32_t wmi         = scene_material_add(scene, &white);
+    if (wmi == UINT32_MAX)
+        return false;
+    SceneLodDesc white_lod = {.first_vertex = 0, .first_index = 0, .index_count = wk, .error = 1.0e9f};
+    g_slimes.glint_mesh = scene_mesh_add(scene, &(SceneMeshDesc){.vertices     = wverts,
+                                                                  .vertex_count = wn,
+                                                                  .indices      = widxs,
+                                                                  .index_count  = wk,
+                                                                  .lods         = &white_lod,
+                                                                  .lod_count    = 1,
+                                                                  .local_center = {0.0f, 0.0f, 0.0f},
+                                                                  .local_radius = 1.2f,
+                                                                  .material     = wmi});
+    if (g_slimes.glint_mesh == UINT32_MAX)
+        return false;
+    g_slimes.mat_white = wmi;
+
+    /* Spawn the crowd as contiguous slot triples: the VS phases its jiggle off
+       slot/3, so body, dark and glint of one slime must share a triple. */
+    for (uint32_t i = 0; i < SLIME_COUNT; ++i) {
+        Slime *s = &g_slimes.slimes[i];
+        s->tint  = i % 3u;
+        float ang = frand() * 6.2831853f;
+        float rad = 1.5f + frand() * 5.5f;
+        s->home[0] = cosf(ang) * rad;
+        s->home[1] = 1.5f + sinf(ang) * rad * 0.6f;
+        s->pos[0]  = s->home[0];
+        s->pos[1]  = SLIME_GROUND_Y;
+        s->pos[2]  = s->home[1];
+        s->vel[0] = s->vel[1] = s->vel[2] = 0.0f;
+        s->scale                          = 0.9f + frand() * 0.5f;
+        s->yaw = s->yaw_tgt               = frand() * 6.2831853f;
+        s->squash                          = 1.0f;
+        s->air                             = false;
+        s->dwell                           = frand() * 1.2f + (float)i * 0.09f;
+
+        SceneInstanceDesc d = {.pos   = {s->pos[0], 0.8f * s->scale, s->pos[2]},
+                               .scale = s->scale};
+        d.mesh            = g_slimes.body_mesh[s->tint];
+        s->slot           = scene_instance_create(scene, &d);
+        d.mesh            = g_slimes.dark_mesh;
+        s->slot_dark      = scene_instance_create(scene, &d);
+        d.mesh            = g_slimes.glint_mesh;
+        s->slot_glint     = scene_instance_create(scene, &d);
+        if (s->slot == UINT32_MAX || s->slot_dark == UINT32_MAX || s->slot_glint == UINT32_MAX) {
+            log_error("[slime] out of dynamic slots at %u", i);
+            return false;
+        }
+        if (s->slot_dark != s->slot + 1u || s->slot_glint != s->slot + 2u || (s->slot % 3u) != 0u) {
+            log_error("[slime] slot triple not contiguous: %u/%u/%u", s->slot, s->slot_dark, s->slot_glint);
+            return false;
+        }
+        scene_set_instance_wiggle(scene, s->slot, 0.06f);
+        scene_set_instance_wiggle(scene, s->slot_dark, 0.06f);
+        scene_set_instance_wiggle(scene, s->slot_glint, 0.06f);
+    }
+    log_info("[slime] %u slimes: 3 body meshes + dark + glint, %u dynamic slots", SLIME_COUNT, SLIME_COUNT * 3u);
+    return true;
+}
+
+/* Per-frame hop sim: gravity, ground contact, wander, and the squash channel
+   the VS reads. Writes only the crowd's dynamic instances; the static meadow
+   is never touched. */
+static void slime_frame(Scene *scene, float dt) {
+    if (dt <= 0.0f || dt > 0.1f)
+        dt = 0.1f;
+    for (uint32_t i = 0; i < SLIME_COUNT; ++i) {
+        Slime *s         = &g_slimes.slimes[i];
+        float  squash_tgt = 1.0f;
+
+        if (s->air) {
+            s->vel[1] -= SLIME_GRAV * dt;
+            s->pos[0] += s->vel[0] * dt;
+            s->pos[1] += s->vel[1] * dt;
+            s->pos[2] += s->vel[2] * dt;
+            if (s->pos[1] <= SLIME_GROUND_Y) {
+                s->pos[1] = SLIME_GROUND_Y;
+                s->air    = false;
+                s->squash = 0.55f; /* landing pancake; springs back below */
+                s->vel[0] = s->vel[2] = 0.0f;
+                s->dwell  = 0.35f + frand() * 0.6f;
+            } else {
+                /* stretch with vertical speed: fast fall = long slime */
+                squash_tgt = 1.0f + fabsf(s->vel[1]) * 0.030f;
+                if (squash_tgt > 1.35f)
+                    squash_tgt = 1.35f;
+            }
+        } else {
+            s->dwell -= dt;
+            if (s->dwell <= 0.0f) {
+                float ang = frand() * 6.2831853f;
+                float rad = 1.5f + frand() * 5.5f;
+                float tx  = s->home[0] + cosf(ang) * rad;
+                float tz  = s->home[1] + sinf(ang) * rad * 0.6f;
+                float dx  = tx - s->pos[0], dz = tz - s->pos[2];
+                float dl  = sqrtf(dx * dx + dz * dz);
+                if (dl > 0.001f) {
+                    dx /= dl;
+                    dz /= dl;
+                } else {
+                    dx = dz = 0.0f;
+                }
+                float sp    = 2.0f + frand() * 2.0f;
+                s->vel[0]   = dx * sp;
+                s->vel[2]   = dz * sp;
+                s->vel[1]   = 6.0f + frand() * 2.5f;
+                s->air      = true;
+                s->squash   = 0.78f; /* coiled push-off */
+                if (dl > 0.001f)
+                    s->yaw_tgt = atan2f(dx, dz); /* +Z is the face */
+            }
+        }
+
+        /* One fast ease toward the target so the pancake reads as a single
+           impact rather than a lerped sag. */
+        float ease = dt * 14.0f;
+        if (ease > 1.0f)
+            ease = 1.0f;
+        s->squash += (squash_tgt - s->squash) * ease;
+
+        float dyaw = s->yaw_tgt - s->yaw;
+        while (dyaw > 3.14159265f)
+            dyaw -= 6.2831853f;
+        while (dyaw < -3.14159265f)
+            dyaw += 6.2831853f;
+        float yase = dt * 6.0f;
+        if (yase > 1.0f)
+            yase = 1.0f;
+        s->yaw += dyaw * yase;
+
+        /* Contact point stays planted: the body spans +/-0.8*scale in local y,
+           scaled by squash in the VS, so the centre rides at bottom + that. */
+        float cy  = s->pos[1] + 0.8f * s->squash * s->scale;
+        float hy  = sinf(s->yaw * 0.5f), hw = cosf(s->yaw * 0.5f);
+        SceneInstanceDesc d = {.pos   = {s->pos[0], cy, s->pos[2]},
+                               .quat  = {0.0f, hy, 0.0f, hw},
+                               .scale = s->scale};
+        d.mesh = g_slimes.body_mesh[s->tint];
+        scene_instance_set(scene, s->slot, &d);
+        d.mesh = g_slimes.dark_mesh;
+        scene_instance_set(scene, s->slot_dark, &d);
+        d.mesh = g_slimes.glint_mesh;
+        scene_instance_set(scene, s->slot_glint, &d);
+        scene_set_instance_squash(scene, s->slot, s->squash);
+        scene_set_instance_squash(scene, s->slot_dark, s->squash);
+        scene_set_instance_squash(scene, s->slot_glint, s->squash);
+    }
 }
 
 static void pets_start(void *user, Renderer *renderer) {
@@ -516,6 +829,9 @@ static void pets_frame(void *user, const GameFrame *frame) {
 
     flycam_update(&p->cam, frame->input, frame->dt);
 
+    if (p->scene)
+        slime_frame(p->scene, p->dt);
+
     /* TEMP: scripted flycam sweep for verification. Removed after the shot. */
     if (getenv("MU_FLYCAM_TEST")) {
         static int n = 0;
@@ -600,12 +916,13 @@ static void pets_render(void *user, VkCommandBuffer cmd, RenderTarget *color, Re
            tile with a 2-rung tree needs max_meshes * 2 rows, not the sum of the
            assets' own ladders — sizing it from the sum runs out mid-roster. */
         uint32_t total = pets_instance_total(asset_meshes);
-        /* +1 mesh and +1 material for the procedural gel slime staged after the
-           cooked assets; mesh and material capacities are fixed at create. The
-           slime is a dynamic instance, so it draws from the MEADOW_MOVING reserve
-           and total (the static count) is unchanged. */
-        max_meshes += 1u;
-        max_materials += 1u;
+        /* +5 meshes and +5 materials for the procedural slime crowd staged after
+           the cooked assets: three tinted body variants, the dark eye/smile
+           feature mesh and the white glint mesh. Mesh and material capacities
+           are fixed at create; the instances themselves are dynamic and draw
+           from the MEADOW_MOVING reserve, so the static count is unchanged. */
+        max_meshes += 5u;
+        max_materials += 5u;
         /* A mesh is charged the scene-wide rung count, not its own, because a
            group id is mesh * lod_count + lod. So a roster that mixes a 1-rung
            tile with a 2-rung tree needs max_meshes * 2 rows, not the sum of the
@@ -631,10 +948,12 @@ static void pets_render(void *user, VkCommandBuffer cmd, RenderTarget *color, Re
             return;
         }
 
-        /* Hero gel slime: one dynamic instance out of the MEADOW_MOVING reserve.
-           Built before the upload so its mesh/material/instance are staged with
-           the rest. */
-        slime_build(scene);
+        /* Slime crowd: 12 dynamic triples (body, dark face, white glints) out of
+           the MEADOW_MOVING reserve, staged before the upload with the rest. */
+        if (!slime_build(scene)) {
+            scene_destroy(scene);
+            return;
+        }
 
         if (!scene_upload_scene(scene, cmd)) {
             scene_destroy(scene);

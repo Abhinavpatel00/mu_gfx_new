@@ -205,6 +205,7 @@ struct SceneDrawPush {
     SCENE_PTR(SceneGpuMaterial) materials;
     SCENE_PTR(float) bloom;
     SCENE_PTR(float) wiggle; /* per-instance jiggle amplitude; 0 = static */
+    SCENE_PTR(float) squash; /* per-instance vertical squash; 1 = rest */
     SCENE_U32 counts[8]; /* 5 shader printf */
 };
 

@@ -200,6 +200,13 @@ struct Scene {
     bool        wiggle_dirty; /* an amplitude changed; re-upload the table */
     BufferSlice wiggle_table; /* max_instances x float on the GPU */
 
+    /* Squash: per-instance hop squash-and-stretch, same machinery as wiggle.
+       1 = rest, <1 squashed, >1 stretched. Set every frame for hopping slimes;
+       the table re-uploads whole only when dirty, like wiggle. */
+    float      *squash_v;
+    bool        squash_dirty;
+    BufferSlice squash_table; /* max_instances x float on the GPU */
+
     /* per view, per frame-in-flight transient tables */
     SceneViewFrame view_frame[SCENE_MAX_VIEWS][MAX_FRAMES_IN_FLIGHT];
     uint32_t       view_count;
@@ -302,6 +309,7 @@ Scene *scene_create(VkBackend *vk, const SceneDesc *desc) {
         b += (uint64_t)s->max_instances * sizeof(uint32_t) * 4;      /* dirty + static_dirty + row_of + bloom_dense */
         b += (uint64_t)s->max_instances * sizeof(float);             /* bloom_strength */
         b += (uint64_t)s->max_instances * sizeof(float);             /* wiggle_amp */
+        b += (uint64_t)s->max_instances * sizeof(float);             /* squash_v */
         b += (uint64_t)s->max_instances * sizeof(uint32_t);          /* compact_dst */
         b += (uint64_t)s->max_meshes * sizeof(struct SceneCullMesh); /* cpu_cull */
         b += (uint64_t)s->max_meshes * SCENE_MAX_LODS * sizeof(struct SceneGroupShade);
@@ -353,6 +361,12 @@ Scene *scene_create(VkBackend *vk, const SceneDesc *desc) {
     memset(s->wiggle_amp, 0, (size_t)s->max_instances * sizeof(float));
     s->wiggle_table = alloc_slice(s, (VkDeviceSize)s->max_instances * sizeof(float), 16);
 
+    s->squash_v     = mu_arena_alloc(&s->arena, s->max_instances * sizeof(float), 16);
+    s->squash_dirty = false;
+    for (uint32_t i = 0; i < s->max_instances; ++i)
+        s->squash_v[i] = 1.0f; /* rest shape is the default, not 0 */
+    s->squash_table = alloc_slice(s, (VkDeviceSize)s->max_instances * sizeof(float), 16);
+
     s->cpu_cull = mu_arena_alloc(&s->arena, s->max_meshes * sizeof(struct SceneCullMesh), 16);
     s->cpu_group_shade =
         mu_arena_alloc(&s->arena, (uint32_t)(s->max_meshes * SCENE_MAX_LODS * sizeof(struct SceneGroupShade)), 16);
@@ -397,6 +411,7 @@ void scene_destroy(Scene *s) {
     buffer_pool_free(s->cull_rows);
     buffer_pool_free(s->bloom_table);
     buffer_pool_free(s->wiggle_table);
+    buffer_pool_free(s->squash_table);
     buffer_pool_free(s->group_static);
     buffer_pool_free(s->group_shade);
     buffer_pool_free(s->vertex_arena);
@@ -625,6 +640,27 @@ float scene_instance_wiggle(const Scene *s, uint32_t slot) {
     return s->wiggle_amp[slot];
 }
 
+/* Per-instance hop squash-and-stretch. Clamped to a sane cartoon range; a
+   change marks the table dirty so the next scene_frame re-uploads it whole. */
+void scene_set_instance_squash(Scene *s, uint32_t slot, float v) {
+    if (!s || slot >= s->max_instances || !s->cpu_instances[slot].alive)
+        return;
+    if (v < 0.5f)
+        v = 0.5f;
+    if (v > 1.6f)
+        v = 1.6f;
+    if (s->squash_v[slot] != v) {
+        s->squash_v[slot] = v;
+        s->squash_dirty   = true;
+    }
+}
+
+float scene_instance_squash(const Scene *s, uint32_t slot) {
+    if (!s || slot >= s->max_instances)
+        return 1.0f;
+    return s->squash_v[slot];
+}
+
 /* Removal is existence, not state: the candidate row goes away, so no hot loop
    ever asks whether this instance is alive. The slot is retired and becomes a
    hole; holes are reclaimed by scene_compact_slots() at load boundaries.
@@ -652,6 +688,7 @@ void scene_instance_destroy(Scene *s, uint32_t slot) {
         s->cpu_instances[slot]  = s->cpu_instances[last_slot];
         s->bloom_strength[slot] = s->bloom_strength[last_slot];
         s->wiggle_amp[slot]     = s->wiggle_amp[last_slot];
+        s->squash_v[slot]       = s->squash_v[last_slot];
         mu_bitset_set_bit(&s->bloom_bits, slot, mu_bitset_test(&s->bloom_bits, last_slot));
         s->row_of[slot]             = moved_row;
         s->cpu_rows[moved_row].slot = slot;
@@ -659,6 +696,7 @@ void scene_instance_destroy(Scene *s, uint32_t slot) {
     memset(&s->cpu_instances[last_slot], 0, sizeof(s->cpu_instances[last_slot]));
     s->bloom_strength[last_slot] = 0.0f;
     s->wiggle_amp[last_slot]     = 0.0f;
+    s->squash_v[last_slot]       = 1.0f;
     mu_bitset_reset(&s->bloom_bits, last_slot);
     s->bloom_dirty = true;
     s->instance_count--;
@@ -724,6 +762,7 @@ void scene_compact_slots(Scene *s) {
             s->cpu_instances[to]      = s->cpu_instances[i];
             s->bloom_strength[to]     = s->bloom_strength[i];
             s->wiggle_amp[to]         = s->wiggle_amp[i];
+            s->squash_v[to]           = s->squash_v[i];
             s->cpu_instances[i].alive = 0;
             s->row_of[i]              = UINT32_MAX;
         }
@@ -742,10 +781,12 @@ void scene_compact_slots(Scene *s) {
         else if (!s->cpu_instances[i].alive) {
             s->bloom_strength[i] = 0.0f;
             s->wiggle_amp[i]     = 0.0f;
+            s->squash_v[i]       = 1.0f;
         }
     }
     s->bloom_dirty  = true;
     s->wiggle_dirty = true;
+    s->squash_dirty = true;
 
     s->dynamic_count      = dyn;
     s->static_count       = sta;
@@ -834,7 +875,10 @@ bool scene_upload_scene(Scene *s, VkCommandBuffer cmd) {
                                     (ByteSpan){s->bloom_strength, (size_t)s->max_instances * sizeof(float)});
     renderer_upload_buffer_to_slice(vk, cmd, s->wiggle_table,
                                     (ByteSpan){s->wiggle_amp, (size_t)s->max_instances * sizeof(float)});
+    renderer_upload_buffer_to_slice(vk, cmd, s->squash_table,
+                                    (ByteSpan){s->squash_v, (size_t)s->max_instances * sizeof(float)});
     s->wiggle_dirty = false;
+    s->squash_dirty = false;
 
     /* Whole instance table, once. After this the dynamic prefix is rewritten by
        T1 each frame and the static suffix only when a static row actually
@@ -1034,6 +1078,7 @@ static void build_draw_push(Scene *s, uint32_t view, uint32_t lane, struct Scene
     p->materials   = slice_addr(vk, s->materials);
     p->bloom       = slice_addr(vk, s->bloom_table);
     p->wiggle      = slice_addr(vk, s->wiggle_table);
+    p->squash      = slice_addr(vk, s->squash_table);
 
     p->counts[5] = getenv("MU_SHADER_DEBUG") ? 1u : 0u;
 }
@@ -1148,10 +1193,13 @@ void scene_frame(Scene *s, VkCommandBuffer cmd, RenderTarget *color, RenderTarge
 
     /* Wiggle amplitudes are set at spawn, but scene_set_instance_wiggle may run
        after the first upload, so mirror bloom's dirty re-upload here. */
-    if (s->wiggle_dirty) {
+    if (s->wiggle_dirty || s->squash_dirty) {
         renderer_upload_buffer_to_slice(vk, cmd, s->wiggle_table,
                                         (ByteSpan){s->wiggle_amp, (size_t)s->max_instances * sizeof(float)});
+        renderer_upload_buffer_to_slice(vk, cmd, s->squash_table,
+                                        (ByteSpan){s->squash_v, (size_t)s->max_instances * sizeof(float)});
         s->wiggle_dirty = false;
+        s->squash_dirty = false;
     }
 
     /* Candidates mirror the live slot set; re-upload the prefix whenever the
@@ -1427,7 +1475,7 @@ void scene_frame(Scene *s, VkCommandBuffer cmd, RenderTarget *color, RenderTarge
         PassAttachment dep = {.target = depth, .load = LOAD_CLEAR, .store = STORE_KEEP};
         dep.clear[0]       = 0.0f; /* reverse-Z: the far plane is 0.0 */
 
-        BufferAccess draw_reads[11] = {
+        BufferAccess draw_reads[12] = {
             {.slice  = s->instances,
              .stage  = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT,
              .access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT},
@@ -1459,6 +1507,9 @@ void scene_frame(Scene *s, VkCommandBuffer cmd, RenderTarget *color, RenderTarge
              .stage  = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT,
              .access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT},
             {.slice  = s->wiggle_table,
+             .stage  = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT,
+             .access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT},
+            {.slice  = s->squash_table,
              .stage  = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT,
              .access = VK_ACCESS_2_SHADER_STORAGE_READ_BIT},
         };

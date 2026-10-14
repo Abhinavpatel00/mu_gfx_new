@@ -56,12 +56,26 @@ SceneVOut vs_main(uint vid : SV_VertexID, uint iid : SV_InstanceID, uint base_in
     float3 local = float3(unpack_half2(v.position_xy), f16tof32(v.position_z & 0xFFFFu));
     float  s     = f16tof32(inst.scale);
     float3 ipos  = float3(inst.pos[0], inst.pos[1], inst.pos[2]);
-    float3 world = ipos + quat_rotate(inst.quat, local * s);
+    /* Same hop squash-and-stretch + gel jiggle as scene.slang:vs_main. sy==1
+       and amp==0 (the defaults for every non-slime instance) is the identity. */
+    float  sy      = pc.squash[slot];
+    float  widen   = rsqrt(max(sy, 1e-3f));
+    float3 su      = float3(widen, sy, widen);
+    float3 world   = ipos + quat_rotate(inst.quat, local * su * s);
+
+    float amp = pc.wiggle[slot];
+    if (amp != 0.0f)
+    {
+        float h    = local.y * 0.5f + 0.5f;
+        float ph   = global_data.time * 7.0f + float(slot) * 2.399963f;
+        world += quat_rotate(inst.quat, unpack_oct(v.normal_oct)) * (sin(ph) * amp * h * s);
+    }
 
     SceneVOut o;
     o.position = float4(dot(pc.clip_rows[0], float4(world, 1.0f)), dot(pc.clip_rows[1], float4(world, 1.0f)),
                         dot(pc.clip_rows[2], float4(world, 1.0f)), dot(pc.clip_rows[3], float4(world, 1.0f)));
-    o.normal   = normalize(quat_rotate(inst.quat, unpack_oct(v.normal_oct)));
+    float3 nrm = unpack_oct(v.normal_oct);
+    o.normal   = normalize(quat_rotate(inst.quat, nrm / max(su, 1e-3f)));
     o.uv       = unpack_half2(v.uv);
     o.material = gs.material;
     o.world    = world;
