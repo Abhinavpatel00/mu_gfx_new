@@ -13,9 +13,6 @@
 [submodule "external/meshoptimizer"]
 	path = external/meshoptimizer
 	url = https://github.com/zeux/meshoptimizer.git
-[submodule "external/mu"]
-	path = external/mu
-	url = git@github.com:Abhinavpatel00/mylib.git
 [submodule "external/stb"]
 	path = external/stb
 	url = git@github.com:nothings/stb.git
@@ -43,3 +40,9 @@
 [submodule "external/jsmn"]
 	path = external/jsmn
 	url = https://github.com/zserge/jsmn
+[submodule "external/bc7enc"]
+	path = external/bc7enc
+	url = https://github.com/richgel999/bc7enc_rdo
+[submodule "external/mu"]
+	path = external/mu
+	url = git@github.com:Abhinavpatel00/mylib.git
