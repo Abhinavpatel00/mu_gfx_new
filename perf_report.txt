@@ -1,18 +1,18 @@
 == mu_gfx perf report ==
-frames            : 3764
-frame time        : 17.411 ms (57.4 fps)
-cpu active (ema)  : 2.346 ms
-cpu wait (ema)    : 14.392 ms
-gpu frame         : 18.355 ms (avg 17.852 ms)
-resolution        : 1362x749
+frames            : 349
+frame time        : 16.783 ms (59.6 fps)
+cpu active (ema)  : 1.317 ms
+cpu wait (ema)    : 15.333 ms
+gpu frame         : 16.411 ms (avg 16.231 ms)
+resolution        : 1366x768
 
 pass                            cur(ms)    avg(ms)    min(ms)    max(ms)   primitives
-Scene                            10.446     10.353      7.896     65.798      7924772
-SSAO                              1.497      1.396      1.036      9.049            0
-Bloom                             0.946      0.915      0.697      5.399            0
-Tonemap                           2.910      2.770      1.987     16.772            0
-SMAA Edge                         0.529      0.505      0.355      3.051      1021500
-SMAA Weight                       1.018      0.974      0.682      6.173      1021500
-SMAA Blend                        0.576      0.539      0.379      3.213      1021500
-Blit Swapchain                    0.220      0.203      0.147      1.122            0
-Nuklear Render                    0.212      0.197      0.149      1.221       842900
+Scene                             9.625      9.440      6.677     19.701      8294348
+SSAO                              1.336      1.298      0.920      1.695            0
+Bloom                             0.853      0.865      0.635      1.044            0
+Tonemap                           2.567      2.548      1.829      3.166            0
+SMAA Edge                         0.468      0.462      0.328      0.614      1049088
+SMAA Weight                       0.865      0.880      0.634      1.231      1049088
+SMAA Blend                        0.493      0.507      0.348      0.686      1049088
+Blit Swapchain                    0.186      0.211      0.154      0.279            0
+Nuklear Render                    0.019      0.019      0.013      0.036        24848

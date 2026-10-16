@@ -1434,12 +1434,31 @@ Renderer *renderer_create(bool use_wayland, GameHooks game) {
     memset(r, 0, sizeof(*r)); // zero-value = safe defaults everywhere
     r->game = game;
     r->show_gpu_text = true; /* F1 toggles the GPU profiler text overlay */
+    /* MU_RES=WxH overrides the window size, so headless runs can measure the
+       per-pixel passes at a target resolution instead of the 1362x749 default. */
+    {
+        const char *res = getenv("MU_RES");
+        unsigned    w = 0, h = 0;
+        if (res && sscanf(res, "%ux%u", &w, &h) == 2 && w >= 64u && h >= 64u) {
+            desc.width  = w;
+            desc.height = h;
+        }
+    }
     vk_instance_create(&r->vk, &desc);
     glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API); /* we drive Vulkan ourselves */
     r->window = glfwCreateWindow((int)desc.width, (int)desc.height, "Vulkan", NULL, NULL);
     if (!r->window) {
         log_error("[renderer] glfwCreateWindow failed");
         exit(EXIT_FAILURE);
+    }
+
+    /* MU_FULLSCREEN=1 puts the window on the primary monitor at the video
+       mode's size, so a tiling WM cannot halve it and measurements are stable. */
+    if (getenv("MU_FULLSCREEN") && atoi(getenv("MU_FULLSCREEN"))) {
+        GLFWmonitor       *mon = glfwGetPrimaryMonitor();
+        const GLFWvidmode *vm  = mon ? glfwGetVideoMode(mon) : NULL;
+        if (mon && vm)
+            glfwSetWindowMonitor(r->window, mon, 0, 0, vm->width, vm->height, vm->refreshRate);
     }
 
     VK_CHECK(glfwCreateWindowSurface(r->vk.instance.instance, r->window, NULL, &r->vk.surface));
@@ -1496,7 +1515,11 @@ static double ns_to_ms(double ns) { return ns / 1000000.0; }
 
 static GpuProfilerUIState g_gpu_profiler_ui = {
     .open                = false,
-    .paused              = true,
+    /* Live by default: the overlay, the profiler window and the headless perf
+       dump all read this snapshot, and a frozen default made all three blank
+       until someone ticked Pause off. The window's Pause box still freezes it
+       on demand. */
+    .paused              = false,
     .show_pipeline_stats = true,
 };
 
@@ -1598,6 +1621,13 @@ static void perf_dump(const Renderer *r) {
     }
     fclose(f);
     fprintf(stderr, "[config] wrote %s\n", PERF_REPORT_PATH);
+}
+
+/* Headless entry point for the perf dump, so a scripted run can measure
+   without opening the profiler window. */
+void renderer_write_perf(Renderer *r) {
+    if (r)
+        perf_dump(r);
 }
 
 static MU_INLINE bool frame_start(Renderer *r) {

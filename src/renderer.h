@@ -87,4 +87,8 @@ void renderer_hud(Renderer *renderer, const char *fmt, ...);
    next presented frame. Handy for scripted verification without key input. */
 bool renderer_screenshot(Renderer *renderer, const char *path);
 
+/* Write the rolling frame + per-pass GPU timings to perf_report.txt. For
+   scripted/headless measurement (see MU_PERF in main.c). */
+void renderer_write_perf(Renderer *renderer);
+
 #endif

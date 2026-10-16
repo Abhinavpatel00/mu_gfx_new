@@ -905,6 +905,20 @@ static void pets_frame(void *user, const GameFrame *frame) {
         }
     }
 
+    /* Headless perf dump: MU_PERF=<frames> writes perf_report.txt after that
+       many frames (plus a settle window so the EMA converges), then exits. */
+    {
+        const char *perf = getenv("MU_PERF");
+        if (perf) {
+            static int n = 0;
+            int        at = atoi(perf);
+            if (++n == at) {
+                renderer_write_perf(frame->renderer);
+                exit(EXIT_SUCCESS);
+            }
+        }
+    }
+
     /* TEMP: scripted flycam sweep for verification. Removed after the shot. */
     if (getenv("MU_FLYCAM_TEST")) {
         static int n = 0;
