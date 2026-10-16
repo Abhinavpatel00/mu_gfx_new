@@ -8,6 +8,4 @@
 
 add sparkles in scene which comes from seperate trasparent pass after opaque pass
 
-
-
-Use a uniform spatial grid instead. Each slime is assigned to a cell based on its position. A slime checks only its own cell and neighboring cells. This is a standard GPU broad-phase collision technique
+se a uniform spatial grid instead. Each slime is assigned to a cell based on its position. A slime checks only its own cell and neighboring cells. This is a standard GPU broad-phase collision technique

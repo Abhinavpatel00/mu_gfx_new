@@ -90,13 +90,9 @@ static const char *const pets_assets[A_COUNT] = {
 
 /* Ground tiles and the path that crosses them. The tile is 4x4, so spacing is
    the tile size: any other number opens seams at the joins. */
-#define MEADOW_TILES      20
+#define MEADOW_TILES      72
 #define MEADOW_TILE_STEP  4.0f
-#define MEADOW_PATH_STEPS 24
-/* Room left for props the game will move; the region is a fixed slot range, so
-   a scene with none still pays for its ceiling and nothing else. The slime
-   crowd is 2 instances per slime (body, SDF face quad) x 12. */
-#define MEADOW_MOVING     24
+#define MEADOW_PATH_STEPS 120
 
 /* A species' planting rule. Radial bands rather than a hand-placed list: a
    couple of thousand props is past the point a table stays readable, and a
@@ -150,6 +146,57 @@ static const Scatter meadow_scatter[] = {
     {A_FLOWER_GROUP, 46, 2.0f, 26.0f, 0.80f, 1.30f, 0.0f},
 };
 #define MEADOW_SCATTER_COUNT (sizeof(meadow_scatter) / sizeof(meadow_scatter[0]))
+
+/* The forest belt ringing the clearing. A clearing is a hole in a wood, and the
+   wood is what gives the scene its scale. Two bands per species: a dense inner
+   belt where the clearing's own trees stop (r ~34) up to r ~78, then a sparser
+   outer stand out to the terrain's edge (r ~132), so density falls off with
+   distance the way a real stand thins rather than stopping at a wall. Object
+   count is nearly free — the frame is fill-bound, not instance-bound. */
+static const Scatter forest_scatter[] = {
+    /* --- trees: inner belt ------------------------------------------------- */
+    {A_TREE_COMMON_A, 55, 34.0f, 78.0f, 0.90f, 1.60f, 5.0f},
+    {A_TREE_COMMON_B, 50, 34.0f, 78.0f, 0.90f, 1.60f, 5.0f},
+    {A_TREE_COMMON_C, 50, 34.0f, 78.0f, 0.90f, 1.60f, 5.0f},
+    {A_PINE_A, 80, 34.0f, 78.0f, 0.90f, 1.70f, 5.0f},
+    {A_PINE_B, 80, 34.0f, 78.0f, 0.90f, 1.70f, 5.0f},
+    {A_TREE_BIRCH_A, 65, 34.0f, 78.0f, 0.90f, 1.50f, 4.0f},
+    {A_TREE_BIRCH_B, 60, 34.0f, 78.0f, 0.90f, 1.50f, 4.0f},
+    {A_TREE_OAK_A, 45, 34.0f, 78.0f, 0.90f, 1.60f, 4.5f},
+    {A_TREE_OAK_B, 45, 34.0f, 78.0f, 0.90f, 1.60f, 4.5f},
+    {A_TREE_TWISTED_A, 10, 44.0f, 80.0f, 0.55f, 0.80f, 9.0f},
+    {A_TREE_TWISTED_B, 10, 44.0f, 80.0f, 0.55f, 0.80f, 9.0f},
+    /* --- trees: outer stand (sparser) ------------------------------------- */
+    {A_TREE_COMMON_A, 45, 72.0f, 132.0f, 0.90f, 1.60f, 6.5f},
+    {A_TREE_COMMON_B, 40, 72.0f, 132.0f, 0.90f, 1.60f, 6.5f},
+    {A_TREE_COMMON_C, 40, 72.0f, 132.0f, 0.90f, 1.60f, 6.5f},
+    {A_PINE_A, 70, 72.0f, 132.0f, 0.90f, 1.70f, 6.5f},
+    {A_PINE_B, 70, 72.0f, 132.0f, 0.90f, 1.70f, 6.5f},
+    {A_TREE_BIRCH_A, 55, 72.0f, 132.0f, 0.90f, 1.50f, 5.5f},
+    {A_TREE_BIRCH_B, 50, 72.0f, 132.0f, 0.90f, 1.50f, 5.5f},
+    {A_TREE_OAK_A, 40, 72.0f, 132.0f, 0.90f, 1.60f, 6.0f},
+    {A_TREE_OAK_B, 40, 72.0f, 132.0f, 0.90f, 1.60f, 6.0f},
+    {A_TREE_TWISTED_A, 8, 80.0f, 130.0f, 0.55f, 0.80f, 10.0f},
+    {A_TREE_TWISTED_B, 8, 80.0f, 130.0f, 0.55f, 0.80f, 10.0f},
+    /* --- underbrush filling the belt -------------------------------------- */
+    {A_BUSH_A, 70, 34.0f, 78.0f, 0.90f, 1.50f, 2.0f},
+    {A_BUSH_A, 60, 72.0f, 132.0f, 0.90f, 1.50f, 2.0f},
+    {A_BUSH_FLOWERS, 40, 34.0f, 78.0f, 0.90f, 1.50f, 2.0f},
+    {A_BUSH_FLOWERS, 30, 72.0f, 132.0f, 0.90f, 1.50f, 2.0f},
+    {A_BUSH_B, 70, 34.0f, 78.0f, 1.00f, 1.80f, 0.0f},
+    {A_BUSH_B, 60, 72.0f, 132.0f, 1.00f, 1.80f, 0.0f},
+    {A_BUSH_C, 70, 34.0f, 78.0f, 1.20f, 2.20f, 0.0f},
+    {A_BUSH_C, 60, 72.0f, 132.0f, 1.20f, 2.20f, 0.0f},
+    {A_FERN, 120, 34.0f, 78.0f, 0.40f, 0.80f, 0.0f},
+    {A_FERN, 110, 72.0f, 132.0f, 0.40f, 0.80f, 0.0f},
+    {A_ROCK_A, 24, 34.0f, 78.0f, 0.80f, 1.50f, 3.0f},
+    {A_ROCK_A, 20, 72.0f, 132.0f, 0.80f, 1.50f, 3.0f},
+    {A_ROCK_B, 24, 34.0f, 78.0f, 0.80f, 1.50f, 3.0f},
+    {A_ROCK_B, 20, 72.0f, 132.0f, 0.80f, 1.50f, 3.0f},
+    {A_ROCK_C, 48, 34.0f, 78.0f, 1.20f, 2.60f, 2.5f},
+    {A_ROCK_C, 40, 72.0f, 132.0f, 1.20f, 2.60f, 2.5f},
+};
+#define FOREST_SCATTER_COUNT (sizeof(forest_scatter) / sizeof(forest_scatter[0]))
 
 /* Runtime density/extent multiplier (MU_SCENE_SCALE). Scales the planted
    counts and the terrain grid together, so capacity sizing and placement walk
@@ -251,7 +298,42 @@ static uint32_t pets_instance_total(const uint32_t asset_meshes[A_COUNT]) {
     uint32_t total = tiles * tiles * asset_meshes[A_GROUND];
     for (uint32_t i = 0; i < MEADOW_SCATTER_COUNT; ++i)
         total += scaled_count(meadow_scatter[i].count) * asset_meshes[meadow_scatter[i].asset];
+    for (uint32_t i = 0; i < FOREST_SCATTER_COUNT; ++i)
+        total += scaled_count(forest_scatter[i].count) * asset_meshes[forest_scatter[i].asset];
     return total + scaled_count(MEADOW_PATH_STEPS) * asset_meshes[A_ROCKPATH];
+}
+
+/* Plants one species table into the scene, walking the same scaled counts the
+   capacity was sized from. A prop is a group of meshes in one space, so every
+   mesh of the asset gets an instance at the same transform. */
+static uint32_t plant_scatter(Scene *scene, const SceneAssetLoad loads[A_COUNT], const Scatter *table,
+                              uint32_t count) {
+    uint32_t planted = 0;
+    for (uint32_t s = 0; s < count; ++s) {
+        const Scatter        *sp    = &table[s];
+        const SceneAssetLoad *ld    = &loads[sp->asset];
+        uint32_t              want  = scaled_count(sp->count);
+        float                 r_min = sp->r_min * g_scene_scale;
+        float                 r_max = sp->r_max * g_scene_scale;
+        float                 gap   = sp->min_gap * g_scene_scale;
+        uint32_t              placed = 0;
+        for (uint32_t tries = 0; tries < want * 32u && placed < want; ++tries) {
+            float ang = frand() * 6.2831853f;
+            float rad = sqrtf(frange(r_min * r_min, r_max * r_max));
+            float x   = cosf(ang) * rad;
+            float z   = sinf(ang) * rad;
+            if (!meadow_clear(x, z, gap))
+                continue;
+            if (gap > 0.0f)
+                meadow_record(x, z);
+            plant(scene, ld, x, 0.0f, z, frand() * 6.2831853f, frange(sp->s_min, sp->s_max));
+            planted++;
+            placed++;
+        }
+        if (placed < want)
+            log_info("[pets] %s: placed %u of %u", pets_assets[sp->asset], placed, want);
+    }
+    return planted;
 }
 
 /* Loads the roster, then plants the clearing.
@@ -296,36 +378,15 @@ static uint32_t pets_build_assets(Scene *scene) {
 
     /* Species, in table order. Drawing the radius from the band's squared range
        keeps the density uniform over the annulus instead of piling up middle. */
-    for (uint32_t s = 0; s < MEADOW_SCATTER_COUNT; ++s) {
-        const Scatter        *sp     = &meadow_scatter[s];
-        const SceneAssetLoad *ld     = &loads[sp->asset];
-        uint32_t              want   = scaled_count(sp->count);
-        float                 r_min  = sp->r_min * g_scene_scale;
-        float                 r_max  = sp->r_max * g_scene_scale;
-        float                 gap    = sp->min_gap * g_scene_scale;
-        uint32_t              placed = 0;
-        for (uint32_t tries = 0; tries < want * 32u && placed < want; ++tries) {
-            float ang = frand() * 6.2831853f;
-            float rad = sqrtf(frange(r_min * r_min, r_max * r_max));
-            float x   = cosf(ang) * rad;
-            float z   = sinf(ang) * rad;
-            if (!meadow_clear(x, z, gap))
-                continue;
-            if (gap > 0.0f)
-                meadow_record(x, z);
-            plant(scene, ld, x, 0.0f, z, frand() * 6.2831853f, frange(sp->s_min, sp->s_max));
-            planted++;
-            placed++;
-        }
-        if (placed < want)
-            log_info("[pets] %s: placed %u of %u", pets_assets[sp->asset], placed, want);
-    }
+    planted += plant_scatter(scene, loads, meadow_scatter, MEADOW_SCATTER_COUNT);
+    /* The wood around it, planted after so trunks clear the clearing's props. */
+    planted += plant_scatter(scene, loads, forest_scatter, FOREST_SCATTER_COUNT);
 
     /* A worn path from the spawn into the trees, wobbling as it goes. */
     uint32_t path_steps = scaled_count(MEADOW_PATH_STEPS);
     for (uint32_t i = 0; i < path_steps; ++i) {
         float t = (float)i / (float)(path_steps - 1u);
-        plant(scene, &loads[A_ROCKPATH], sinf(t * 5.0f) * 1.4f, 0.02f, 8.0f - t * 36.0f * g_scene_scale,
+        plant(scene, &loads[A_ROCKPATH], sinf(t * 5.0f) * 1.4f, 0.02f, 60.0f - t * 120.0f * g_scene_scale,
               t * 3.0f, frange(0.9f, 1.15f));
         planted++;
     }
@@ -345,9 +406,16 @@ static uint32_t pets_build_assets(Scene *scene) {
    change, never per frame. Placeholder tiles are the Slime Rancher rips in
    assets/slime_faces/ — see TODO(faces) in todo.txt. */
 
-#define SLIME_COUNT 12u
-#define SLIME_GRAV  14.0f /* world units / s^2: snappy, cartoon falls */
-#define SLIME_GROUND_Y 0.0f
+/* Crowd size. Two dynamic instances per slime (body + SDF face quad), so the
+   dynamic region is 2 * this. MU_SLIMES overrides, clamped to the hard cap. */
+#define SLIME_DEFAULT 2048u
+#define SLIME_MAX_CAP 16384u
+/* Collision is gated to slimes within this radius of the camera; beyond it a
+   slime still hops and is drawn, it just never pushes a neighbour — the far
+   crowd is free. Cell size sets the uniform collision grid's resolution. */
+#define SLIME_COLLIDE_RADIUS 26.0f
+#define SLIME_CELL_SIZE      3.0f
+#define SLIME_SPREAD         100.0f /* spawn half-extent: the whole meadow and wood */
 
 /* Lat/long UV-sphere: 2 poles + (SLIME_RING-1) rings of SLIME_SEG verts. */
 #define SLIME_SEG   16u
@@ -384,30 +452,7 @@ typedef enum SlimeFace {
     FACE_SLEEPY = 7,
 } SlimeFace;
 
-typedef struct Slime {
-    uint32_t slot;      /* body instance slot (dynamic) */
-    uint32_t slot_face; /* face quad instance: shares the body transform */
-    uint32_t tint;      /* 0..2: body mesh/material variant */
-    uint32_t face_id;   /* atlas tile; written to the face table on change */
-    float    home[2];   /* wander anchor (x, z) */
-    float    pos[3];    /* contact point (bottom) in world space */
-    float    vel[3];    /* hop velocity while airborne */
-    float    scale;     /* uniform body scale */
-    float    dwell;     /* seconds on the ground until the next hop */
-    float    blink;     /* seconds until the next blink starts */
-    float    blink_len; /* remaining blink time; 0 = eyes open */
-    float    land_t;    /* remaining landing-reaction time; 0 = none */
-    bool     land_hard; /* landing was fast: show scared, else happy */
-    float    event_t;   /* remaining random-mood time; 0 = none */
-    uint32_t event_id;  /* FACE_SAD or FACE_ANGRY while event_t runs */
-    float    yaw;       /* facing, smoothed toward travel */
-    float    yaw_tgt;
-    float    squash;    /* current vertical squash, 1 = rest */
-    bool     air;       /* true while the hop arc is above ground */
-} Slime;
-
 typedef struct SlimeCrowd {
-    Slime    slimes[SLIME_COUNT];
     uint32_t body_mesh[3]; /* one per tint: a mesh owns one material */
     uint32_t face_mesh;    /* shared SDF face quad */
     uint32_t mat_body[3];
@@ -416,6 +461,7 @@ typedef struct SlimeCrowd {
 } SlimeCrowd;
 
 static SlimeCrowd g_slimes;
+static uint32_t  g_slime_target = SLIME_DEFAULT;
 
 /* Vibrant gel base colors, opaque. */
 static const uint32_t kSlimeTint[3] = {
@@ -630,193 +676,69 @@ static bool slime_build(Scene *scene) {
     g_slimes.mat_face = fmi;
 
     /* Spawn the crowd as contiguous slot pairs: the VS phases its jiggle off
-       slot/2, so body and face of one slime must share a pair. The face table
-       carries the same slot's expression tile, so indirect draws, firstInstance
-       and instance-buffer indexing agree — that is what keeps slimes from
-       wearing each other's faces. */
-    for (uint32_t i = 0; i < SLIME_COUNT; ++i) {
-        Slime *s = &g_slimes.slimes[i];
-        s->tint  = i % 3u;
-        float ang = frand() * 6.2831853f;
-        float rad = 1.5f + frand() * 5.5f;
+       slot/2, so body and face of one slime must share a pair. The GPU sim
+       indexes the same pairing (slime i owns slots 2i, 2i+1), so indirect draws,
+       firstInstance and instance-buffer indexing all agree. */
+    uint32_t count = g_slime_target;
+    if (count > SLIME_MAX_CAP)
+        count = SLIME_MAX_CAP;
+    struct SlimeState *states = malloc((size_t)count * sizeof(struct SlimeState));
+    if (!states)
+        return false;
+
+    for (uint32_t i = 0; i < count; ++i) {
+        struct SlimeState *s = &states[i];
+        /* Homes fill the clearing disc; sqrt keeps them uniform over area, which
+           is the density the old rejection sampling was approximating. */
+        float ang  = frand() * 6.2831853f;
+        float rad  = sqrtf(frand()) * SLIME_SPREAD;
         s->home[0] = cosf(ang) * rad;
-        s->home[1] = 1.5f + sinf(ang) * rad * 0.6f;
+        s->home[1] = sinf(ang) * rad;
         s->pos[0]  = s->home[0];
-        s->pos[1]  = SLIME_GROUND_Y;
+        s->pos[1]  = 0.0f; /* contact point on the ground plane */
         s->pos[2]  = s->home[1];
         s->vel[0] = s->vel[1] = s->vel[2] = 0.0f;
-        s->scale                          = 0.9f + frand() * 0.5f;
-        s->yaw = s->yaw_tgt               = frand() * 6.2831853f;
-        s->squash                          = 1.0f;
-        s->air                             = false;
-        s->dwell                           = frand() * 1.2f + (float)i * 0.09f;
-        s->face_id                         = FACE_HAPPY;
-        s->land_t                          = 0.0f;
-        s->land_hard                       = false;
-        s->event_t                         = 0.0f;
-        s->event_id                        = FACE_HAPPY;
-        /* MU_BLINK_NOW staggers the first blink ~at once for verification. */
-        s->blink = getenv("MU_BLINK_NOW") ? (0.05f + (float)i * 0.03f)
-                                          : (1.5f + frand() * 2.5f + (float)i * 0.21f);
-        s->blink_len                       = 0.0f;
+        s->yaw = s->yaw_tgt = frand() * 6.2831853f;
+        s->scale            = 0.9f + frand() * 0.5f;
+        s->squash           = 1.0f;
+        s->wobble           = 0.0f;
+        s->dwell            = frand() * 2.0f + (float)(i % 16u) * 0.05f;
+        s->blink            = 1.5f + frand() * 3.0f;
+        s->blink_len        = 0.0f;
+        s->land_t           = 0.0f;
+        s->event_t          = 0.0f;
+        s->event_id         = FACE_HAPPY;
+        s->face_id          = FACE_HAPPY;
+        s->flags            = 0u;
+        s->rng              = 0x9E3779B9u ^ (i * 2654435761u + 1u);
+        s->pad[0] = s->pad[1] = 0u;
 
-        SceneInstanceDesc d = {.pos   = {s->pos[0], 0.8f * s->scale, s->pos[2]},
-                               .scale = s->scale};
-        d.mesh            = g_slimes.body_mesh[s->tint];
-        s->slot           = scene_instance_create(scene, &d);
-        d.mesh            = g_slimes.face_mesh;
-        s->slot_face      = scene_instance_create(scene, &d);
-        if (s->slot == UINT32_MAX || s->slot_face == UINT32_MAX) {
+        SceneInstanceDesc d = {.pos = {s->pos[0], 0.8f * s->scale, s->pos[2]}, .scale = s->scale};
+        d.mesh              = g_slimes.body_mesh[i % 3u];
+        uint32_t slot       = scene_instance_create(scene, &d);
+        d.mesh              = g_slimes.face_mesh;
+        uint32_t slot_face  = scene_instance_create(scene, &d);
+        if (slot == UINT32_MAX || slot_face == UINT32_MAX) {
             log_error("[slime] out of dynamic slots at %u", i);
+            free(states);
             return false;
         }
-        if (s->slot_face != s->slot + 1u || (s->slot % 2u) != 0u) {
-            log_error("[slime] slot pair not contiguous: %u/%u", s->slot, s->slot_face);
+        if (slot_face != slot + 1u || (slot % 2u) != 0u) {
+            log_error("[slime] slot pair not contiguous: %u/%u", slot, slot_face);
+            free(states);
             return false;
         }
-        scene_set_instance_wiggle(scene, s->slot, 0.06f);
-        scene_set_instance_wiggle(scene, s->slot_face, 0.06f);
-        scene_set_instance_face(scene, s->slot_face, s->face_id);
+        scene_set_instance_wiggle(scene, slot, 0.06f);
+        scene_set_instance_wiggle(scene, slot_face, 0.06f);
     }
-    log_info("[slime] %u slimes: 3 body meshes + SDF face quad (%u tiles), %u dynamic slots", SLIME_COUNT,
-             SLIME_FACE_COUNT, SLIME_COUNT * 2u);
+
+    bool ok = scene_slime_enable(scene, count, states, SLIME_COLLIDE_RADIUS, SLIME_CELL_SIZE);
+    free(states);
+    if (!ok)
+        return false;
+    log_info("[slime] %u slimes: 3 body meshes + SDF face quad (%u tiles), %u dynamic slots", count, SLIME_FACE_COUNT,
+             count * 2u);
     return true;
-}
-
-/* Per-frame hop sim: gravity, ground contact, wander, the squash channel the
-   VS reads, and expression changes. Writes only the crowd's dynamic
-   instances; the static meadow is never touched. */
-static void slime_frame(Scene *scene, float dt) {
-    if (dt <= 0.0f || dt > 0.1f)
-        dt = 0.1f;
-    /* Every few seconds one grounded slime gets the grumps (sad or angry) for
-       a couple of seconds, so the crowd shows more than hop-cycle moods. */
-    static float grump_in = 3.0f;
-    grump_in -= dt;
-    if (grump_in <= 0.0f) {
-        grump_in = 4.0f + frand() * 3.0f;
-        Slime *s = &g_slimes.slimes[(uint32_t)(frand() * SLIME_COUNT) % SLIME_COUNT];
-        if (!s->air && s->event_t <= 0.0f) {
-            s->event_id = frand() < 0.5f ? FACE_SAD : FACE_ANGRY;
-            s->event_t  = 2.5f;
-        }
-    }
-    for (uint32_t i = 0; i < SLIME_COUNT; ++i) {
-        Slime *s         = &g_slimes.slimes[i];
-        float  squash_tgt = 1.0f;
-
-        if (s->air) {
-            s->vel[1] -= SLIME_GRAV * dt;
-            s->pos[0] += s->vel[0] * dt;
-            s->pos[1] += s->vel[1] * dt;
-            s->pos[2] += s->vel[2] * dt;
-            if (s->pos[1] <= SLIME_GROUND_Y) {
-                s->pos[1] = SLIME_GROUND_Y;
-                s->air    = false;
-                s->squash = 0.55f; /* landing pancake; springs back below */
-                /* Hard falls read as scared, soft ones as happy, for 0.6s. */
-                s->land_hard = s->vel[1] < -9.0f;
-                s->land_t    = 0.6f;
-                s->vel[0] = s->vel[2] = 0.0f;
-                s->dwell  = 0.4f + frand() * 2.2f; /* long waits drift hungry, then sleepy */
-            } else {
-                /* stretch with vertical speed: fast fall = long slime */
-                squash_tgt = 1.0f + fabsf(s->vel[1]) * 0.030f;
-                if (squash_tgt > 1.35f)
-                    squash_tgt = 1.35f;
-            }
-        } else {
-            s->dwell -= dt;
-            if (s->dwell <= 0.0f) {
-                float ang = frand() * 6.2831853f;
-                float rad = 1.5f + frand() * 5.5f;
-                float tx  = s->home[0] + cosf(ang) * rad;
-                float tz  = s->home[1] + sinf(ang) * rad * 0.6f;
-                float dx  = tx - s->pos[0], dz = tz - s->pos[2];
-                float dl  = sqrtf(dx * dx + dz * dz);
-                if (dl > 0.001f) {
-                    dx /= dl;
-                    dz /= dl;
-                } else {
-                    dx = dz = 0.0f;
-                }
-                float sp    = 2.0f + frand() * 2.0f;
-                s->vel[0]   = dx * sp;
-                s->vel[2]   = dz * sp;
-                s->vel[1]   = 6.0f + frand() * 2.5f;
-                s->air      = true;
-                s->squash   = 0.78f; /* coiled push-off */
-                if (dl > 0.001f)
-                    s->yaw_tgt = atan2f(dx, dz); /* +Z is the face */
-            }
-        }
-
-        /* One fast ease toward the target so the pancake reads as a single
-           impact rather than a lerped sag. */
-        float ease = dt * 14.0f;
-        if (ease > 1.0f)
-            ease = 1.0f;
-        s->squash += (squash_tgt - s->squash) * ease;
-
-        float dyaw = s->yaw_tgt - s->yaw;
-        while (dyaw > 3.14159265f)
-            dyaw -= 6.2831853f;
-        while (dyaw < -3.14159265f)
-            dyaw += 6.2831853f;
-        float yase = dt * 6.0f;
-        if (yase > 1.0f)
-            yase = 1.0f;
-        s->yaw += dyaw * yase;
-
-        /* Moods, highest priority first: blink beats everything, then the
-           landing reaction, airborne elation, random grumps, and finally the
-           dwell drift (hungry, then sleepy). face_id changes only on
-           expression change, so the face table re-uploads rarely. */
-        if (s->land_t > 0.0f)
-            s->land_t -= dt;
-        if (s->event_t > 0.0f)
-            s->event_t -= dt;
-        uint32_t face_want = FACE_HAPPY;
-        if (s->blink_len > 0.0f) {
-            s->blink_len -= dt;
-            face_want = FACE_BLINK;
-            if (s->blink_len <= 0.0f)
-                s->blink = 1.5f + frand() * 3.0f;
-        } else {
-            s->blink -= dt;
-            if (s->blink <= 0.0f)
-                s->blink_len = 0.12f;
-            else if (s->land_t > 0.0f)
-                face_want = s->land_hard ? FACE_SCARED : FACE_HAPPY;
-            else if (s->air)
-                face_want = FACE_ELATED;
-            else if (s->event_t > 0.0f)
-                face_want = s->event_id;
-            else if (s->dwell > 2.0f)
-                face_want = FACE_SLEEPY;
-            else if (s->dwell > 1.0f)
-                face_want = FACE_HUNGRY;
-        }
-        if (face_want != s->face_id) {
-            s->face_id = face_want;
-            scene_set_instance_face(scene, s->slot_face, s->face_id);
-        }
-
-        /* Contact point stays planted: the body spans +/-0.8*scale in local y,
-           scaled by squash in the VS, so the centre rides at bottom + that.
-           The face quad shares the transform; its VS billboards from it. */
-        float cy  = s->pos[1] + 0.8f * s->squash * s->scale;
-        float hy  = sinf(s->yaw * 0.5f), hw = cosf(s->yaw * 0.5f);
-        SceneInstanceDesc d = {.pos   = {s->pos[0], cy, s->pos[2]},
-                               .quat  = {0.0f, hy, 0.0f, hw},
-                               .scale = s->scale};
-        d.mesh = g_slimes.body_mesh[s->tint];
-        scene_instance_set(scene, s->slot, &d);
-        d.mesh = g_slimes.face_mesh;
-        scene_instance_set(scene, s->slot_face, &d);
-        scene_set_instance_squash(scene, s->slot, s->squash);
-        scene_set_instance_squash(scene, s->slot_face, s->squash);
-    }
 }
 
 static void pets_start(void *user, Renderer *renderer) {
@@ -831,6 +753,17 @@ static void pets_start(void *user, Renderer *renderer) {
             if (s > 0.0f)
                 g_scene_scale = s;
         }
+    }
+    /* Crowd size override, clamped to the hard cap the state array allows. */
+    {
+        const char *sl = getenv("MU_SLIMES");
+        if (sl && sl[0]) {
+            long v = strtol(sl, NULL, 10);
+            if (v > 0)
+                g_slime_target = (uint32_t)v;
+        }
+        if (g_slime_target > SLIME_MAX_CAP)
+            g_slime_target = SLIME_MAX_CAP;
     }
     /* Standing at the clearing's south edge, looking north across it along the
        path, so the first frame already frames the thing the scene is for. */
@@ -919,8 +852,8 @@ static void pets_frame(void *user, const GameFrame *frame) {
 
     flycam_update(&p->cam, frame->input, frame->dt);
 
-    if (p->scene)
-        slime_frame(p->scene, p->dt);
+    /* The slime crowd is simulated entirely on the GPU in scene_frame, so there
+       is no per-frame CPU slime work here. */
 
     /* Scripted screenshot for headless verification: MU_SHOT=<frames> writes
        one screenshot after that many frames, then keeps running. */
@@ -1033,9 +966,7 @@ static void pets_render(void *user, VkCommandBuffer cmd, RenderTarget *color, Re
         uint32_t total = pets_instance_total(asset_meshes);
         /* +4 meshes and +4 materials for the procedural slime crowd staged after
            the cooked assets: three tinted body variants and the shared SDF face
-           quad. Mesh and material capacities are fixed at create; the instances
-           themselves are dynamic and draw from the MEADOW_MOVING reserve, so
-           the static count is unchanged. */
+           quad. Mesh and material capacities are fixed at create. */
         max_meshes += 4u;
         max_materials += 4u;
         /* A mesh is charged the scene-wide rung count, not its own, because a
@@ -1044,18 +975,19 @@ static void pets_render(void *user, VkCommandBuffer cmd, RenderTarget *color, Re
            assets' own ladders — sizing it from the sum runs out mid-roster. The
            slime mesh is counted here too, so it gets its rungs as well. */
         uint32_t max_lod_rows = max_meshes * max_rungs;
-        /* Everything here is static, so the static region holds the whole
-           clearing and the dynamic region is only the reserve: the split is
-           what makes the per-frame upload touch nothing at all. */
-        uint32_t slots = total + MEADOW_MOVING;
-        Scene   *scene = scene_create(p->vk, &(SceneDesc){.max_instances    = slots,
-                                                         .dynamic_capacity = MEADOW_MOVING,
-                                                         .static_capacity  = total,
-                                                         .max_meshes       = max_meshes,
-                                                         .max_lod_rows     = max_lod_rows,
-                                                         .lod_count        = max_rungs,
-                                                         .max_materials    = max_materials ? max_materials : 4,
-                                                         .max_survivors    = slots});
+        /* The static region holds the whole meadow; the dynamic region is the
+           slime crowd's slot pairs, owned by the GPU sim. Sizing it from the
+           live crowd is what lets MU_SLIMES steer the count. */
+        uint32_t dynamic = 2u * g_slime_target;
+        uint32_t slots   = total + dynamic;
+        Scene   *scene   = scene_create(p->vk, &(SceneDesc){.max_instances    = slots,
+                                                            .dynamic_capacity = dynamic,
+                                                            .static_capacity  = total,
+                                                            .max_meshes       = max_meshes,
+                                                            .max_lod_rows     = max_lod_rows,
+                                                            .lod_count        = max_rungs,
+                                                            .max_materials    = max_materials ? max_materials : 4,
+                                                            .max_survivors    = slots});
         if (!scene)
             return;
         if (pets_build_assets(scene) == UINT32_MAX) {
@@ -1063,8 +995,8 @@ static void pets_render(void *user, VkCommandBuffer cmd, RenderTarget *color, Re
             return;
         }
 
-        /* Slime crowd: 12 dynamic pairs (body, SDF face quad) out of
-           the MEADOW_MOVING reserve, staged before the upload with the rest. */
+        /* Slime crowd: g_slime_target dynamic pairs (body, SDF face quad)
+           staged before the upload with the rest. */
         if (!slime_build(scene)) {
             scene_destroy(scene);
             return;

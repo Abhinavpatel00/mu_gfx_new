@@ -144,6 +144,15 @@ extern const SceneInstanceDesc kSceneInstanceIdentity; /* zero-filled */
    gpu pool. Called once with a frame command buffer. */
 bool scene_upload_scene(Scene *s, VkCommandBuffer cmd);
 
+/* Hand the GPU the slime crowd's initial state. The slime instances must already
+   own the dynamic slots, and each slime must occupy the contiguous pair
+   [2i, 2i+1] (body, face) because those pairs are drawn and simmed as pairs.
+   The CPU writes the sim state once here; every later frame is computed on the
+   GPU around view 0's camera. collide_radius is the distance gate past which a
+   slime takes part in no collision at all. Call before scene_upload_scene. */
+bool scene_slime_enable(Scene *s, uint32_t count, const struct SlimeState *states, float collide_radius,
+                        float cell_size);
+
 void scene_view_set(Scene *s, uint32_t view, const SceneViewDesc *view_desc);
 void scene_set_clear(Scene *s, const float rgba[4]);
 

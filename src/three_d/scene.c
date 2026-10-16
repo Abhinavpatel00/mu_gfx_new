@@ -234,12 +234,29 @@ struct Scene {
 
     /* pipelines */
     PipelineID cs_cull, cs_count, cs_scan_block, cs_scan_blocks, cs_emit, cs_scatter;
+    PipelineID cs_slime_sim, cs_slime_grid, cs_slime_resolve;
     PipelineID draw_pipeline;
     PipelineID toon_pipeline; /* cel-shaded variant of the scene draw */
     bool       toon;
     bool       pipelines_ready;
     bool       uploaded;
     VkFormat   color_format, depth_format;
+
+    /* GPU slime sim. When active, the dynamic instances in [0, 2*slime_count)
+       are owned by compute, not the CPU upload path, and the three passes run
+       once per frame before the cull. State is ping-ponged between two buffers
+       so slime_resolve's neighbour reads see a stable snapshot. */
+    bool               slime_active;
+    uint32_t           slime_count;
+    struct SlimeState *slime_state_init; /* CPU copy, freed once uploaded */
+    BufferSlice        slime_state[2];
+    BufferSlice        slime_grid_count; /* nx*nz u32, cleared per frame */
+    BufferSlice        slime_grid_items; /* nx*nz*cap u32 */
+    uint32_t           slime_grid_nx, slime_grid_nz, slime_grid_cap;
+    float              slime_collide_radius;
+    float              slime_cell_size;
+    float              slime_inv_cell;
+    uint32_t           slime_parity;
 };
 
 /* ============================================================ helpers */
@@ -407,6 +424,9 @@ Scene *scene_create(VkBackend *vk, const SceneDesc *desc) {
     s->cs_scan_blocks = pipeline_create_compute(vk, "compiledshaders/compact.cs_scan_blocks.comp.spv");
     s->cs_emit        = pipeline_create_compute(vk, "compiledshaders/compact.cs_emit.comp.spv");
     s->cs_scatter     = pipeline_create_compute(vk, "compiledshaders/compact.cs_scatter.comp.spv");
+    s->cs_slime_sim     = pipeline_create_compute(vk, "compiledshaders/slime_sim.comp.spv");
+    s->cs_slime_grid    = pipeline_create_compute(vk, "compiledshaders/slime_grid.comp.spv");
+    s->cs_slime_resolve = pipeline_create_compute(vk, "compiledshaders/slime_resolve.comp.spv");
 
     log_info("[scene] created: max_instances=%u (dynamic<%u) max_meshes=%u max_survivors=%u", s->max_instances,
              s->dynamic_capacity, s->max_meshes, s->max_survivors);
@@ -434,6 +454,10 @@ void scene_destroy(Scene *s) {
     buffer_pool_free(s->group_shade);
     buffer_pool_free(s->vertex_arena);
     buffer_pool_free(s->index_arena);
+    buffer_pool_free(s->slime_state[0]);
+    buffer_pool_free(s->slime_state[1]);
+    buffer_pool_free(s->slime_grid_count);
+    buffer_pool_free(s->slime_grid_items);
     forEach(i, MAX_FRAMES_IN_FLIGHT) {
         buffer_pool_free(s->counters[i]);
         destroy_buffer(vk, &s->counters_host[i]);
@@ -455,6 +479,7 @@ void scene_destroy(Scene *s) {
     }
     free(s->staged_vertices);
     free(s->staged_indices);
+    free(s->slime_state_init);
     free(s->bloom_bits.array);
     free(s->arena.base);
     free(s);
@@ -918,6 +943,58 @@ void scene_set_clear(Scene *s, const float rgba[4]) { memcpy(s->clear, rgba, siz
 
 /* ============================================================ upload (T0) */
 
+bool scene_slime_enable(Scene *s, uint32_t count, const struct SlimeState *states, float collide_radius,
+                        float cell_size) {
+    if (!s || count == 0 || !states)
+        return false;
+    if (count > s->dynamic_capacity / 2u) {
+        log_error("[scene] slime count %u exceeds the %u dynamic pairs", count, s->dynamic_capacity / 2u);
+        return false;
+    }
+    if (cell_size <= 0.0f)
+        cell_size = 3.0f;
+
+    /* The grid spans the collide annulus plus a one-cell border so a slime on
+       the gate's rim still finds its neighbours. Cells are square and the grid
+       axis is capped so the per-frame clear stays small. */
+    float    extent = 2.0f * (collide_radius + cell_size);
+    uint32_t nx     = (uint32_t)ceilf(extent / cell_size);
+    if (nx < 1u)
+        nx = 1u;
+    if (nx > 64u)
+        nx = 64u;
+
+    s->slime_count          = count;
+    s->slime_collide_radius = collide_radius;
+    s->slime_cell_size      = cell_size;
+    s->slime_inv_cell       = 1.0f / cell_size;
+    s->slime_grid_nx        = nx;
+    s->slime_grid_nz        = nx;
+    s->slime_grid_cap       = 16u;
+    s->slime_parity         = 0u;
+
+    s->slime_state_init = malloc((size_t)count * sizeof(struct SlimeState));
+    if (!s->slime_state_init)
+        return false;
+    memcpy(s->slime_state_init, states, (size_t)count * sizeof(struct SlimeState));
+
+    VkDeviceSize state_bytes = (VkDeviceSize)count * sizeof(struct SlimeState);
+    s->slime_state[0]        = alloc_slice(s, state_bytes, 16);
+    s->slime_state[1]        = alloc_slice(s, state_bytes, 16);
+    s->slime_grid_count      = alloc_slice(s, (VkDeviceSize)nx * nx * sizeof(uint32_t), 16);
+    s->slime_grid_items =
+        alloc_slice(s, (VkDeviceSize)nx * nx * s->slime_grid_cap * sizeof(uint32_t), 16);
+    if (!s->slime_state[0].buffer || !s->slime_state[1].buffer || !s->slime_grid_count.buffer ||
+        !s->slime_grid_items.buffer) {
+        log_error("[scene] slime buffers failed");
+        return false;
+    }
+    s->slime_active = true;
+    log_info("[scene] slime sim: %u slimes, grid %ux%u cap %u, radius %.1f, cell %.2f", count, nx, nx,
+             s->slime_grid_cap, collide_radius, cell_size);
+    return true;
+}
+
 bool scene_upload_scene(Scene *s, VkCommandBuffer cmd) {
     if (!s || s->uploaded)
         return s->uploaded;
@@ -986,6 +1063,16 @@ bool scene_upload_scene(Scene *s, VkCommandBuffer cmd) {
     s->wiggle_dirty = false;
     s->squash_dirty = false;
     s->face_dirty   = false;
+
+    /* Seed both ping-pong state buffers with the same spawn state. From here the
+       GPU owns them; the CPU copy is dead weight after this upload. */
+    if (s->slime_active && s->slime_state_init) {
+        uint32_t bytes = s->slime_count * sizeof(struct SlimeState);
+        renderer_upload_buffer_to_slice(vk, cmd, s->slime_state[0], (ByteSpan){s->slime_state_init, bytes});
+        renderer_upload_buffer_to_slice(vk, cmd, s->slime_state[1], (ByteSpan){s->slime_state_init, bytes});
+        free(s->slime_state_init);
+        s->slime_state_init = NULL;
+    }
 
     /* Whole instance table, once. After this the dynamic prefix is rewritten by
        T1 each frame and the static suffix only when a static row actually
@@ -1191,6 +1278,98 @@ static void build_draw_push(Scene *s, uint32_t view, uint32_t lane, struct Scene
     p->counts[5] = getenv("MU_SHADER_DEBUG") ? 1u : 0u;
 }
 
+/* T1c: the GPU slime sim, one chain per frame before any view's cull. The grid
+   is built around view 0's camera; with one view that is the only camera there
+   is, and with several it is the one whose distance the collision LOD follows.
+   state_in is integrated in place then read-only for the grid and resolve;
+   resolve commits to state_out (next frame's state_in) plus the draw tables. */
+static void slime_record(Scene *s, VkCommandBuffer cmd, uint32_t view) {
+    if (!s->slime_active || s->slime_count == 0u || s->view_count == 0u)
+        return;
+
+    VkBackend   *vk     = s->vk;
+    uint32_t     count  = s->slime_count;
+    uint32_t     groups = (count + 63u) / 64u;
+    BufferSlice *st_in  = &s->slime_state[s->slime_parity];
+    BufferSlice *st_out = &s->slime_state[s->slime_parity ^ 1u];
+    uint32_t     cells  = s->slime_grid_nx * s->slime_grid_nz;
+    float        extent = (float)s->slime_grid_nx * s->slime_cell_size;
+
+    cmd_fill_buffer(cmd, s->slime_grid_count, (VkDeviceSize)cells * sizeof(uint32_t), 0u);
+
+    struct SceneSlimePush sp;
+    memset(&sp, 0, sizeof(sp));
+    sp.state_in   = slice_addr(vk, *st_in);
+    sp.state_out  = slice_addr(vk, *st_out);
+    sp.instances  = slice_addr(vk, s->instances);
+    sp.squash     = slice_addr(vk, s->squash_table);
+    sp.face       = slice_addr(vk, s->face_table);
+    sp.grid_count = slice_addr(vk, s->slime_grid_count);
+    sp.grid_items = slice_addr(vk, s->slime_grid_items);
+    sp.view.x     = s->views[view].camera_pos[0];
+    sp.view.y     = s->views[view].camera_pos[1];
+    sp.view.z     = s->views[view].camera_pos[2];
+    sp.view.w     = s->slime_collide_radius;
+    sp.counts[0]  = count;
+    sp.counts[1]  = s->slime_grid_nx;
+    sp.counts[2]  = s->slime_grid_nz;
+    sp.counts[3]  = s->slime_grid_cap;
+    sp.min_x      = s->views[view].camera_pos[0] - extent * 0.5f;
+    sp.min_z      = s->views[view].camera_pos[2] - extent * 0.5f;
+    sp.inv_cell   = s->slime_inv_cell;
+
+    BufferAccess sim_state[1] = {{.slice = *st_in, .stage = STAGE_CS, .access = ACCESS_SSBO_R | ACCESS_SSBO_W}};
+    BufferAccess sim_write[1] = {{.slice = *st_in, .stage = STAGE_CS, .access = ACCESS_SSBO_W}};
+    PassDesc     sim_pass     = {.buf_reads       = sim_state,
+                                 .buf_read_count  = 1,
+                                 .buf_writes      = sim_write,
+                                 .buf_write_count = 1,
+                                 .pipeline        = s->cs_slime_sim};
+    begin_pass(vk, cmd, &sim_pass);
+    dispatch_push(vk, cmd, (ByteSpan){&sp, (uint32_t)sizeof(sp)}, groups, 1, 1);
+    end_pass(vk, cmd, &sim_pass);
+
+    BufferAccess grid_reads[3] = {
+        {.slice = *st_in, .stage = STAGE_CS, .access = ACCESS_SSBO_R},
+        {.slice = s->slime_grid_count, .stage = STAGE_CS, .access = ACCESS_SSBO_R | ACCESS_SSBO_W},
+        {.slice = s->slime_grid_items, .stage = STAGE_CS, .access = ACCESS_SSBO_R | ACCESS_SSBO_W},
+    };
+    BufferAccess grid_writes[2] = {
+        {.slice = s->slime_grid_count, .stage = STAGE_CS, .access = ACCESS_SSBO_W},
+        {.slice = s->slime_grid_items, .stage = STAGE_CS, .access = ACCESS_SSBO_W},
+    };
+    PassDesc grid_pass = {.buf_reads       = grid_reads,
+                          .buf_read_count  = 3,
+                          .buf_writes      = grid_writes,
+                          .buf_write_count = 2,
+                          .pipeline        = s->cs_slime_grid};
+    begin_pass(vk, cmd, &grid_pass);
+    dispatch_push(vk, cmd, (ByteSpan){&sp, (uint32_t)sizeof(sp)}, groups, 1, 1);
+    end_pass(vk, cmd, &grid_pass);
+
+    BufferAccess res_reads[3] = {
+        {.slice = *st_in, .stage = STAGE_CS, .access = ACCESS_SSBO_R},
+        {.slice = s->slime_grid_count, .stage = STAGE_CS, .access = ACCESS_SSBO_R},
+        {.slice = s->slime_grid_items, .stage = STAGE_CS, .access = ACCESS_SSBO_R},
+    };
+    BufferAccess res_writes[4] = {
+        {.slice = *st_out, .stage = STAGE_CS, .access = ACCESS_SSBO_W},
+        {.slice = s->instances, .stage = STAGE_CS, .access = ACCESS_SSBO_W},
+        {.slice = s->squash_table, .stage = STAGE_CS, .access = ACCESS_SSBO_W},
+        {.slice = s->face_table, .stage = STAGE_CS, .access = ACCESS_SSBO_W},
+    };
+    PassDesc res_pass = {.buf_reads       = res_reads,
+                         .buf_read_count  = 3,
+                         .buf_writes      = res_writes,
+                         .buf_write_count = 4,
+                         .pipeline        = s->cs_slime_resolve};
+    begin_pass(vk, cmd, &res_pass);
+    dispatch_push(vk, cmd, (ByteSpan){&sp, (uint32_t)sizeof(sp)}, groups, 1, 1);
+    end_pass(vk, cmd, &res_pass);
+
+    s->slime_parity ^= 1u;
+}
+
 void scene_frame(Scene *s, VkCommandBuffer cmd, RenderTarget *color, RenderTarget *depth) {
     if (!s || !s->uploaded || s->view_count == 0 || s->group_count == 0)
         return;
@@ -1257,8 +1436,10 @@ void scene_frame(Scene *s, VkCommandBuffer cmd, RenderTarget *color, RenderTarge
 
     /* T1a: the dynamic prefix. Every slot below dynamic_capacity is rewritten
        every frame as one contiguous span — the app moves most of them, so a
-       dirty list would degenerate to the same bytes plus the bookkeeping. */
-    if (s->dynamic_count) {
+       dirty list would degenerate to the same bytes plus the bookkeeping.
+       Under the GPU slime sim the whole dynamic prefix is owned by compute, so
+       the CPU upload would only clobber the frame's work: skipped entirely. */
+    if (s->dynamic_count && !s->slime_active) {
         for (uint32_t i = 0; i < s->dynamic_count; ++i)
             s->instance_upload_scratch[i] = s->cpu_instances[i].gpu;
         BufferSlice dyn = s->instances;
@@ -1301,8 +1482,9 @@ void scene_frame(Scene *s, VkCommandBuffer cmd, RenderTarget *color, RenderTarge
 
     /* Wiggle amplitudes are set at spawn, but scene_set_instance_wiggle may run
        after the first upload, so mirror bloom's dirty re-upload here. Face and
-       squash ride along: all three are small whole-table uploads. */
-    if (s->wiggle_dirty || s->squash_dirty || s->face_dirty) {
+       squash ride along: all three are small whole-table uploads. Under the
+       slime sim, squash and face are GPU-owned and must not be overwritten. */
+    if (!s->slime_active && (s->wiggle_dirty || s->squash_dirty || s->face_dirty)) {
         renderer_upload_buffer_to_slice(vk, cmd, s->wiggle_table,
                                         (ByteSpan){s->wiggle_amp, (size_t)s->max_instances * sizeof(float)});
         renderer_upload_buffer_to_slice(vk, cmd, s->squash_table,
@@ -1327,6 +1509,8 @@ void scene_frame(Scene *s, VkCommandBuffer cmd, RenderTarget *color, RenderTarge
     }
 
     uint32_t G = s->group_count;
+
+    slime_record(s, cmd, 0u);
 
     for (uint32_t view = 0; view < s->view_count; ++view) {
         SceneViewFrame *vf = &s->view_frame[view][lane];

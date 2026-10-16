@@ -244,6 +244,53 @@ struct SceneCompactPush {
                                         3 candidate_count, 4 blocks, 5 debug printf */
 };
 
+/* ---- GPU slime sim. One 96-byte row per slime. The CPU writes it once at
+   spawn and then never touches it again: the whole hop integrator, mood
+   selection and collision run in compute, and the row is ping-ponged so a
+   thread's neighbour reads never race the writes that resolve them. ---- */
+struct SlimeState {
+    float     pos[3];    /* contact point on the ground plane */
+    float     yaw;       /* smoothed facing */
+    float     vel[3];    /* hop velocity while airborne */
+    float     yaw_tgt;
+    float     home[2];    /* wander anchor (x, z) */
+    float     dwell;      /* seconds grounded until the next hop */
+    float     blink;      /* seconds until the next blink starts */
+    float     blink_len;  /* remaining blink time; 0 = eyes open */
+    float     land_t;     /* remaining landing reaction; 0 = none */
+    float     event_t;    /* remaining random-mood time; 0 = none */
+    float     squash;     /* current vertical squash (1 = rest) */
+    float     wobble;     /* collision wobble, decays to 0 */
+    float     scale;      /* uniform body scale */
+    SCENE_U32 face_id;    /* current face atlas tile */
+    SCENE_U32 event_id;   /* FACE_SAD / FACE_ANGRY while event_t runs */
+    SCENE_U32 flags;      /* bit0 air, bit1 land_hard */
+    SCENE_U32 rng;        /* per-slime xorshift word */
+    SCENE_U32 pad[2];
+};
+
+#define SLIME_FLAG_AIR       0x1u
+#define SLIME_FLAG_LAND_HARD 0x2u
+
+/* ---- slime compute push. counts[0] count, [1] grid nx, [2] grid nz,
+   [3] cell capacity. The grid is built around view 0's camera; slimes past
+   view.w only collide as far as that gate is concerned. ---- */
+struct SceneSlimePush {
+    SCENE_PTR(SlimeState) state_in;
+    SCENE_PTR(SlimeState) state_out;
+    SCENE_PTR(SceneInstance) instances;
+    SCENE_PTR(float) squash;
+    SCENE_PTR(SCENE_U32) face;
+    SCENE_PTR(SCENE_U32) grid_count;
+    SCENE_PTR(SCENE_U32) grid_items;
+    SceneVec4 view;      /* xyz camera position, w = collide radius */
+    SCENE_U32 counts[8];
+    float     min_x;
+    float     min_z;
+    float     inv_cell;
+    SCENE_U32 pad;
+};
+
 #undef SCENE_PTR
 
 #ifdef __STDC__
@@ -260,6 +307,8 @@ _Static_assert(sizeof(struct SceneGpuMaterial) == 32, "SceneGpuMaterial is 32 by
 _Static_assert(sizeof(struct SceneCullPush) <= 256, "SceneCullPush exceeds the 256-byte push range");
 _Static_assert(sizeof(struct SceneDrawPush) <= 256, "SceneDrawPush exceeds the 256-byte push range");
 _Static_assert(sizeof(struct SceneCompactPush) <= 256, "SceneCompactPush exceeds the push range");
+_Static_assert(sizeof(struct SlimeState) == 96, "SlimeState is 96 bytes");
+_Static_assert(sizeof(struct SceneSlimePush) <= 256, "SceneSlimePush exceeds the push range");
 
 #endif /* __STDC__ */
 #endif /* MU_GFX_SCENE_SHARED_H */
