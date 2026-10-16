@@ -1,0 +1,87 @@
+Render flow (per frame)
+=======================
+
+Driver:  src/renderer.c  render_frame()
+Scene:   src/three_d/scene.c  scene_frame()
+Slimes:  src/three_d/scene.c  slime_record()
+Shaders: shaders/*.slang  ->  compiledshaders/*.spv
+
+The frame is one command buffer: a chain of compute passes, then the graphics
+passes that consume what compute produced. Every pass declares the exact buffer
+slices it reads and writes (begin_pass / end_pass + BufferAccess), so barriers
+implicate only those byte ranges, never the whole 512 MB pool.
+
+
+Compute
+=======
+
+Upload (not every frame; only when the relevant table is dirty)
+    Instances, mesh rows, group tables, index/vertex arenas   scene_upload_scene
+    Bloom strength table                                     (bloom_dirty)
+    Wiggle / squash / stretch / face tables                  (only when the slime
+                                                              sim is inactive)
+    Cull candidate prefix rows                               (candidates_dirty)
+
+Slimes  (once per frame, view 0; only when slime_active)
+    Clear hop-grid counts        cmd_fill_buffer  slime_grid_count = 0
+    Update slimes                cs_slime_sim     integrate hops -> state_in
+    Build hop grid               cs_slime_grid    state_in -> grid (counting sort)
+    Resolve collisions           cs_slime_resolve state_in + grid + obstacles -> state_out
+                                                  writes instances, squash, stretch, face
+                                                  (slime-vs-slime 3x3 + obstacle CSR push-out)
+    Ping-pong state              state_in <-> state_out
+
+Cull + compact  (per view)
+    Cull                         cs_cull        -> survivors[]
+    Histogram survivors          cs_count       -> group_count[]
+    Scan per block               cs_scan_block  -> vis_base, cmd_index, cursor, draws[],
+                                                    draw_count, scan_aux
+    Scan block offsets           cs_scan_blocks -> block base offsets in scan_aux
+    Emit indirect draws          cs_emit        -> draws[] + group_base[]
+    Scatter survivors            cs_scatter     -> vis[]
+
+Counters copy to the host-visible lane buffer (for the next frame / HUD)
+
+
+Graphics
+========
+
+Sky
+    Draw sky                     pass_sky       -> HDR color (no depth)
+
+Opaque
+    Draw all opaque indirect     scene frame T5  vkCmdDrawIndexedIndirectCount
+                                                 draws[] / draw_count[]
+                                                 pipeline: draw_pipeline  (or toon_pipeline)
+                                                 depth: reverse-Z, LOAD_CLEAR 0.0, STORE_KEEP
+
+Transparent
+    Draw sparkles additive       scene frame T5b vkCmdDraw(6, slime_count * sparkles_per_slime)
+                                                 one camera-facing quad per sparkle, procedural
+                                                 (instance id -> slime -> instance row)
+                                                 pipeline: sparkle_pipeline (blend ONE,ONE; depth test on, depth write off)
+                                                 depth: LOAD_KEEP / STORE_KEEP
+    Draw particles               (not yet present)
+    Draw other transparent       (not yet present)
+
+Post
+    SSAO                         pass_ssao          compute
+    Bloom                        pass_bloom         compute, BLOOM_MIPS downsample + upsample
+    Tonemap / composite          post_pass          compute (tonemap + bloom + ssao + grade)
+    SMAA                         pass_smaa
+    LDR -> swapchain             pass_ldr_to_swapchain
+    Text overlay / UI            pass_text_overlay, nuklear, game HUD
+
+
+Notes
+=====
+* Compute pipelines: cs_slime_sim, cs_slime_grid, cs_slime_resolve, cs_cull,
+  cs_count, cs_scan_block, cs_scan_blocks, cs_emit, cs_scatter.
+* The slime sim runs once per frame for view 0; the cull/compact passes run
+  once per view.
+* Under the slime sim the dynamic instance prefix [0, 2*slime_count) is owned by
+  compute, so the CPU squash/stretch/face uploads are skipped.
+* Sparkles are a separate additive pass after the opaque draw. `MU_SPARKLES=N`
+  sets quads per slime (0 disables the pass). The billboard basis is recovered
+  from the clip rows (row 0 ~ right, row 1 ~ -up), so no camera vectors are
+  uploaded.

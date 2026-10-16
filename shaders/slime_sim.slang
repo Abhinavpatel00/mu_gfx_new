@@ -34,6 +34,31 @@ void cs_main(uint3 tid : SV_DispatchThreadID)
     SlimeState s   = pc.state_in[i];
     uint       rng = s.rng ^ (global_data.frame_count * 747796405u + i * 2891336453u + 1u);
 
+    /* Ambient wrap: the town of slimes follows the player. A slime that drifts
+       past the collide radius is re-homed to a fresh spot in the ring around the
+       camera, so the crowd is always there without a per-chunk slime manager.
+       The old position is simply abandoned — a slime off screen has no history
+       worth keeping (rule: regenerate, do not persist). */
+    {
+        float vdx = s.pos[0] - global_data.camera_pos.x;
+        float vdz = s.pos[2] - global_data.camera_pos.z;
+        if (vdx * vdx + vdz * vdz > pc.collide_radius * pc.collide_radius)
+        {
+            float a   = rnd(rng) * 6.2831853f;
+            float rad = pc.collide_radius * (0.12f + rnd(rng) * 0.82f);
+            s.home[0] = global_data.camera_pos.x + cos(a) * rad;
+            s.home[1] = global_data.camera_pos.z + sin(a) * rad;
+            s.pos[0]  = s.home[0];
+            s.pos[1]  = 0.0f;
+            s.pos[2]  = s.home[1];
+            s.vel[0] = s.vel[1] = s.vel[2] = 0.0f;
+            s.flags &= ~(SLIME_FLAG_AIR | SLIME_FLAG_LAND_HARD);
+            s.dwell  = rnd(rng) * 0.6f;
+            s.squash = 1.0f;
+            s.stretch = 1.0f;
+        }
+    }
+
     bool  air    = (s.flags & SLIME_FLAG_AIR) != 0u;
     float squash = 1.0f;   /* vertical: 1 = rest */
     float stretch = 1.0f;  /* forward along facing: 1 = rest */
@@ -58,7 +83,9 @@ void cs_main(uint3 tid : SV_DispatchThreadID)
             s.event_id = hard ? 3u : 6u; /* FACE_SCARED : FACE_ANGRY */
             s.vel[0]  = 0.0f;
             s.vel[2]  = 0.0f;
-            s.dwell   = 0.35f + rnd(rng) * 2.4f;
+            /* Short rest: the crowd keeps wandering instead of sitting still for
+               seconds at a time. The dwell is the pause before the next hop. */
+            s.dwell   = 0.05f + rnd(rng) * 0.5f;
             air       = false;
         }
         else
@@ -74,10 +101,21 @@ void cs_main(uint3 tid : SV_DispatchThreadID)
         s.dwell -= dt;
         if (s.dwell <= 0.0f)
         {
-            float ang = rnd(rng) * 6.2831853f;
-            float rad = 1.2f + rnd(rng) * 6.0f;
-            float tx  = s.home[0] + cos(ang) * rad;
-            float tz  = s.home[1] + sin(ang) * rad * 0.7f;
+            /* Wander: hop to a fresh spot near where the slime already is, not
+               back to a fixed home. The step is clamped to a patch around home
+               so the crowd roams an area instead of diffusing off the map. */
+            float ang  = rnd(rng) * 6.2831853f;
+            float step = 1.0f + rnd(rng) * 3.5f;
+            float tx   = s.pos[0] + cos(ang) * step;
+            float tz   = s.pos[2] + sin(ang) * step;
+            float hx   = tx - s.home[0];
+            float hz   = tz - s.home[1];
+            float hd   = sqrt(hx * hx + hz * hz);
+            if (hd > 14.0f)
+            {
+                tx = s.home[0] + hx / hd * 14.0f;
+                tz = s.home[1] + hz / hd * 14.0f;
+            }
             float dx  = tx - s.pos[0];
             float dz  = tz - s.pos[2];
             float dl  = sqrt(dx * dx + dz * dz);

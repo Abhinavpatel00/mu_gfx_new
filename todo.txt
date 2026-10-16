@@ -32,3 +32,9 @@ Blend between SDF textures based on game state:
 - Health low → blend toward "scared" face
 - Near food → blend toward "happy" face
 - Time of day → "sleepy" faces at night
+
+
+
+
+
+grass should be seperate draw call

@@ -280,6 +280,52 @@ static void meadow_record(float x, float z) {
     g_placed_count++;
 }
 
+/* ---- environment obstacles -------------------------------------------------
+   Solid props the slime sim must not sink into. Only trunks and boulders block;
+   ground cover and bushes are soft and let a slime sit inside them. A flat disc
+   per prop, gathered once at plant time and bucketed into a grid by the scene. */
+#define OBSTACLE_MAX 8192
+static struct SlimeObstacle g_obstacles[OBSTACLE_MAX];
+static uint32_t              g_obstacle_count;
+
+static float obstacle_radius(uint32_t asset) {
+    switch (asset) {
+    case A_TREE_COMMON_A:
+    case A_TREE_COMMON_B:
+    case A_TREE_COMMON_C:
+    case A_PINE_A:
+    case A_PINE_B:
+    case A_TREE_BIRCH_A:
+    case A_TREE_BIRCH_B:
+    case A_TREE_OAK_A:
+    case A_TREE_OAK_B:
+        return 0.55f;
+    case A_TREE_TWISTED_A:
+    case A_TREE_TWISTED_B:
+    case A_TREE_BARE_A:
+        return 0.80f;
+    case A_ROCK_A:
+    case A_ROCK_B:
+        return 0.85f;
+    case A_ROCK_C:
+        return 1.40f;
+    default:
+        return 0.0f; /* soft: ground cover, bushes, ferns, mushrooms */
+    }
+}
+
+static void obstacle_record(uint32_t asset, float x, float z, float scale) {
+    float r = obstacle_radius(asset);
+    if (r <= 0.0f || g_obstacle_count >= OBSTACLE_MAX)
+        return;
+    struct SlimeObstacle *o = &g_obstacles[g_obstacle_count++];
+    o->x                    = x;
+    o->z                    = z;
+    o->radius               = r * scale + 0.2f;
+    o->pad                  = 0.0f;
+}
+
+
 /* A prop is a group of meshes in one space, so every mesh of the asset gets an
    instance at the same transform. */
 static void plant(Scene *scene, const SceneAssetLoad *ld, float x, float y, float z, float yaw, float scale) {
@@ -326,7 +372,9 @@ static uint32_t plant_scatter(Scene *scene, const SceneAssetLoad loads[A_COUNT],
                 continue;
             if (gap > 0.0f)
                 meadow_record(x, z);
-            plant(scene, ld, x, 0.0f, z, frand() * 6.2831853f, frange(sp->s_min, sp->s_max));
+            float sc = frange(sp->s_min, sp->s_max);
+            plant(scene, ld, x, 0.0f, z, frand() * 6.2831853f, sc);
+            obstacle_record(sp->asset, x, z, sc);
             planted++;
             placed++;
         }
@@ -360,6 +408,7 @@ static uint32_t pets_build_assets(Scene *scene) {
 
     g_seed         = 0x9E3779B9u;
     g_placed_count = 0;
+    g_obstacle_count = 0;
     uint32_t planted = 0;
 
     /* Ground: one tile per cell at exactly the tile pitch — any other spacing
@@ -411,13 +460,13 @@ static uint32_t pets_build_assets(Scene *scene) {
    dynamic region is 2 * this. MU_SLIMES overrides, clamped to the hard cap. */
 #define SLIME_DEFAULT 2048u
 #define SLIME_MAX_CAP 16384u
-/* Collision is gated to slimes within this radius of the camera; beyond it a
-   slime still hops and is drawn, it just never pushes a neighbour — the far
-   crowd is free. Cell size sets the uniform collision grid's resolution. */
-#define SLIME_COLLIDE_RADIUS 26.0f
+/* The collision grid is camera-relative: the crowd is wrapped to stay around
+   the player (see slime_sim), so collision only ever needs to cover this radius
+   and the per-frame grid clear stays small however big the world grows. */
+#define SLIME_COLLIDE_RADIUS 80.0f
 #define SLIME_CELL_SIZE      3.0f
-#define SLIME_SPREAD         100.0f /* spawn half-extent: the whole meadow and wood */
-#define SLIME_SPAWN_CLEAR    12.0f  /* keep the player's spawn clearing free of slimes */
+#define SLIME_SPREAD         76.0f  /* spawn half-extent: the ring the crowd wraps within */
+#define SLIME_SPAWN_CLEAR    10.0f  /* keep the player's spawn clearing free of slimes */
 
 /* Lat/long UV-sphere: 2 poles + (SLIME_RING-1) rings of SLIME_SEG verts. */
 #define SLIME_SEG   16u
@@ -705,7 +754,7 @@ static bool slime_build(Scene *scene) {
         s->squash           = 1.0f;
         s->wobble           = 0.0f;
         s->stretch          = 1.0f;
-        s->dwell            = frand() * 2.0f + (float)(i % 16u) * 0.05f;
+        s->dwell            = frand() * 0.4f + (float)(i % 16u) * 0.02f;
         s->blink            = 1.5f + frand() * 3.0f;
         s->blink_len        = 0.0f;
         s->land_t           = 0.0f;
@@ -999,7 +1048,9 @@ static void pets_render(void *user, VkCommandBuffer cmd, RenderTarget *color, Re
         }
 
         /* Slime crowd: g_slime_target dynamic pairs (body, SDF face quad)
-           staged before the upload with the rest. */
+           staged before the upload with the rest. Obstacles first, so the sim
+           grid has its blocking discs before the state is enabled. */
+        scene_slime_obstacles(scene, g_obstacles, g_obstacle_count);
         if (!slime_build(scene)) {
             scene_destroy(scene);
             return;

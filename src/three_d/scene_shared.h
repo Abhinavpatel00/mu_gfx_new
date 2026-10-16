@@ -220,6 +220,18 @@ struct SceneDrawPush {
     SCENE_U32 counts[8]; /* 5 shader printf */
 };
 
+/* ---- sparkle push. Sparkles are procedural: instance iid derives a slime
+   index (iid % slime_count), an orbit phase and a twinkle from a hash, and
+   reads that slime's body row for its position. No particle buffer, no CPU
+   emission — the seed is the memory. The camera basis the billboard needs is
+   recovered from clip_rows (row 0 ∝ right, row 1 ∝ -up). ---- */
+struct SceneSparklePush {
+    SceneVec4 clip_rows[4]; /* 64 */
+    SceneVec4 camera;       /* 16 xyz eye position, w unused */
+    SCENE_PTR(SceneInstance) instances; /* 8 slime body rows (slot 2i) */
+    SCENE_U32 counts[8];    /* 0 sparkle_count, 1 slime_count, 2 sparkles_per_slime */
+};
+
 /* ---- compaction context (histogram / scan / emit / scatter) ----
    scan_aux is one slice carved into three regions of SCENE_SCAN_BLOCK entries:
     [0*BLOCK)  per-block totals (count, emit), written by cs_scan_block
@@ -274,10 +286,27 @@ struct SlimeState {
 #define SLIME_FLAG_AIR       0x1u
 #define SLIME_FLAG_LAND_HARD 0x2u
 
+/* ---- static obstacle disc: a solid prop the sim pushes grounded slimes out
+   of (tree trunk, boulder). One per solid prop, gathered once at plant time.
+   Membership in the obstacle grid is the only thing the shader branches on. ---- */
+struct SlimeObstacle {
+    float x;
+    float z;
+    float radius;
+    float pad;
+};
+
 /* ---- slime compute push. counts[0] count, [1] grid nx, [2] grid nz,
-   [3] cell capacity. The grid is built around view 0's camera; slimes past
-   view.w only collide as far as that gate is concerned. ---- */
+   [3] cell capacity, [4] obstacle nx, [5] obstacle nz. The hop grid is built
+   around view 0's camera; slimes past view.w only collide as far as that gate
+   is concerned. The obstacle grid is static over the world (fixed origin) and
+   is queried with the same 3x3 neighbourhood. ---- */
 struct SceneSlimePush {
+    /* Every field is 8-byte (pointer) or 4-byte scalar. A SceneVec4 here would
+       be 16-byte aligned on the Slang side: placed after the 11 pointers (88
+       bytes, not a multiple of 16) it would shift every trailing field by 8 and
+       desync the C and Slang layouts. Camera is four scalars instead — same
+       data, no alignment trap. */
     SCENE_PTR(SlimeState) state_in;
     SCENE_PTR(SlimeState) state_out;
     SCENE_PTR(SceneInstance) instances;
@@ -286,10 +315,15 @@ struct SceneSlimePush {
     SCENE_PTR(SCENE_U32) face;
     SCENE_PTR(SCENE_U32) grid_count;
     SCENE_PTR(SCENE_U32) grid_items;
-    SceneVec4 view;      /* xyz camera position, w = collide radius */
+    SCENE_PTR(SlimeObstacle) obstacles; /* flat obstacle array */
+    SCENE_PTR(SCENE_U32) obs_off;       /* (obs_nx*obs_nz+1) CSR offsets */
+    SCENE_PTR(SCENE_U32) obs_items;     /* obstacle indices, cell by cell */
     SCENE_U32 counts[8];
+    float     collide_radius; /* camera-relative crowd radius; camera comes from global_data */
     float     min_x;
     float     min_z;
+    float     obs_min_x;
+    float     obs_min_z;
     float     inv_cell;
     SCENE_U32 pad;
 };
@@ -309,6 +343,7 @@ _Static_assert(sizeof(struct SceneGpuDraw) == 32, "SceneGpuDraw is 32 bytes");
 _Static_assert(sizeof(struct SceneGpuMaterial) == 32, "SceneGpuMaterial is 32 bytes");
 _Static_assert(sizeof(struct SceneCullPush) <= 256, "SceneCullPush exceeds the 256-byte push range");
 _Static_assert(sizeof(struct SceneDrawPush) <= 256, "SceneDrawPush exceeds the 256-byte push range");
+_Static_assert(sizeof(struct SceneSparklePush) <= 256, "SceneSparklePush exceeds the 256-byte push range");
 _Static_assert(sizeof(struct SceneCompactPush) <= 256, "SceneCompactPush exceeds the push range");
 _Static_assert(sizeof(struct SlimeState) == 96, "SlimeState is 96 bytes");
 _Static_assert(sizeof(struct SceneSlimePush) <= 256, "SceneSlimePush exceeds the push range");

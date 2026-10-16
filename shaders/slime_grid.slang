@@ -1,9 +1,9 @@
 /* slime_grid.slang — pass 2 of the slime compute chain.
-   Builds the uniform collision grid around view 0's camera. Slimes past the
-   collide radius never enter a cell, so the resolve pass cannot see them and
-   they skip collision entirely — the distance gate is the layout, not a branch
-   over every pair. One atomic per near slime; a full cell drops the overflow
-   rather than growing, which is fine at this density. */
+   Builds the uniform collision grid around the camera. The crowd is wrapped to
+   stay near the player, so every active slime falls inside this grid and takes
+   part in collision; the grid bounds are the only gate. One atomic per slime; a
+   full cell drops the overflow rather than growing, which is fine at this
+   density. */
 #include "common.slang"
 #include "../src/three_d/scene_shared.h"
 
@@ -17,11 +17,6 @@ void cs_main(uint3 tid : SV_DispatchThreadID)
         return;
 
     SlimeState s = pc.state_in[i];
-
-    float dx = s.pos[0] - pc.view.x;
-    float dz = s.pos[2] - pc.view.z;
-    if (dx * dx + dz * dz > pc.view.w * pc.view.w)
-        return; /* far from the player: no collision this frame */
 
     int cx = int((s.pos[0] - pc.min_x) * pc.inv_cell);
     int cz = int((s.pos[2] - pc.min_z) * pc.inv_cell);

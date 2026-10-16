@@ -153,6 +153,12 @@ bool scene_upload_scene(Scene *s, VkCommandBuffer cmd);
 bool scene_slime_enable(Scene *s, uint32_t count, const struct SlimeState *states, float collide_radius,
                         float cell_size);
 
+/* Solid props the slime sim must not sink into, as world-space discs (x, z,
+   radius). The scene buckets them into a fixed uniform grid once; the resolve
+   pass pushes grounded slimes out of any disc they overlap. Call before
+   scene_slime_enable (which builds the grid) and before scene_upload_scene. */
+void scene_slime_obstacles(Scene *s, const struct SlimeObstacle *obstacles, uint32_t count);
+
 void scene_view_set(Scene *s, uint32_t view, const SceneViewDesc *view_desc);
 void scene_set_clear(Scene *s, const float rgba[4]);
 

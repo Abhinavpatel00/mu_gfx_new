@@ -16,6 +16,11 @@
 #define MU_ALLOCATORS_IMPLEMENTATION
 #include "../../external/mu/allocators.h"
 
+/* Sparkles emitted per slime in the transparent pass. Purely procedural (see
+   sparkle.slang), so this is the only knob: one draw of slime_count * this
+   camera-facing quads. */
+#define SCENE_SPARKLES_PER_SLIME 4u
+
 /* ============================================================ small encoders */
 
 static uint16_t f2h(float x) {
@@ -244,6 +249,7 @@ struct Scene {
     PipelineID cs_slime_sim, cs_slime_grid, cs_slime_resolve;
     PipelineID draw_pipeline;
     PipelineID toon_pipeline; /* cel-shaded variant of the scene draw */
+    PipelineID sparkle_pipeline; /* additive transparent sparkle pass */
     bool       toon;
     bool       pipelines_ready;
     bool       uploaded;
@@ -255,6 +261,7 @@ struct Scene {
        so slime_resolve's neighbour reads see a stable snapshot. */
     bool               slime_active;
     uint32_t           slime_count;
+    uint32_t           sparkles_per_slime; /* 0 disables the transparent pass */
     struct SlimeState *slime_state_init; /* CPU copy, freed once uploaded */
     BufferSlice        slime_state[2];
     BufferSlice        slime_grid_count; /* nx*nz u32, cleared per frame */
@@ -264,6 +271,22 @@ struct Scene {
     float              slime_cell_size;
     float              slime_inv_cell;
     uint32_t           slime_parity;
+
+    /* Static obstacle collision: solid props (trunks, boulders) gathered once
+       at plant time and bucketed into a fixed uniform grid over the world. The
+       resolve pass queries it with the same 3x3 neighbourhood it uses for
+       slimes, so a grounded slime is pushed out of a trunk instead of merging
+       into it. Separate from the camera-relative hop grid: obstacles never
+       move, so this grid has a fixed origin and is built once. */
+    struct SlimeObstacle *slime_obs_init;      /* CPU copy, freed once uploaded */
+    uint32_t             *slime_obs_cpu_off;   /* CSR offsets, freed once uploaded */
+    uint32_t             *slime_obs_cpu_items; /* CSR items, freed once uploaded */
+    uint32_t              slime_obs_count;
+    uint32_t              slime_obs_nx, slime_obs_nz;
+    float                 slime_obs_min_x, slime_obs_min_z;
+    BufferSlice           slime_obs_all;   /* flat SlimeObstacle[] */
+    BufferSlice           slime_obs_off;   /* (nx*nz+1) u32 */
+    BufferSlice           slime_obs_items; /* u32 */
 };
 
 /* ============================================================ helpers */
@@ -473,6 +496,12 @@ void scene_destroy(Scene *s) {
     buffer_pool_free(s->slime_state[1]);
     buffer_pool_free(s->slime_grid_count);
     buffer_pool_free(s->slime_grid_items);
+    buffer_pool_free(s->slime_obs_all);
+    buffer_pool_free(s->slime_obs_off);
+    buffer_pool_free(s->slime_obs_items);
+    free(s->slime_obs_init);
+    free(s->slime_obs_cpu_off);
+    free(s->slime_obs_cpu_items);
     forEach(i, MAX_FRAMES_IN_FLIGHT) {
         buffer_pool_free(s->counters[i]);
         destroy_buffer(vk, &s->counters_host[i]);
@@ -963,6 +992,91 @@ void scene_set_clear(Scene *s, const float rgba[4]) { memcpy(s->clear, rgba, siz
 
 /* ============================================================ upload (T0) */
 
+/* Buckets the gathered obstacle discs into a fixed uniform grid over the world
+   (CSR: offsets + items), sized from their actual spread. Runs once, on the
+   CPU, before upload; the resolve pass only ever reads the result. */
+static void slime_build_obstacle_grid(Scene *s) {
+    uint32_t n  = s->slime_obs_count;
+    float    cs = s->slime_cell_size > 0.0f ? s->slime_cell_size : 3.0f;
+    if (n == 0) {
+        s->slime_obs_nx = s->slime_obs_nz = 0u;
+        return;
+    }
+
+    float max_abs = 0.0f;
+    const struct SlimeObstacle *o = s->slime_obs_init;
+    for (uint32_t i = 0; i < n; ++i) {
+        float ax = fabsf(o[i].x);
+        float az = fabsf(o[i].z);
+        if (ax > max_abs)
+            max_abs = ax;
+        if (az > max_abs)
+            max_abs = az;
+    }
+    float    half = max_abs + 2.0f * cs;
+    uint32_t nx   = (uint32_t)ceilf(2.0f * half / cs);
+    if (nx < 1u)
+        nx = 1u;
+    if (nx > 256u)
+        nx = 256u;
+    uint32_t cells  = nx * nx;
+    float    min_xy = -half;
+
+    uint32_t *off = (uint32_t *)calloc((size_t)cells + 1u, sizeof(uint32_t));
+    if (!off)
+        return;
+    for (uint32_t i = 0; i < n; ++i) {
+        int cx = (int)((o[i].x - min_xy) / cs);
+        int cz = (int)((o[i].z - min_xy) / cs);
+        cx     = cx < 0 ? 0 : (cx >= (int)nx ? (int)nx - 1 : cx);
+        cz     = cz < 0 ? 0 : (cz >= (int)nx ? (int)nx - 1 : cz);
+        off[(uint32_t)cz * nx + (uint32_t)cx + 1u]++;
+    }
+    for (uint32_t c = 0; c < cells; ++c)
+        off[c + 1u] += off[c];
+
+    uint32_t *items  = (uint32_t *)malloc((size_t)n * sizeof(uint32_t));
+    uint32_t *cursor = (uint32_t *)malloc((size_t)cells * sizeof(uint32_t));
+    if (!items || !cursor) {
+        free(off);
+        free(items);
+        free(cursor);
+        return;
+    }
+    memcpy(cursor, off, (size_t)cells * sizeof(uint32_t));
+    for (uint32_t i = 0; i < n; ++i) {
+        int cx = (int)((o[i].x - min_xy) / cs);
+        int cz = (int)((o[i].z - min_xy) / cs);
+        cx     = cx < 0 ? 0 : (cx >= (int)nx ? (int)nx - 1 : cx);
+        cz     = cz < 0 ? 0 : (cz >= (int)nx ? (int)nx - 1 : cz);
+        items[cursor[(uint32_t)cz * nx + (uint32_t)cx]++] = i;
+    }
+    free(cursor);
+
+    s->slime_obs_nx    = nx;
+    s->slime_obs_nz    = nx;
+    s->slime_obs_min_x = min_xy;
+    s->slime_obs_min_z = min_xy;
+    s->slime_obs_cpu_off   = off;
+    s->slime_obs_cpu_items = items;
+
+    s->slime_obs_all   = alloc_slice(s, (VkDeviceSize)n * sizeof(struct SlimeObstacle), 16);
+    s->slime_obs_off   = alloc_slice(s, ((VkDeviceSize)cells + 1u) * sizeof(uint32_t), 16);
+    s->slime_obs_items = alloc_slice(s, (VkDeviceSize)n * sizeof(uint32_t), 16);
+    log_info("[scene] slime obstacles: %u discs, grid %ux%u cell %.2f", n, nx, nx, cs);
+}
+
+void scene_slime_obstacles(Scene *s, const struct SlimeObstacle *obstacles, uint32_t count) {
+    if (!s || !obstacles || count == 0u)
+        return;
+    free(s->slime_obs_init);
+    s->slime_obs_init = (struct SlimeObstacle *)malloc((size_t)count * sizeof(struct SlimeObstacle));
+    if (!s->slime_obs_init)
+        return;
+    memcpy(s->slime_obs_init, obstacles, (size_t)count * sizeof(struct SlimeObstacle));
+    s->slime_obs_count = count;
+}
+
 bool scene_slime_enable(Scene *s, uint32_t count, const struct SlimeState *states, float collide_radius,
                         float cell_size) {
     if (!s || count == 0 || !states)
@@ -976,13 +1090,15 @@ bool scene_slime_enable(Scene *s, uint32_t count, const struct SlimeState *state
 
     /* The grid spans the collide annulus plus a one-cell border so a slime on
        the gate's rim still finds its neighbours. Cells are square and the grid
-       axis is capped so the per-frame clear stays small. */
+       follows the camera: the crowd is wrapped to stay near the player (see
+       slime_sim), so a camera-relative grid is all the collision ever needs and
+       the per-frame clear stays small no matter how big the world is. */
     float    extent = 2.0f * (collide_radius + cell_size);
     uint32_t nx     = (uint32_t)ceilf(extent / cell_size);
     if (nx < 1u)
         nx = 1u;
-    if (nx > 64u)
-        nx = 64u;
+    if (nx > 96u)
+        nx = 96u;
 
     s->slime_count          = count;
     s->slime_collide_radius = collide_radius;
@@ -1009,7 +1125,14 @@ bool scene_slime_enable(Scene *s, uint32_t count, const struct SlimeState *state
         log_error("[scene] slime buffers failed");
         return false;
     }
+    slime_build_obstacle_grid(s);
     s->slime_active = true;
+    s->sparkles_per_slime = SCENE_SPARKLES_PER_SLIME;
+    {
+        const char *sp = getenv("MU_SPARKLES");
+        if (sp)
+            s->sparkles_per_slime = (uint32_t)strtoul(sp, NULL, 10);
+    }
     log_info("[scene] slime sim: %u slimes, grid %ux%u cap %u, radius %.1f, cell %.2f", count, nx, nx,
              s->slime_grid_cap, collide_radius, cell_size);
     return true;
@@ -1097,6 +1220,18 @@ bool scene_upload_scene(Scene *s, VkCommandBuffer cmd) {
         s->slime_state_init = NULL;
     }
 
+    /* Obstacle discs + their CSR grid: built once, uploaded once. */
+    if (s->slime_active && s->slime_obs_count && s->slime_obs_cpu_off && s->slime_obs_cpu_items) {
+        uint32_t cells = s->slime_obs_nx * s->slime_obs_nz;
+        renderer_upload_buffer_to_slice(
+            vk, cmd, s->slime_obs_all,
+            (ByteSpan){s->slime_obs_init, s->slime_obs_count * sizeof(struct SlimeObstacle)});
+        renderer_upload_buffer_to_slice(vk, cmd, s->slime_obs_off,
+                                        (ByteSpan){s->slime_obs_cpu_off, (cells + 1u) * sizeof(uint32_t)});
+        renderer_upload_buffer_to_slice(vk, cmd, s->slime_obs_items,
+                                        (ByteSpan){s->slime_obs_cpu_items, s->slime_obs_count * sizeof(uint32_t)});
+    }
+
     /* Whole instance table, once. After this the dynamic prefix is rewritten by
        T1 each frame and the static suffix only when a static row actually
        changes, so a settled scene pays nothing for instance residency. */
@@ -1173,6 +1308,17 @@ static void ensure_pipelines(Scene *s, RenderTarget *color, RenderTarget *depth)
     cfg.vert_path      = "compiledshaders/toon.vert.spv";
     cfg.frag_path      = "compiledshaders/toon.frag.spv";
     s->toon_pipeline   = pipeline_create_graphics(s->vk, &cfg);
+
+    /* Sparkles share the draw's clip rows and color/depth formats but blend
+       additively and never write depth: a transparent pass that runs after the
+       opaque draw. Same reverse-Z compare, so a sparkle hides behind a trunk. */
+    cfg.vert_path          = "compiledshaders/sparkle.vert.spv";
+    cfg.frag_path          = "compiledshaders/sparkle.frag.spv";
+    cfg.depth_write_enable = false;
+    cfg.depth_test_enable  = true;
+    cfg.blends[0]          = blend_additive();
+    s->sparkle_pipeline    = pipeline_create_graphics(s->vk, &cfg);
+
     s->toon            = getenv("MU_TOON") != NULL;
     s->pipelines_ready = true;
 }
@@ -1331,17 +1477,24 @@ static void slime_record(Scene *s, VkCommandBuffer cmd, uint32_t view) {
     sp.face       = slice_addr(vk, s->face_table);
     sp.grid_count = slice_addr(vk, s->slime_grid_count);
     sp.grid_items = slice_addr(vk, s->slime_grid_items);
-    sp.view.x     = s->views[view].camera_pos[0];
-    sp.view.y     = s->views[view].camera_pos[1];
-    sp.view.z     = s->views[view].camera_pos[2];
-    sp.view.w     = s->slime_collide_radius;
+    if (s->slime_obs_count && s->slime_obs_all.buffer) {
+        sp.obstacles = slice_addr(vk, s->slime_obs_all);
+        sp.obs_off   = slice_addr(vk, s->slime_obs_off);
+        sp.obs_items = slice_addr(vk, s->slime_obs_items);
+    }
     sp.counts[0]  = count;
     sp.counts[1]  = s->slime_grid_nx;
     sp.counts[2]  = s->slime_grid_nz;
     sp.counts[3]  = s->slime_grid_cap;
+    sp.counts[4]  = s->slime_obs_nx;
+    sp.counts[5]  = s->slime_obs_nz;
+    sp.counts[6]  = getenv("MU_SLIME_DEBUG") ? 1u : 0u;
     sp.min_x      = s->views[view].camera_pos[0] - extent * 0.5f;
     sp.min_z      = s->views[view].camera_pos[2] - extent * 0.5f;
+    sp.obs_min_x  = s->slime_obs_min_x;
+    sp.obs_min_z  = s->slime_obs_min_z;
     sp.inv_cell   = s->slime_inv_cell;
+    sp.collide_radius = s->slime_collide_radius;
 
     BufferAccess sim_state[1] = {{.slice = *st_in, .stage = STAGE_CS, .access = ACCESS_SSBO_R | ACCESS_SSBO_W}};
     BufferAccess sim_write[1] = {{.slice = *st_in, .stage = STAGE_CS, .access = ACCESS_SSBO_W}};
@@ -1372,11 +1525,17 @@ static void slime_record(Scene *s, VkCommandBuffer cmd, uint32_t view) {
     dispatch_push(vk, cmd, (ByteSpan){&sp, (uint32_t)sizeof(sp)}, groups, 1, 1);
     end_pass(vk, cmd, &grid_pass);
 
-    BufferAccess res_reads[3] = {
+    BufferAccess res_reads[6] = {
         {.slice = *st_in, .stage = STAGE_CS, .access = ACCESS_SSBO_R},
         {.slice = s->slime_grid_count, .stage = STAGE_CS, .access = ACCESS_SSBO_R},
         {.slice = s->slime_grid_items, .stage = STAGE_CS, .access = ACCESS_SSBO_R},
     };
+    uint32_t res_read_count = 3u;
+    if (s->slime_obs_count && s->slime_obs_all.buffer) {
+        res_reads[res_read_count++] = (BufferAccess){.slice = s->slime_obs_all, .stage = STAGE_CS, .access = ACCESS_SSBO_R};
+        res_reads[res_read_count++] = (BufferAccess){.slice = s->slime_obs_off, .stage = STAGE_CS, .access = ACCESS_SSBO_R};
+        res_reads[res_read_count++] = (BufferAccess){.slice = s->slime_obs_items, .stage = STAGE_CS, .access = ACCESS_SSBO_R};
+    }
     BufferAccess res_writes[5] = {
         {.slice = *st_out, .stage = STAGE_CS, .access = ACCESS_SSBO_W},
         {.slice = s->instances, .stage = STAGE_CS, .access = ACCESS_SSBO_W},
@@ -1385,7 +1544,7 @@ static void slime_record(Scene *s, VkCommandBuffer cmd, uint32_t view) {
         {.slice = s->face_table, .stage = STAGE_CS, .access = ACCESS_SSBO_W},
     };
     PassDesc res_pass = {.buf_reads       = res_reads,
-                         .buf_read_count  = 3,
+                         .buf_read_count  = res_read_count,
                          .buf_writes      = res_writes,
                          .buf_write_count = 5,
                          .pipeline        = s->cs_slime_resolve};
@@ -1858,6 +2017,45 @@ void scene_frame(Scene *s, VkCommandBuffer cmd, RenderTarget *color, RenderTarge
         cmd_draw_indexed_indirect_count(vk, cmd, (ByteSpan){&dp, (uint32_t)sizeof(dp)}, vf->draws, vf->draw_count, G,
                                         (uint32_t)sizeof(struct SceneGpuDraw));
         end_pass(vk, cmd, &draw_pass);
+
+        /* T5b: transparent sparkle pass, after the opaque draw. Reads the slime
+           body rows the resolve pass just wrote, blends additively over the
+           lit HDR colour, and depth-tests against the opaque depth without
+           writing it. Procedural: the vertex shader derives each sparkle from
+           its instance id, so there is no particle buffer to upload. */
+        if (s->slime_active && s->slime_count && s->sparkles_per_slime) {
+            struct SceneSparklePush spk;
+            memset(&spk, 0, sizeof(spk));
+            for (int r = 0; r < 4; ++r) {
+                spk.clip_rows[r].x = s->views[view].clip_rows[r][0];
+                spk.clip_rows[r].y = s->views[view].clip_rows[r][1];
+                spk.clip_rows[r].z = s->views[view].clip_rows[r][2];
+                spk.clip_rows[r].w = s->views[view].clip_rows[r][3];
+            }
+            spk.camera.x = s->views[view].camera_pos[0];
+            spk.camera.y = s->views[view].camera_pos[1];
+            spk.camera.z = s->views[view].camera_pos[2];
+            spk.instances = slice_addr(vk, s->instances);
+            spk.counts[0] = s->slime_count * s->sparkles_per_slime;
+            spk.counts[1] = s->slime_count;
+            spk.counts[2] = s->sparkles_per_slime;
+
+            PassAttachment scol = {.target = color, .load = LOAD_KEEP, .store = STORE_KEEP};
+            PassAttachment sdep = {.target = depth, .load = LOAD_KEEP, .store = STORE_KEEP};
+            BufferAccess   sreads[1] = {
+                {.slice = s->instances, .stage = STAGE_VERT, .access = ACCESS_SSBO_R},
+            };
+            PassDesc spass = {.colors         = &scol,
+                              .color_count    = 1,
+                              .depth          = &sdep,
+                              .buf_reads      = sreads,
+                              .buf_read_count = ARRAY_COUNT(sreads),
+                              .pipeline       = s->sparkle_pipeline};
+            begin_pass(vk, cmd, &spass);
+            push_constants(vk, cmd, (ByteSpan){&spk, (uint32_t)sizeof(spk)});
+            vkCmdDraw(cmd, 6u, spk.counts[0], 0u, 0u);
+            end_pass(vk, cmd, &spass);
+        }
     }
 
     /* copy counters to the host-visible lane buffer for next time */

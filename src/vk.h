@@ -716,6 +716,22 @@ static inline ColorAttachmentBlend blend_alpha(void) {
     };
 }
 
+/* Additive: src + dst, for light-emitting particles (sparkles). The shader
+   premultiplies by its own alpha, so the source factor is ONE. */
+static inline ColorAttachmentBlend blend_additive(void) {
+    return (ColorAttachmentBlend){
+        .blend_enable = true,
+        .src_color    = VK_BLEND_FACTOR_ONE,
+        .dst_color    = VK_BLEND_FACTOR_ONE,
+        .color_op     = VK_BLEND_OP_ADD,
+        .src_alpha    = VK_BLEND_FACTOR_ONE,
+        .dst_alpha    = VK_BLEND_FACTOR_ONE,
+        .alpha_op     = VK_BLEND_OP_ADD,
+        .write_mask =
+            VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT,
+    };
+}
+
 // Destruction is immediate. Wait for final GPU use (or defer via DeleteQueue).
 // At shutdown wait idle, drain delete queues, then destroy resources and backend.
 // Create the instance, then create/set the platform surface before the backend.
