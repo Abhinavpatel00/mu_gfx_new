@@ -88,11 +88,17 @@ static const char *const pets_assets[A_COUNT] = {
     [A_CLOVER]         = "assets/md_clover.mua",
 };
 
-/* Ground tiles and the path that crosses them. The tile is 4x4, so spacing is
-   the tile size: any other number opens seams at the joins. */
-#define MEADOW_TILES      72
-#define MEADOW_TILE_STEP  4.0f
-#define MEADOW_PATH_STEPS 180
+/* The world is a function of chunk coordinates, not a stored list: a chunk is a
+   CHUNK_SIZE square of ground plus a scatter of species drawn from a hash of its
+   (cx, cz), so the same coordinate yields the same content on any machine and
+   nothing is persisted between frames. A (2*CHUNK_R+1)^2 window around the
+   player is live; crossing a chunk border retires the window and regenerates it.
+   Regenerate, do not persist. */
+#define CHUNK_SIZE 32.0f
+#define CHUNK_TILE 4.0f /* the ground tile is 4x4, so spacing is the tile size */
+#define CHUNK_GRID 8u   /* tiles per chunk side => CHUNK_GRID * CHUNK_TILE == CHUNK_SIZE */
+#define CHUNK_R    4
+#define CHUNK_SIDE (2 * CHUNK_R + 1) /* 9x9 chunks live around the player */
 
 /* A species' planting rule. Radial bands rather than a hand-placed list: a
    couple of thousand props is past the point a table stays readable, and a
@@ -107,108 +113,57 @@ typedef struct Scatter {
     float    min_gap;
 } Scatter;
 
-/* Trees and their seedings, then rocks, then bushes, then ground cover. Order
-   is load-bearing: the rejection list is filled as this is walked, so anything
-   that must stand clear of a trunk has to be planted after one. */
-static const Scatter meadow_scatter[] = {
-    /* --- trees: a light frame around the clearing, not a wall ------------- */
-    {A_TREE_COMMON_A, 8, 12.0f, 34.0f, 0.85f, 1.15f, 7.0f},
-    {A_TREE_COMMON_B, 7, 12.0f, 34.0f, 0.85f, 1.15f, 7.0f},
-    {A_TREE_COMMON_C, 7, 12.0f, 34.0f, 0.80f, 1.10f, 7.0f},
-    {A_PINE_A, 10, 14.0f, 36.0f, 0.85f, 1.20f, 6.5f},
-    {A_PINE_B, 10, 14.0f, 36.0f, 0.85f, 1.20f, 6.5f},
-    /* The twisted pair are the 16m ancients: kept large but rare and off centre. */
-    {A_TREE_TWISTED_A, 3, 17.0f, 32.0f, 0.50f, 0.70f, 11.0f},
-    {A_TREE_TWISTED_B, 3, 17.0f, 32.0f, 0.50f, 0.70f, 11.0f},
-    {A_TREE_BIRCH_A, 11, 11.0f, 34.0f, 0.90f, 1.30f, 6.0f},
-    {A_TREE_BIRCH_B, 10, 11.0f, 34.0f, 0.90f, 1.30f, 6.0f},
-    {A_TREE_OAK_A, 9, 12.0f, 34.0f, 0.90f, 1.25f, 6.5f},
-    {A_TREE_OAK_B, 8, 12.0f, 34.0f, 0.90f, 1.25f, 6.5f},
-    {A_TREE_BARE_A, 5, 13.0f, 33.0f, 1.10f, 1.60f, 8.0f},
-    /* --- rocks ------------------------------------------------------------ */
-    {A_ROCK_A, 12, 6.0f, 30.0f, 0.70f, 1.20f, 5.0f},
-    {A_ROCK_B, 12, 6.0f, 30.0f, 0.70f, 1.20f, 5.0f},
-    {A_ROCK_C, 26, 4.0f, 32.0f, 1.20f, 2.40f, 2.5f},
-    /* --- bushes ----------------------------------------------------------- */
-    {A_BUSH_A, 34, 5.0f, 30.0f, 0.80f, 1.30f, 2.5f},
-    {A_BUSH_FLOWERS, 22, 5.0f, 28.0f, 0.80f, 1.30f, 2.5f},
-    {A_BUSH_B, 40, 4.0f, 30.0f, 1.00f, 1.80f, 0.0f},
-    {A_BUSH_C, 34, 4.0f, 30.0f, 1.20f, 2.20f, 0.0f},
-    /* --- ground cover: dense, and free to overlap itself ------------------ */
-    {A_GRASS_TALL, 260, 2.0f, 34.0f, 0.70f, 1.40f, 0.0f},
-    {A_GRASS_WISPY, 220, 2.0f, 34.0f, 0.70f, 1.40f, 0.0f},
-    {A_GRASS_B, 300, 1.5f, 34.0f, 1.40f, 3.00f, 0.0f},
-    {A_GRASS_C, 260, 1.5f, 34.0f, 1.20f, 2.60f, 0.0f},
-    {A_PEBBLE_A, 60, 2.0f, 30.0f, 0.80f, 1.60f, 0.0f},
-    {A_CLOVER, 90, 2.0f, 28.0f, 0.80f, 1.40f, 0.0f},
-    {A_MUSHROOM, 44, 3.0f, 26.0f, 0.90f, 1.60f, 0.0f},
-    {A_FERN, 18, 6.0f, 28.0f, 0.35f, 0.60f, 3.0f},
-    {A_FLOWER_GROUP, 46, 2.0f, 26.0f, 0.80f, 1.30f, 0.0f},
+/* Per-chunk scatter. r_min..r_max is a placement radius band around the chunk
+   centre (half the chunk diagonal is ~22.6, so 0..20 fills the tile without a
+   hole in the middle); min_gap is the within-chunk rejection distance, 0 for
+   ground cover that is allowed to grow through itself. Order is load-bearing:
+   the rejection list is filled while walking, so trees are planted before the
+   underbrush that must stand clear of their trunks. Counts are per 32 m chunk,
+   so a window's density is fixed regardless of how far the player travels. */
+static const Scatter chunk_scatter[] = {
+    /* --- trees ------------------------------------------------------------- */
+    {A_TREE_COMMON_A, 2, 2.0f, 20.0f, 0.85f, 1.30f, 6.5f},
+    {A_TREE_COMMON_B, 2, 2.0f, 20.0f, 0.85f, 1.30f, 6.5f},
+    {A_TREE_COMMON_C, 2, 2.0f, 20.0f, 0.80f, 1.25f, 6.5f},
+    {A_PINE_A, 2, 2.0f, 21.0f, 0.85f, 1.35f, 6.0f},
+    {A_PINE_B, 2, 2.0f, 21.0f, 0.85f, 1.35f, 6.0f},
+    {A_TREE_BIRCH_A, 2, 2.0f, 20.0f, 0.90f, 1.35f, 5.5f},
+    {A_TREE_BIRCH_B, 2, 2.0f, 20.0f, 0.90f, 1.35f, 5.5f},
+    {A_TREE_OAK_A, 2, 2.0f, 20.0f, 0.90f, 1.30f, 6.0f},
+    {A_TREE_OAK_B, 2, 2.0f, 20.0f, 0.90f, 1.30f, 6.0f},
+    /* The twisted pair are the ancients: large, rare, off in the corners. */
+    {A_TREE_TWISTED_A, 1, 10.0f, 20.0f, 0.50f, 0.75f, 12.0f},
+    {A_TREE_TWISTED_B, 1, 10.0f, 20.0f, 0.50f, 0.75f, 12.0f},
+    {A_TREE_BARE_A, 1, 4.0f, 20.0f, 1.05f, 1.55f, 8.0f},
+    /* --- rocks ------------------------------------------------------------- */
+    {A_ROCK_A, 1, 2.0f, 20.0f, 0.70f, 1.20f, 5.0f},
+    {A_ROCK_B, 1, 2.0f, 20.0f, 0.70f, 1.20f, 5.0f},
+    {A_ROCK_C, 2, 2.0f, 20.0f, 1.20f, 2.40f, 3.0f},
+    /* --- bushes ------------------------------------------------------------ */
+    {A_BUSH_A, 3, 2.0f, 20.0f, 0.80f, 1.30f, 3.0f},
+    {A_BUSH_FLOWERS, 2, 2.0f, 20.0f, 0.80f, 1.30f, 3.0f},
+    {A_BUSH_B, 4, 2.0f, 20.0f, 1.00f, 1.80f, 0.0f},
+    {A_BUSH_C, 3, 2.0f, 20.0f, 1.20f, 2.20f, 0.0f},
+    /* --- ground cover: dense, and free to overlap itself ------------------- */
+    {A_GRASS_TALL, 30, 0.0f, 22.0f, 0.70f, 1.40f, 0.0f},
+    {A_GRASS_WISPY, 26, 0.0f, 22.0f, 0.70f, 1.40f, 0.0f},
+    {A_GRASS_B, 34, 0.0f, 22.0f, 1.40f, 3.00f, 0.0f},
+    {A_GRASS_C, 30, 0.0f, 22.0f, 1.20f, 2.60f, 0.0f},
+    {A_PEBBLE_A, 6, 0.0f, 20.0f, 0.80f, 1.60f, 0.0f},
+    {A_CLOVER, 12, 0.0f, 20.0f, 0.80f, 1.40f, 0.0f},
+    {A_MUSHROOM, 5, 2.0f, 18.0f, 0.90f, 1.60f, 0.0f},
+    {A_FERN, 3, 4.0f, 20.0f, 0.35f, 0.60f, 3.0f},
+    {A_FLOWER_GROUP, 5, 0.0f, 18.0f, 0.80f, 1.30f, 0.0f},
 };
-#define MEADOW_SCATTER_COUNT (sizeof(meadow_scatter) / sizeof(meadow_scatter[0]))
+#define CHUNK_SCATTER_COUNT (sizeof(chunk_scatter) / sizeof(chunk_scatter[0]))
 
-/* The forest ringing the clearing: an open woodland, not a wall. Species are
-   scattered in two thin bands — a loose inner stand where the clearing's own
-   trees stop (r ~36) and a sparse outer treeline toward the terrain edge — with
-   large gaps so the player can wander between trunks and see across glades.
-   Density falls with distance, and each stand streams through its own LOD rung,
-   so the far wood is cheap in fill and locality alike. */
-static const Scatter forest_scatter[] = {
-    /* --- trees: loose inner stand ----------------------------------------- */
-    {A_TREE_COMMON_A, 25, 36.0f, 80.0f, 0.90f, 1.60f, 8.0f},
-    {A_TREE_COMMON_B, 22, 36.0f, 80.0f, 0.90f, 1.60f, 8.0f},
-    {A_TREE_COMMON_C, 22, 36.0f, 80.0f, 0.90f, 1.60f, 8.0f},
-    {A_PINE_A, 30, 36.0f, 80.0f, 0.90f, 1.70f, 8.0f},
-    {A_PINE_B, 30, 36.0f, 80.0f, 0.90f, 1.70f, 8.0f},
-    {A_TREE_BIRCH_A, 24, 36.0f, 80.0f, 0.90f, 1.50f, 7.0f},
-    {A_TREE_BIRCH_B, 22, 36.0f, 80.0f, 0.90f, 1.50f, 7.0f},
-    {A_TREE_OAK_A, 18, 36.0f, 80.0f, 0.90f, 1.60f, 8.0f},
-    {A_TREE_OAK_B, 18, 36.0f, 80.0f, 0.90f, 1.60f, 8.0f},
-    {A_TREE_TWISTED_A, 6, 46.0f, 82.0f, 0.55f, 0.80f, 12.0f},
-    {A_TREE_TWISTED_B, 6, 46.0f, 82.0f, 0.55f, 0.80f, 12.0f},
-    /* --- trees: sparse outer treeline ------------------------------------- */
-    {A_TREE_COMMON_A, 18, 78.0f, 132.0f, 0.90f, 1.60f, 11.0f},
-    {A_TREE_COMMON_B, 16, 78.0f, 132.0f, 0.90f, 1.60f, 11.0f},
-    {A_TREE_COMMON_C, 16, 78.0f, 132.0f, 0.90f, 1.60f, 11.0f},
-    {A_PINE_A, 24, 78.0f, 132.0f, 0.90f, 1.70f, 11.0f},
-    {A_PINE_B, 24, 78.0f, 132.0f, 0.90f, 1.70f, 11.0f},
-    {A_TREE_BIRCH_A, 18, 78.0f, 132.0f, 0.90f, 1.50f, 10.0f},
-    {A_TREE_BIRCH_B, 16, 78.0f, 132.0f, 0.90f, 1.50f, 10.0f},
-    {A_TREE_OAK_A, 14, 78.0f, 132.0f, 0.90f, 1.60f, 11.0f},
-    {A_TREE_OAK_B, 14, 78.0f, 132.0f, 0.90f, 1.60f, 11.0f},
-    {A_TREE_TWISTED_A, 4, 86.0f, 130.0f, 0.55f, 0.80f, 13.0f},
-    {A_TREE_TWISTED_B, 4, 86.0f, 130.0f, 0.55f, 0.80f, 13.0f},
-    /* --- underbrush: scattered patches, not a carpet ---------------------- */
-    {A_BUSH_A, 30, 36.0f, 80.0f, 0.90f, 1.50f, 3.0f},
-    {A_BUSH_A, 24, 78.0f, 132.0f, 0.90f, 1.50f, 4.0f},
-    {A_BUSH_FLOWERS, 18, 36.0f, 80.0f, 0.90f, 1.50f, 3.0f},
-    {A_BUSH_FLOWERS, 12, 78.0f, 132.0f, 0.90f, 1.50f, 4.0f},
-    {A_BUSH_B, 40, 36.0f, 80.0f, 1.00f, 1.80f, 0.0f},
-    {A_BUSH_B, 30, 78.0f, 132.0f, 1.00f, 1.80f, 0.0f},
-    {A_BUSH_C, 36, 36.0f, 80.0f, 1.20f, 2.20f, 0.0f},
-    {A_BUSH_C, 28, 78.0f, 132.0f, 1.20f, 2.20f, 0.0f},
-    {A_FERN, 60, 36.0f, 80.0f, 0.40f, 0.80f, 0.0f},
-    {A_FERN, 50, 78.0f, 132.0f, 0.40f, 0.80f, 0.0f},
-    {A_ROCK_A, 14, 36.0f, 80.0f, 0.80f, 1.50f, 5.0f},
-    {A_ROCK_A, 12, 78.0f, 132.0f, 0.80f, 1.50f, 6.0f},
-    {A_ROCK_B, 14, 36.0f, 80.0f, 0.80f, 1.50f, 5.0f},
-    {A_ROCK_B, 12, 78.0f, 132.0f, 0.80f, 1.50f, 6.0f},
-    {A_ROCK_C, 24, 36.0f, 80.0f, 1.20f, 2.60f, 4.0f},
-    {A_ROCK_C, 20, 78.0f, 132.0f, 1.20f, 2.60f, 5.0f},
-};
-#define FOREST_SCATTER_COUNT (sizeof(forest_scatter) / sizeof(forest_scatter[0]))
-
-/* Runtime density/extent multiplier (MU_SCENE_SCALE). Scales the planted
-   counts and the terrain grid together, so capacity sizing and placement walk
-   exactly the same numbers; used to profile how the frame scales with size. */
+/* Runtime density multiplier (MU_SCENE_SCALE). Scales the per-chunk scatter
+   counts only, so capacity sizing and placement walk exactly the same numbers;
+   used to profile how the frame scales with world density. */
 static float    g_scene_scale = 1.0f;
-static uint32_t scaled_count(uint32_t base) {
+static uint32_t chunk_count(uint32_t base) {
     uint32_t n = (uint32_t)((float)base * g_scene_scale + 0.5f);
     return n > 0u ? n : 1u;
-}
-static uint32_t meadow_tiles(void) {
-    uint32_t t = (uint32_t)((float)MEADOW_TILES * g_scene_scale + 0.5f);
-    return t > 1u ? t : 1u;
 }
 
 /* Cooked .mua room pieces (see the table above). Node transforms are baked
@@ -337,52 +292,95 @@ static void plant(Scene *scene, const SceneAssetLoad *ld, float x, float y, floa
     }
 }
 
-/* The instance total the scene must be created with, derived from the same two
-   tables the builder walks so the capacity and the planting cannot disagree. */
-static uint32_t pets_instance_total(const uint32_t asset_meshes[A_COUNT]) {
-    uint32_t tiles = meadow_tiles();
-    uint32_t total = tiles * tiles * asset_meshes[A_GROUND];
-    for (uint32_t i = 0; i < MEADOW_SCATTER_COUNT; ++i)
-        total += scaled_count(meadow_scatter[i].count) * asset_meshes[meadow_scatter[i].asset];
-    for (uint32_t i = 0; i < FOREST_SCATTER_COUNT; ++i)
-        total += scaled_count(forest_scatter[i].count) * asset_meshes[forest_scatter[i].asset];
-    return total + scaled_count(MEADOW_PATH_STEPS) * asset_meshes[A_ROCKPATH];
+/* The instance total the scene must be created with. One chunk's worth of
+   ground plus scatter, times the number of live chunks, derived from the same
+   table chunk_build walks so the capacity and the planting cannot disagree. */
+static uint32_t world_instance_total(const uint32_t asset_meshes[A_COUNT]) {
+    uint32_t ground_tile = asset_meshes[A_GROUND] > asset_meshes[A_GROUND_ROCKY] ? asset_meshes[A_GROUND]
+                                                                                : asset_meshes[A_GROUND_ROCKY];
+    uint32_t per = CHUNK_GRID * CHUNK_GRID * ground_tile;
+    for (uint32_t i = 0; i < CHUNK_SCATTER_COUNT; ++i)
+        per += chunk_count(chunk_scatter[i].count) * asset_meshes[chunk_scatter[i].asset];
+    return per * CHUNK_SIDE * CHUNK_SIDE;
 }
 
-/* Plants one species table into the scene, walking the same scaled counts the
-   capacity was sized from. A prop is a group of meshes in one space, so every
-   mesh of the asset gets an instance at the same transform. */
-static uint32_t plant_scatter(Scene *scene, const SceneAssetLoad loads[A_COUNT], const Scatter *table,
-                              uint32_t count) {
-    uint32_t planted = 0;
-    for (uint32_t s = 0; s < count; ++s) {
-        const Scatter        *sp    = &table[s];
+/* Per-chunk RNG. Seeded from the chunk coordinate alone, so a chunk's content is
+   a pure function of where it is: the same tile looks identical however the
+   player arrives at it, and no RNG state is carried across a stream boundary. */
+static uint32_t chunk_hash(int cx, int cz) {
+    uint32_t h = (uint32_t)cx * 0x9E3779B9u + (uint32_t)cz * 0x85EBCA6Bu;
+    h ^= h >> 15;
+    h *= 0x2C1B3C6Du;
+    h ^= h >> 12;
+    h *= 0x297A2D39u;
+    h ^= h >> 15;
+    return h ? h : 0xA5A5A5A5u;
+}
+static float crand(uint32_t *s) {
+    uint32_t x = *s;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    *s = x;
+    return (float)(x >> 8) * (1.0f / 16777216.0f);
+}
+static float crange(uint32_t *s, float lo, float hi) { return lo + (hi - lo) * crand(s); }
+
+/* Builds one chunk: its ground tiles and its species, from a hash of (cx, cz).
+   Instance slots are staged static; the whole window is torn down and rebuilt on
+   a stream boundary, so nothing here tracks ownership. */
+static void chunk_build(Scene *scene, const SceneAssetLoad loads[A_COUNT], int cx, int cz) {
+    uint32_t rng = chunk_hash(cx, cz);
+    float    ox  = (float)cx * CHUNK_SIZE;
+    float    oz  = (float)cz * CHUNK_SIZE;
+
+    /* Ground: one tile per cell at exactly the tile pitch — any other spacing
+       opens seams at the joins. Every fifth tile (in a global, so seam-free
+       pattern) takes the rocky variant. */
+    for (uint32_t lz = 0; lz < CHUNK_GRID; ++lz) {
+        for (uint32_t lx = 0; lx < CHUNK_GRID; ++lx) {
+            int      gx    = cx * (int)CHUNK_GRID + (int)lx;
+            int      gz    = cz * (int)CHUNK_GRID + (int)lz;
+            uint32_t asset = (((uint32_t)gx * 7u + (uint32_t)gz * 13u) % 5u == 0u) ? A_GROUND_ROCKY : A_GROUND;
+            plant(scene, &loads[asset], ox + (float)lx * CHUNK_TILE, 0.0f, oz + (float)lz * CHUNK_TILE, 0.0f, 1.0f);
+        }
+    }
+
+    /* Species, in table order. The rejection list is per-chunk so one chunk's
+       content never depends on which neighbours were built before it. */
+    g_placed_count = 0;
+    float centre_x = ox + CHUNK_SIZE * 0.5f;
+    float centre_z = oz + CHUNK_SIZE * 0.5f;
+    for (uint32_t s = 0; s < CHUNK_SCATTER_COUNT; ++s) {
+        const Scatter        *sp    = &chunk_scatter[s];
         const SceneAssetLoad *ld    = &loads[sp->asset];
-        uint32_t              want  = scaled_count(sp->count);
-        float                 r_min = sp->r_min * g_scene_scale;
-        float                 r_max = sp->r_max * g_scene_scale;
-        float                 gap   = sp->min_gap * g_scene_scale;
+        uint32_t              want  = chunk_count(sp->count);
+        float                 gap   = sp->min_gap;
         uint32_t              placed = 0;
-        for (uint32_t tries = 0; tries < want * 32u && placed < want; ++tries) {
-            float ang = frand() * 6.2831853f;
-            float rad = sqrtf(frange(r_min * r_min, r_max * r_max));
-            float x   = cosf(ang) * rad;
-            float z   = sinf(ang) * rad;
+        for (uint32_t tries = 0; tries < want * 16u && placed < want; ++tries) {
+            float ang = crand(&rng) * 6.2831853f;
+            float rad = sqrtf(crange(&rng, sp->r_min * sp->r_min, sp->r_max * sp->r_max));
+            float x   = centre_x + cosf(ang) * rad;
+            float z   = centre_z + sinf(ang) * rad;
             if (!meadow_clear(x, z, gap))
                 continue;
             if (gap > 0.0f)
                 meadow_record(x, z);
-            float sc = frange(sp->s_min, sp->s_max);
-            plant(scene, ld, x, 0.0f, z, frand() * 6.2831853f, sc);
+            float sc = crange(&rng, sp->s_min, sp->s_max);
+            plant(scene, ld, x, 0.0f, z, crand(&rng) * 6.2831853f, sc);
             obstacle_record(sp->asset, x, z, sc);
-            planted++;
             placed++;
         }
-        if (placed < want)
-            log_info("[pets] %s: placed %u of %u", pets_assets[sp->asset], placed, want);
     }
-    return planted;
 }
+
+/* Loaded roster, kept for streaming; and the chunk the live window is centred
+   on, so a frame that stays inside a chunk pays nothing. */
+static SceneAssetLoad g_loads[A_COUNT];
+static bool           g_loads_ready;
+static int            g_chunk_cx   = 0;
+static int            g_chunk_cz   = 0;
+static bool           g_chunk_done = false;
 
 /* Loads the roster, then plants the clearing.
 
@@ -406,43 +404,48 @@ static uint32_t pets_build_assets(Scene *scene) {
         total_meshes += loads[m].mesh_count;
     }
 
-    g_seed         = 0x9E3779B9u;
-    g_placed_count = 0;
+    /* Keep the loaded roster for streaming. Instances are not planted here: the
+       world is built a window at a time by world_stream, so the same loads feed
+       every chunk the player walks into. */
+    memcpy(g_loads, loads, sizeof(g_loads));
+    g_loads_ready = true;
+
+    g_seed           = 0x9E3779B9u;
+    g_placed_count   = 0;
     g_obstacle_count = 0;
-    uint32_t planted = 0;
 
-    /* Ground: one tile per cell at exactly the tile pitch — any other spacing
-       opens seams at the joins. Every fifth cell takes the rocky variant, a
-       deterministic wear pattern so the same tiles are worn every run. */
-    uint32_t tiles = meadow_tiles();
-    for (uint32_t z = 0; z < tiles; ++z) {
-        for (uint32_t x = 0; x < tiles; ++x) {
-            float    px    = ((float)x - (float)(tiles - 1) * 0.5f) * MEADOW_TILE_STEP;
-            float    pz    = ((float)z - (float)(tiles - 1) * 0.5f) * MEADOW_TILE_STEP;
-            uint32_t asset = ((x * 7u + z * 13u) % 5u == 0u) ? A_GROUND_ROCKY : A_GROUND;
-            plant(scene, &loads[asset], px, 0.0f, pz, 0.0f, 1.0f);
-            planted++;
-        }
-    }
-
-    /* Species, in table order. Drawing the radius from the band's squared range
-       keeps the density uniform over the annulus instead of piling up middle. */
-    planted += plant_scatter(scene, loads, meadow_scatter, MEADOW_SCATTER_COUNT);
-    /* The wood around it, planted after so trunks clear the clearing's props. */
-    planted += plant_scatter(scene, loads, forest_scatter, FOREST_SCATTER_COUNT);
-
-    /* A worn path that wanders across the world, from the spawn into the far
-       wood, so there is a route to follow while exploring. */
-    uint32_t path_steps = scaled_count(MEADOW_PATH_STEPS);
-    for (uint32_t i = 0; i < path_steps; ++i) {
-        float t = (float)i / (float)(path_steps - 1u);
-        plant(scene, &loads[A_ROCKPATH], sinf(t * 9.0f) * 6.0f, 0.02f, 60.0f - t * 200.0f * g_scene_scale,
-              t * 3.0f, frange(0.9f, 1.15f));
-        planted++;
-    }
-
-    log_info("[pets] %u meshes registered, %u props planted", total_meshes, planted);
+    log_info("[pets] %u meshes registered, chunked world %u chunk(s) per side, %u live",
+             total_meshes, CHUNK_SIDE, CHUNK_SIDE * CHUNK_SIDE);
     return total_meshes;
+}
+
+/* ---- world streaming -------------------------------------------------------
+   Rebuilds the live window when the player crosses a chunk border. The whole
+   window is retired (scene_static_clear) and regenerated from chunk
+   coordinates; there is no incremental add/remove and no persistent world
+   state, which is what makes the cost a constant that does not grow with
+   travel distance. The obstacle disc set is gathered fresh for the new window
+   and handed to the slime sim, which re-buckets it around the camera. */
+static void world_stream(Scene *scene, float cam_x, float cam_z) {
+    if (!g_loads_ready)
+        return;
+
+    int cx = (int)floorf(cam_x / CHUNK_SIZE);
+    int cz = (int)floorf(cam_z / CHUNK_SIZE);
+    if (g_chunk_done && cx == g_chunk_cx && cz == g_chunk_cz)
+        return;
+    g_chunk_cx   = cx;
+    g_chunk_cz   = cz;
+    g_chunk_done = true;
+
+    scene_static_clear(scene);
+    g_obstacle_count = 0;
+    for (int dz = -CHUNK_R; dz <= CHUNK_R; ++dz)
+        for (int dx = -CHUNK_R; dx <= CHUNK_R; ++dx)
+            chunk_build(scene, g_loads, cx + dx, cz + dz);
+
+    scene_slime_obstacles(scene, g_obstacles, g_obstacle_count);
+    log_info("[world] streamed to chunk (%d, %d): %u obstacles", cx, cz, g_obstacle_count);
 }
 
 /* ---- slime crowd ----------------------------------------------------------- */
@@ -932,14 +935,16 @@ static void pets_frame(void *user, const GameFrame *frame) {
         }
     }
 
-    /* TEMP: scripted flycam sweep for verification. Removed after the shot. */
+    /* TEMP: scripted world-transit sweep for verification (roads east). Removed
+       after testing. Crosses a 32 m chunk border every ~53 frames so the
+       streamed window is retired and regenerated repeatedly. */
     if (getenv("MU_FLYCAM_TEST")) {
         static int n = 0;
-        p->cam.yaw += 0.02f;
-        p->cam.pitch      = -0.45f + sinf(n * 0.01f) * 0.25f;
-        p->cam.pos[0]     = sinf(n * 0.004f) * 26.0f;
+        p->cam.pos[0]     = (float)n * 0.6f;
         p->cam.pos[1]     = 10.0f;
-        p->cam.pos[2]     = cosf(n * 0.004f) * 26.0f;
+        p->cam.pos[2]     = 0.0f;
+        p->cam.pitch      = -0.25f;
+        p->cam.yaw        = 1.5707963f;
         p->cam.forward[0] = cosf(p->cam.pitch) * sinf(p->cam.yaw);
         p->cam.forward[1] = sinf(p->cam.pitch);
         p->cam.forward[2] = -cosf(p->cam.pitch) * cosf(p->cam.yaw);
@@ -1015,7 +1020,7 @@ static void pets_render(void *user, VkCommandBuffer cmd, RenderTarget *color, Re
            group id is mesh * lod_count + lod. So a roster that mixes a 1-rung
            tile with a 2-rung tree needs max_meshes * 2 rows, not the sum of the
            assets' own ladders — sizing it from the sum runs out mid-roster. */
-        uint32_t total = pets_instance_total(asset_meshes);
+        uint32_t total = world_instance_total(asset_meshes);
         /* +4 meshes and +4 materials for the procedural slime crowd staged after
            the cooked assets: three tinted body variants and the shared SDF face
            quad. Mesh and material capacities are fixed at create. */
@@ -1048,13 +1053,14 @@ static void pets_render(void *user, VkCommandBuffer cmd, RenderTarget *color, Re
         }
 
         /* Slime crowd: g_slime_target dynamic pairs (body, SDF face quad)
-           staged before the upload with the rest. Obstacles first, so the sim
-           grid has its blocking discs before the state is enabled. */
-        scene_slime_obstacles(scene, g_obstacles, g_obstacle_count);
+           staged before the upload with the rest. The crowd is enabled first so
+           the obstacle buffers exist, then the first world window is built and
+           hands the sim its blocking discs before the upload. */
         if (!slime_build(scene)) {
             scene_destroy(scene);
             return;
         }
+        world_stream(scene, p->cam.pos[0], p->cam.pos[2]);
 
         if (!scene_upload_scene(scene, cmd)) {
             scene_destroy(scene);
@@ -1064,6 +1070,11 @@ static void pets_render(void *user, VkCommandBuffer cmd, RenderTarget *color, Re
         log_info("[pets] scene live: %u instances, %u meshes, %u rungs, %u groups", total, max_meshes,
                  scene_lod_count(scene), max_meshes * scene_lod_count(scene));
     }
+
+    /* World streaming: retire and regenerate the live window when the player
+       crosses a chunk border. No-op inside a chunk. */
+    if (p->scene)
+        world_stream(p->scene, p->cam.pos[0], p->cam.pos[2]);
 
     /* camera: the flycam's eye and forward vector, built during pets_frame */
     float aspect = (float)color->width / (float)color->height;

@@ -21,6 +21,11 @@
    camera-facing quads. */
 #define SCENE_SPARKLES_PER_SLIME 4u
 
+/* Cap on blocking discs in the camera-relative obstacle grid. A streamed window
+   of the world holds a few thousand trunks/boulders; the slices are sized once
+   at this cap so a window change only re-uploads, never reallocates. */
+#define SCENE_SLIME_OBS_CAP 16384u
+
 /* ============================================================ small encoders */
 
 static uint16_t f2h(float x) {
@@ -273,15 +278,20 @@ struct Scene {
     uint32_t           slime_parity;
 
     /* Static obstacle collision: solid props (trunks, boulders) gathered once
-       at plant time and bucketed into a fixed uniform grid over the world. The
+       at plant time and bucketed into a camera-relative uniform grid. The
        resolve pass queries it with the same 3x3 neighbourhood it uses for
        slimes, so a grounded slime is pushed out of a trunk instead of merging
-       into it. Separate from the camera-relative hop grid: obstacles never
-       move, so this grid has a fixed origin and is built once. */
+       into it. Obstacles are camera-relative like the hop grid because the
+       streamed world scrolls: when the window changes the CPU re-buckets the
+       live discs and re-uploads, so the grid always covers what the player can
+       reach without ever holding the whole world. */
     struct SlimeObstacle *slime_obs_init;      /* CPU copy, freed once uploaded */
     uint32_t             *slime_obs_cpu_off;   /* CSR offsets, freed once uploaded */
     uint32_t             *slime_obs_cpu_items; /* CSR items, freed once uploaded */
+    uint32_t             *slime_obs_cpu_cursor;/* CSR fill cursor, scratch */
     uint32_t              slime_obs_count;
+    uint32_t              slime_obs_cap;       /* obstacle slice capacity (discs) */
+    bool                  slime_obs_dirty;     /* world streamed: grid must rebuild */
     uint32_t              slime_obs_nx, slime_obs_nz;
     float                 slime_obs_min_x, slime_obs_min_z;
     BufferSlice           slime_obs_all;   /* flat SlimeObstacle[] */
@@ -502,6 +512,7 @@ void scene_destroy(Scene *s) {
     free(s->slime_obs_init);
     free(s->slime_obs_cpu_off);
     free(s->slime_obs_cpu_items);
+    free(s->slime_obs_cpu_cursor);
     forEach(i, MAX_FRAMES_IN_FLIGHT) {
         buffer_pool_free(s->counters[i]);
         destroy_buffer(vk, &s->counters_host[i]);
@@ -976,8 +987,19 @@ void scene_compact_slots(Scene *s) {
     s->candidates_dirty   = true;
 }
 
-void scene_view_set(Scene *s, uint32_t view, const SceneViewDesc *vd) {
-    if (!s || view >= SCENE_MAX_VIEWS)
+/* Retires every static instance in one sweep, for a streamed world that rebuilds
+   its window wholesale. Walking the tail down destroys the last static slot each
+   time, so the O(1) swap-remove never has to move a row: it is a plain O(static)
+   teardown with no scratch and no compaction step. The freed slots are reused by
+   the next scene_instance_create_static. */
+void scene_static_clear(Scene *s) {
+    if (!s)
+        return;
+    for (uint32_t i = s->static_count; i-- > 0u;)
+        scene_instance_destroy(s, s->dynamic_capacity + i);
+}
+
+void scene_view_set(Scene *s, uint32_t view, const SceneViewDesc *vd) {    if (!s || view >= SCENE_MAX_VIEWS)
         return;
     memcpy(s->views[view].clip_rows, vd->clip_rows, sizeof(vd->clip_rows));
     memcpy(s->views[view].camera_pos, vd->camera_pos, sizeof(vd->camera_pos));
@@ -992,89 +1014,84 @@ void scene_set_clear(Scene *s, const float rgba[4]) { memcpy(s->clear, rgba, siz
 
 /* ============================================================ upload (T0) */
 
-/* Buckets the gathered obstacle discs into a fixed uniform grid over the world
-   (CSR: offsets + items), sized from their actual spread. Runs once, on the
-   CPU, before upload; the resolve pass only ever reads the result. */
-static void slime_build_obstacle_grid(Scene *s) {
-    uint32_t n  = s->slime_obs_count;
-    float    cs = s->slime_cell_size > 0.0f ? s->slime_cell_size : 3.0f;
-    if (n == 0) {
-        s->slime_obs_nx = s->slime_obs_nz = 0u;
+/* Re-buckets the gathered obstacle discs into a camera-relative uniform grid
+   (CSR: offsets + items) and uploads it. Runs on the CPU whenever the streamed
+   window changes; the resolve pass only ever reads the result. Discs outside
+   the grid are dropped — a slime is never outside the hop grid, which shares
+   the same extent, so it can never need an obstacle that falls outside. */
+static void slime_obstacles_rebuild(Scene *s, VkCommandBuffer cmd, uint32_t view) {
+    VkBackend *vk = s->vk;
+    uint32_t   nx = s->slime_grid_nx;
+    uint32_t   n  = s->slime_obs_count;
+    if (n > s->slime_obs_cap)
+        n = s->slime_obs_cap;
+
+    if (n == 0u || nx == 0u) {
+        s->slime_obs_nx    = s->slime_obs_nz = 0u;
+        s->slime_obs_dirty = false;
         return;
     }
 
-    float max_abs = 0.0f;
+    float    cs     = s->slime_cell_size > 0.0f ? s->slime_cell_size : 3.0f;
+    float    extent = (float)nx * cs;
+    float    min_x  = s->views[view].camera_pos[0] - extent * 0.5f;
+    float    min_z  = s->views[view].camera_pos[2] - extent * 0.5f;
+    uint32_t cells  = nx * nx;
+
+    uint32_t *off    = s->slime_obs_cpu_off;
+    uint32_t *items  = s->slime_obs_cpu_items;
+    uint32_t *cursor = s->slime_obs_cpu_cursor;
+
+    memset(off, 0, (size_t)(cells + 1u) * sizeof(uint32_t));
     const struct SlimeObstacle *o = s->slime_obs_init;
     for (uint32_t i = 0; i < n; ++i) {
-        float ax = fabsf(o[i].x);
-        float az = fabsf(o[i].z);
-        if (ax > max_abs)
-            max_abs = ax;
-        if (az > max_abs)
-            max_abs = az;
-    }
-    float    half = max_abs + 2.0f * cs;
-    uint32_t nx   = (uint32_t)ceilf(2.0f * half / cs);
-    if (nx < 1u)
-        nx = 1u;
-    if (nx > 256u)
-        nx = 256u;
-    uint32_t cells  = nx * nx;
-    float    min_xy = -half;
-
-    uint32_t *off = (uint32_t *)calloc((size_t)cells + 1u, sizeof(uint32_t));
-    if (!off)
-        return;
-    for (uint32_t i = 0; i < n; ++i) {
-        int cx = (int)((o[i].x - min_xy) / cs);
-        int cz = (int)((o[i].z - min_xy) / cs);
-        cx     = cx < 0 ? 0 : (cx >= (int)nx ? (int)nx - 1 : cx);
-        cz     = cz < 0 ? 0 : (cz >= (int)nx ? (int)nx - 1 : cz);
+        int cx = (int)((o[i].x - min_x) / cs);
+        int cz = (int)((o[i].z - min_z) / cs);
+        if (cx < 0 || cz < 0 || cx >= (int)nx || cz >= (int)nx)
+            continue;
         off[(uint32_t)cz * nx + (uint32_t)cx + 1u]++;
     }
     for (uint32_t c = 0; c < cells; ++c)
         off[c + 1u] += off[c];
 
-    uint32_t *items  = (uint32_t *)malloc((size_t)n * sizeof(uint32_t));
-    uint32_t *cursor = (uint32_t *)malloc((size_t)cells * sizeof(uint32_t));
-    if (!items || !cursor) {
-        free(off);
-        free(items);
-        free(cursor);
-        return;
-    }
     memcpy(cursor, off, (size_t)cells * sizeof(uint32_t));
     for (uint32_t i = 0; i < n; ++i) {
-        int cx = (int)((o[i].x - min_xy) / cs);
-        int cz = (int)((o[i].z - min_xy) / cs);
-        cx     = cx < 0 ? 0 : (cx >= (int)nx ? (int)nx - 1 : cx);
-        cz     = cz < 0 ? 0 : (cz >= (int)nx ? (int)nx - 1 : cz);
+        int cx = (int)((o[i].x - min_x) / cs);
+        int cz = (int)((o[i].z - min_z) / cs);
+        if (cx < 0 || cz < 0 || cx >= (int)nx || cz >= (int)nx)
+            continue;
         items[cursor[(uint32_t)cz * nx + (uint32_t)cx]++] = i;
     }
-    free(cursor);
+
+    renderer_upload_buffer_to_slice(vk, cmd, s->slime_obs_all,
+                                    (ByteSpan){s->slime_obs_init, n * sizeof(struct SlimeObstacle)});
+    renderer_upload_buffer_to_slice(vk, cmd, s->slime_obs_off,
+                                    (ByteSpan){off, (cells + 1u) * sizeof(uint32_t)});
+    renderer_upload_buffer_to_slice(vk, cmd, s->slime_obs_items,
+                                    (ByteSpan){items, n * sizeof(uint32_t)});
 
     s->slime_obs_nx    = nx;
     s->slime_obs_nz    = nx;
-    s->slime_obs_min_x = min_xy;
-    s->slime_obs_min_z = min_xy;
-    s->slime_obs_cpu_off   = off;
-    s->slime_obs_cpu_items = items;
-
-    s->slime_obs_all   = alloc_slice(s, (VkDeviceSize)n * sizeof(struct SlimeObstacle), 16);
-    s->slime_obs_off   = alloc_slice(s, ((VkDeviceSize)cells + 1u) * sizeof(uint32_t), 16);
-    s->slime_obs_items = alloc_slice(s, (VkDeviceSize)n * sizeof(uint32_t), 16);
-    log_info("[scene] slime obstacles: %u discs, grid %ux%u cell %.2f", n, nx, nx, cs);
+    s->slime_obs_min_x = min_x;
+    s->slime_obs_min_z = min_z;
+    s->slime_obs_dirty = false;
 }
 
 void scene_slime_obstacles(Scene *s, const struct SlimeObstacle *obstacles, uint32_t count) {
-    if (!s || !obstacles || count == 0u)
+    if (!s)
         return;
-    free(s->slime_obs_init);
-    s->slime_obs_init = (struct SlimeObstacle *)malloc((size_t)count * sizeof(struct SlimeObstacle));
-    if (!s->slime_obs_init)
-        return;
-    memcpy(s->slime_obs_init, obstacles, (size_t)count * sizeof(struct SlimeObstacle));
-    s->slime_obs_count = count;
+    uint32_t n = count;
+    if (n > s->slime_obs_cap)
+        n = s->slime_obs_cap;
+    if (obstacles && n > 0u) {
+        free(s->slime_obs_init);
+        s->slime_obs_init = (struct SlimeObstacle *)malloc((size_t)n * sizeof(struct SlimeObstacle));
+        if (s->slime_obs_init)
+            memcpy(s->slime_obs_init, obstacles, (size_t)n * sizeof(struct SlimeObstacle));
+    }
+    s->slime_obs_count = s->slime_obs_init ? n : 0u;
+    /* The next scene_frame re-buckets the grid around the camera and uploads. */
+    s->slime_obs_dirty = true;
 }
 
 bool scene_slime_enable(Scene *s, uint32_t count, const struct SlimeState *states, float collide_radius,
@@ -1125,7 +1142,25 @@ bool scene_slime_enable(Scene *s, uint32_t count, const struct SlimeState *state
         log_error("[scene] slime buffers failed");
         return false;
     }
-    slime_build_obstacle_grid(s);
+
+    /* Obstacle grid: fixed-capacity slices, rebuilt and re-uploaded whenever the
+       streamed world window moves (see slime_obstacles_rebuild). The grid shares
+       the hop grid's extent, so a disc is only ever queried inside this range. */
+    uint32_t cells = nx * nx;
+    s->slime_obs_cap        = SCENE_SLIME_OBS_CAP;
+    s->slime_obs_all        = alloc_slice(s, (VkDeviceSize)s->slime_obs_cap * sizeof(struct SlimeObstacle), 16);
+    s->slime_obs_off        = alloc_slice(s, ((VkDeviceSize)cells + 1u) * sizeof(uint32_t), 16);
+    s->slime_obs_items      = alloc_slice(s, (VkDeviceSize)s->slime_obs_cap * sizeof(uint32_t), 16);
+    s->slime_obs_cpu_off    = (uint32_t *)calloc((size_t)cells + 1u, sizeof(uint32_t));
+    s->slime_obs_cpu_items  = (uint32_t *)malloc((size_t)s->slime_obs_cap * sizeof(uint32_t));
+    s->slime_obs_cpu_cursor = (uint32_t *)malloc((size_t)cells * sizeof(uint32_t));
+    if (!s->slime_obs_all.buffer || !s->slime_obs_off.buffer || !s->slime_obs_items.buffer ||
+        !s->slime_obs_cpu_off || !s->slime_obs_cpu_items || !s->slime_obs_cpu_cursor) {
+        log_error("[scene] slime obstacle buffers failed");
+        return false;
+    }
+    s->slime_obs_dirty = true; /* first scene_frame buckets + uploads */
+
     s->slime_active = true;
     s->sparkles_per_slime = SCENE_SPARKLES_PER_SLIME;
     {
@@ -1220,17 +1255,9 @@ bool scene_upload_scene(Scene *s, VkCommandBuffer cmd) {
         s->slime_state_init = NULL;
     }
 
-    /* Obstacle discs + their CSR grid: built once, uploaded once. */
-    if (s->slime_active && s->slime_obs_count && s->slime_obs_cpu_off && s->slime_obs_cpu_items) {
-        uint32_t cells = s->slime_obs_nx * s->slime_obs_nz;
-        renderer_upload_buffer_to_slice(
-            vk, cmd, s->slime_obs_all,
-            (ByteSpan){s->slime_obs_init, s->slime_obs_count * sizeof(struct SlimeObstacle)});
-        renderer_upload_buffer_to_slice(vk, cmd, s->slime_obs_off,
-                                        (ByteSpan){s->slime_obs_cpu_off, (cells + 1u) * sizeof(uint32_t)});
-        renderer_upload_buffer_to_slice(vk, cmd, s->slime_obs_items,
-                                        (ByteSpan){s->slime_obs_cpu_items, s->slime_obs_count * sizeof(uint32_t)});
-    }
+    /* Obstacle discs + their CSR grid are camera-relative and streamed: they are
+       bucketed and uploaded from scene_frame whenever the window changes, so
+       nothing is done here. */
 
     /* Whole instance table, once. After this the dynamic prefix is rewritten by
        T1 each frame and the static suffix only when a static row actually
@@ -1697,6 +1724,11 @@ void scene_frame(Scene *s, VkCommandBuffer cmd, RenderTarget *color, RenderTarge
     }
 
     uint32_t G = s->group_count;
+
+    /* The streamed world moved: re-bucket the obstacle discs around the camera
+       and upload before the sim reads them this frame. */
+    if (s->slime_active && s->slime_obs_dirty)
+        slime_obstacles_rebuild(s, cmd, 0u);
 
     slime_record(s, cmd, 0u);
 

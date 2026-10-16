@@ -138,6 +138,11 @@ TextureID scene_face_atlas_load(Scene *s, const char *const *paths, uint32_t cou
 /* Reclaims retired slots. O(instances); call at load time, never per event. */
 void scene_compact_slots(Scene *s);
 
+/* Retires every static instance in one sweep — the teardown half of streaming a
+   whole world window. O(static), no compaction; the slots are reused by the next
+   batch of scene_instance_create_static calls. */
+void scene_static_clear(Scene *s);
+
 extern const SceneInstanceDesc kSceneInstanceIdentity; /* zero-filled */
 
 /* Upload all staged assets, materials, group templates and instances into the
@@ -154,9 +159,11 @@ bool scene_slime_enable(Scene *s, uint32_t count, const struct SlimeState *state
                         float cell_size);
 
 /* Solid props the slime sim must not sink into, as world-space discs (x, z,
-   radius). The scene buckets them into a fixed uniform grid once; the resolve
-   pass pushes grounded slimes out of any disc they overlap. Call before
-   scene_slime_enable (which builds the grid) and before scene_upload_scene. */
+   radius). The scene re-buckets them into a camera-relative uniform grid and
+   uploads it on the next scene_frame; the resolve pass pushes grounded slimes
+   out of any disc they overlap. Must be called before scene_slime_enable (which
+   sizes the grid buffers) and may be called again any time the world streams so
+   the windows' discs replace the previous set. */
 void scene_slime_obstacles(Scene *s, const struct SlimeObstacle *obstacles, uint32_t count);
 
 void scene_view_set(Scene *s, uint32_t view, const SceneViewDesc *view_desc);
