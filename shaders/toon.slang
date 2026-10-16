@@ -12,7 +12,6 @@
 [[vk::push_constant]] SceneDrawPush pc;
 
 #define SCENE_SAMPLER 0
-#define TOON_BANDS    3.0
 
 static float3 quat_rotate(SceneU32 q, float3 v)
 {
@@ -170,44 +169,78 @@ float4 fs_main(SceneVOut i) : SV_Target0
     if ((m.flags & SCENE_MAT_UNLIT) != 0u)
         return float4(albedo, i.bloom);
 
-    float3 v = normalize(pc.camera.xyz - i.world);
-    float3 l = env_sun_dir();
-
-    /* Quantized diffuse ramp. The half-band is smoothed with smoothstep so the
-       edge does not alias into a hard staircase as the surface turns. */
-    float  lit  = saturate(dot(n, l));
-    float  f    = lit * TOON_BANDS;
-    float  lo   = floor(f);
-    float  ramp = (lo + smoothstep(0.40f, 0.60f, f - lo)) / TOON_BANDS;
-
-    /* Rim wraps toward the lit side so it reads as a bounce edge rather than a
-       uniform outline, and it takes the sky's color for the same reason the
-       ambient does: it is the sky leaning on the silhouette. */
-    float  ndv  = saturate(dot(n, v));
-    float  rim  = pow(1.0f - ndv, 2.5f) * (0.55f + 0.45f * lit);
-
-    float3 h    = normalize(l + v);
-    float  spec = pow(saturate(dot(n, h)), 64.0f);
-    spec        = smoothstep(0.30f, 0.55f, spec);
+    uint   style = global_data.toon_style;
+    float3 v     = normalize(pc.camera.xyz - i.world);
+    float3 l     = env_sun_dir();
+    float  ndl   = saturate(dot(n, l));
+    float  ndv   = saturate(dot(n, v));
+    float3 h     = normalize(l + v);
+    float  ndh   = saturate(dot(n, h));
 
     float  metallic  = saturate(m.metallic);
+    float  roughness = clamp(m.roughness, 0.045f, 1.0f);
     float3 f0        = lerp(float3(0.04f), albedo, metallic);
     float3 kd        = (1.0f - f0) * (1.0f - metallic);
+    float3 sun       = env_sun_radiance();
+    float3 ambient   = kd * albedo * env_diffuse_irradiance(n) * ao;
 
-    float3 sun      = env_sun_radiance();
-    float3 ambient  = kd * albedo * env_ambient(n, ao);
-    float3 diffuse  = kd * albedo * ramp * sun;
-    float3 specular = f0 * spec * sun * ao;
-    /* Sky-coloured, but scaled to an accent: at 1.4 the rim covered every
-       grazing leaf in sky blue and desaturated the whole canopy. */
-    float3 rim_light = env_sky_color() * rim * 0.5f;
+    /* Three switchable cel looks (GlobalData.toon_style, set from the UI). Each
+       picks its own band count and edge width, its shadow tint, its specular
+       character and its rim; the gel tint, sun and ambient are shared. A uniform
+       branch, so no divergence. */
+    float3 diffuse;
+    float3 specular;
+    float3 rim;
+    float  outline = 0.0f;
 
-    /* Gel slimes get a stronger, albedo-tinted fresnel rim on top of the shared
-       sky rim, so they read as wet while ordinary props keep the base look. */
+    if (style == 0u) {
+        /* Anime cel: two hard tonal steps, a cool shadow, a crisp specular dot
+           and a dark silhouette outline. */
+        float  f    = ndl * 2.0f;
+        float  ramp = (floor(f) + smoothstep(0.47f, 0.53f, f - floor(f))) * 0.5f;
+        float3 shadow = float3(0.58f, 0.66f, 0.86f);
+        diffuse   = kd * albedo * ramp * lerp(float3(1.0f), shadow, 1.0f - ramp);
+        float  sp = pow(ndh, 48.0f);
+        specular  = f0 * smoothstep(0.35f, 0.42f, sp) * (1.0f - roughness * 0.7f);
+        rim       = albedo * pow(1.0f - ndv, 4.0f) * 0.6f * (0.4f + 0.6f * ramp);
+        outline   = pow(1.0f - ndv, 5.0f) * 0.45f;
+    } else if (style == 1u) {
+        /* Soft stylized: four gently smoothed steps, a neutral-warm shadow, a
+           modest soft specular and a breath of sky rim. */
+        float  f    = ndl * 4.0f;
+        float  ramp = (floor(f) + smoothstep(0.25f, 0.75f, f - floor(f))) * 0.25f;
+        float3 shadow = float3(1.0f, 0.97f, 0.93f);
+        diffuse   = kd * albedo * ramp * lerp(float3(1.0f), shadow, 1.0f - ramp);
+        float  sp = pow(ndh, 32.0f);
+        specular  = f0 * smoothstep(0.28f, 0.55f, sp) * 0.6f;
+        rim       = env_sky_color() * pow(1.0f - ndv, 2.5f) * (0.4f + 0.4f * ramp) * 0.5f;
+    } else {
+        /* Painterly: two wide soft steps, a warm shadow, a strong sky-to-ground
+           ambient gradient and almost no specular — an illustrated look. */
+        float  f    = ndl * 2.0f;
+        float  ramp = (floor(f) + smoothstep(0.12f, 0.88f, f - floor(f))) * 0.5f;
+        float3 shadow = float3(0.86f, 0.76f, 0.60f);
+        diffuse   = kd * albedo * ramp * lerp(float3(1.0f), shadow, 1.0f - ramp);
+        specular  = f0 * pow(ndh, 24.0f) * 0.25f;
+        float3 warm = lerp(env_sky_color(), env_sun_radiance(), 0.5f);
+        rim       = warm * pow(1.0f - ndv, 2.0f) * (0.5f + 0.5f * ramp) * 0.6f;
+    }
+
+    /* Gel slimes keep their wet albedo-tinted fresnel on top of any style. */
     if ((m.flags & SCENE_MAT_GEL) != 0u)
-        rim_light += albedo * pow(1.0f - ndv, 3.0f) * 0.8f;
+        rim += albedo * pow(1.0f - ndv, 3.0f) * 0.8f;
+
+    /* The direct diffuse carries the same Lambert 1/pi the PBR path uses, so a
+       cel-shaded surface sits at the same exposure as everything else. Without
+       it the diffuse term is pi times too strong and the whole toon image blows
+       past the bloom threshold and reads as a wash. The bands still read. */
+    float3 col = diffuse * LIGHT_INV_PI * sun + ambient + specular * sun * ao + rim;
+
+    /* The anime ink darkens the silhouette rather than adding light, so folds
+       and overlapping props read as drawn. Other styles leave it at zero. */
+    col *= 1.0f - outline;
 
     /* Linear HDR: exposure, bloom and the tonemap all happen in post. Alpha
        carries the per-instance bloom strength into the bloom bright-pass. */
-    return float4(diffuse + ambient + specular + rim_light, i.bloom);
+    return float4(col, i.bloom);
 }

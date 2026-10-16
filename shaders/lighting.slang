@@ -29,4 +29,41 @@ float3 env_ambient(float3 n, float ao) {
     return c * (global_data.env_sky.w * ao);
 }
 
+// Hemispheric diffuse irradiance, no occlusion applied: the caller owns where
+// the ao multiplies in, so the same irradiance can feed the diffuse and a
+// separate specular term without baking ao into both.
+float3 env_diffuse_irradiance(float3 n) {
+    float up = saturate(n.y * 0.5 + 0.5);
+    return lerp(global_data.env_ground.rgb, global_data.env_sky.rgb, up) * global_data.env_sky.w;
+}
+
+// Approximate prefiltered reflection: the sharp sky/horizon/ground gradient
+// along the reflected direction, blended toward the environment average as
+// roughness rises. The cheapest stand-in for a roughness-blurred cubemap, and
+// it reads the same palette the sky pass draws.
+float3 env_reflection_color(float3 r, float roughness) {
+    float  up    = saturate(r.y * 0.5 + 0.5);
+    float3 sharp = lerp(global_data.env_ground.rgb, global_data.env_horizon.rgb, saturate(up * 2.0));
+    sharp        = lerp(sharp, global_data.env_sky.rgb, saturate(up * 2.0 - 1.0));
+    float3 avg   = (global_data.env_sky.rgb + global_data.env_horizon.rgb + global_data.env_ground.rgb) * (1.0 / 3.0);
+    return lerp(sharp, avg, roughness) * global_data.env_sky.w;
+}
+
+// Analytic split-sum environment BRDF (Karis "EnvBRDFApprox"): a fitted
+// polynomial returning (A, B) with the specular irradiance response
+// f0 * A + B. A fit instead of a lookup texture, so no extra bindless slot.
+float2 env_brdf_approx(float roughness, float ndv) {
+    const float4 c0 = float4(-1.0f, -0.0275f, -0.572f, 0.022f);
+    const float4 c1 = float4(1.0f, 0.0425f, 1.04f, -0.04f);
+    float4       r  = roughness * c0 + c1;
+    float        a  = min(r.x * r.x, exp2(-9.28f * ndv)) * r.x + r.y;
+    return float2(-1.04f, 1.04f) * a + r.zw;
+}
+
+// Frostbite horizon specular occlusion: a metal highlight in a crease (low ao)
+// is hidden while one on a surface facing the camera survives.
+float env_specular_occlusion(float ao, float ndv, float roughness) {
+    return saturate(pow(ndv + ao, exp2(-16.0f * roughness - 1.0f)) - 1.0f + ao);
+}
+
 #endif

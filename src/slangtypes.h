@@ -61,7 +61,7 @@ typedef struct GlobalData {
     float    time;           // 4 bytes
     float    delta_time;     // 4 bytes
     uint     frame_count;    // 4 bytes
-    uint     pad;            // 4 bytes
+    uint     toon_style;     // 4 bytes  0 cel, 1 soft, 2 painterly (toon path only)
     float4   screen_params;  // x = width, y = height, z = 1/width, w = 1/height
     /* Environment. The renderer owns it and every shading path reads it here,
        so the sky pass and the two scene pipelines cannot drift apart: the
@@ -151,7 +151,7 @@ struct GlobalData {
     float    time;
     float    delta_time;
     uint     frame_count;
-    uint     pad;
+    uint     toon_style; // 0 cel, 1 soft, 2 painterly (toon path only)
    float4   screen_params;
    float4   env_sky;
    float4   env_horizon;

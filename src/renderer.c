@@ -118,6 +118,7 @@ typedef struct PostSettings {
     float    bloom_radius; /* upsample spread in destination texels */
     float    ssao_strength;
     bool     toon; /* cel-shade the scene instead of the PBR pipeline */
+    int      toon_style; /* 0 cel, 1 soft, 2 painterly; read by toon.slang */
     char     lut_path[LUT_PATH_CHARS]; /* .cube or strip .png; empty = identity */
 } PostSettings;
 
@@ -153,6 +154,7 @@ static PostSettings post_settings_cartoon(void) {
         .bloom_radius        = 1.0f,
         .ssao_strength       = 1.0f,
         .toon                = false,
+        .toon_style          = 0,
     };
 }
 
@@ -190,13 +192,15 @@ static void post_settings_save(const PostSettings *s) {
             "  \"bloom_knee\": %.6g,\n"
             "  \"bloom_radius\": %.6g,\n"
             "  \"ssao_strength\": %.6g,\n"
-            "  \"toon\": %s\n"
+            "  \"toon\": %s,\n"
+            "  \"toon_style\": %d\n"
             "}\n",
             s->flags, s->tonemap_mode, s->exposure, s->gamma, s->contrast, s->saturation, s->temperature, s->tint,
             s->vignette, s->vignette_smoothness, s->sharpen, s->ca, s->grain, s->sepia, s->dither, s->lift[0],
             s->lift[1], s->lift[2], s->gain[0], s->gain[1], s->gain[2], s->lut_strength, s->lut_path,
             s->bloom_strength,
-            s->bloom_threshold, s->bloom_knee, s->bloom_radius, s->ssao_strength, s->toon ? "true" : "false");
+            s->bloom_threshold, s->bloom_knee, s->bloom_radius, s->ssao_strength, s->toon ? "true" : "false",
+            s->toon_style);
     fclose(f);
 }
 
@@ -313,6 +317,8 @@ static void post_settings_load(PostSettings *s) {
             (void)0; /* removed; ignore legacy files */
         else if (json_tok_eq(js, k, "toon"))
             s->toon = (v->end - v->start == 4) && memcmp(js + v->start, "true", 4) == 0;
+        else if (json_tok_eq(js, k, "toon_style"))
+            s->toon_style = (int)json_prim_float(js, v);
         else if (json_tok_eq(js, k, "lift")) {
             for (int e = 0; e < 3 && i + 2 + e < n; e++)
                 s->lift[e] = json_prim_float(js, &tok[i + 2 + e]);
@@ -1357,6 +1363,12 @@ static void renderer_resources_create(Renderer *r, VkBackendDesc *desc) {
     r->post = post_settings_cartoon();
     r->env  = renderer_environment_default();
     post_settings_load(&r->post);
+    /* Headless override for comparing the toon looks without the UI. */
+    {
+        const char *ts = getenv("MU_TOON_STYLE");
+        if (ts && ts[0])
+            r->post.toon_style = atoi(ts);
+    }
     create_identity_lut(r); if (r->post.lut_path[0])
         renderer_lut_load(r, r->post.lut_path);
 
@@ -1414,7 +1426,7 @@ Renderer *renderer_create(bool use_wayland, GameHooks game) {
         .swapchain_extra_usage_flags =
             IMG_XFER_DST | IMG_SAMPLED | IMG_XFER_SRC | IMG_STORAGE,
         .vsync               = false,
-        .enable_debug_printf = true,
+        .enable_debug_printf = GPU_PRINTF,
 
         .bindless_sampled_image_count     = MAX_BINDLESS_TEXTURES,
         .bindless_sampler_count           = MAX_BINDLESS_SAMPLERS,
@@ -1699,7 +1711,12 @@ static void update_global_data(Renderer *r) {
 
     data.time             = (float)((double)(mu_time_now() - r->start_time) / mu_time_freq());
     data.delta_time       = r->dt;
+    if (getenv("MU_FREEZE_TIME")) {
+        data.time       = 0.0f;
+        data.delta_time = 0.0f;
+    }
     data.frame_count      = r->frame_count++;
+    data.toon_style       = (uint32_t)r->post.toon_style;
     data.screen_params[0] = (float)r->vk.swapchain.extent.width;
     data.screen_params[1] = (float)r->vk.swapchain.extent.height;
     data.screen_params[2] = 1.0f / data.screen_params[0];

@@ -215,6 +215,13 @@ static void render_grade_ui(Renderer *r) {
     nk_checkbox_label(ctx, "Toon shade", &toon);
     s->toon = toon != 0;
 
+    {
+        static const char *styles[] = {"Anime cel", "Soft stylized", "Painterly"};
+        nk_label(ctx, "Toon style", NK_TEXT_LEFT);
+        s->toon_style = nk_combo(ctx, styles, (int)(sizeof(styles) / sizeof(styles[0])), s->toon_style, 22,
+                                 nk_vec2(220, 120));
+    }
+
     static const char *modes[] = {"Neutral", "ACES", "Reinhard", "Reinhard2", "Filmic", "Uncharted2", "Unreal"};
     nk_label(ctx, "Tonemap", NK_TEXT_LEFT);
     s->tonemap_mode =

@@ -1,18 +1,18 @@
 == mu_gfx perf report ==
 frames            : 199
-frame time        : 12.087 ms (82.7 fps)
-cpu active (ema)  : 2.991 ms
-cpu wait (ema)    : 9.387 ms
-gpu frame         : 11.574 ms (avg 11.672 ms)
+frame time        : 14.873 ms (67.2 fps)
+cpu active (ema)  : 1.016 ms
+cpu wait (ema)    : 13.352 ms
+gpu frame         : 14.719 ms (avg 14.252 ms)
 resolution        : 678x747
 
 pass                            cur(ms)    avg(ms)    min(ms)    max(ms)        verts        frags
-Scene                             8.240      8.246      0.788     24.197      1071476       741415
-SSAO                              0.675      0.766      0.120      1.344            0            0
-Bloom                             0.387      0.397      0.280      0.739            0            0
-Tonemap                           1.236      1.241      0.878      2.098            0            0
-SMAA Edge                         0.218      0.219      0.159      0.376            3            1
-SMAA Weight                       0.488      0.473      0.123      0.694            3            1
-SMAA Blend                        0.233      0.230      0.166      0.422            3            1
-Blit Swapchain                    0.079      0.080      0.058      0.159            0            0
-Nuklear Render                    0.018      0.018      0.013      0.033          152          168
+Scene                            11.559     10.669      0.825     26.645      1069326       736113
+SSAO                              0.593      0.714      0.128      0.906            0            0
+Bloom                             0.443      0.436      0.318      0.714            0            0
+Tonemap                           1.463      1.381      0.973      2.025            0            0
+SMAA Edge                         0.211      0.236      0.177      0.355            3            1
+SMAA Weight                       0.134      0.459      0.134      0.688            3            1
+SMAA Blend                        0.207      0.247      0.186      0.424            3            1
+Blit Swapchain                    0.088      0.089      0.066      0.183            0            0
+Nuklear Render                    0.020      0.020      0.015      0.023          152          168

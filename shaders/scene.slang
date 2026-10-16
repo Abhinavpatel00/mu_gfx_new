@@ -273,11 +273,25 @@ float4 fs_main(SceneVOut i) : SV_Target0
     float3 diffuse = kd * albedo * (1.0f / 3.14159265f);
     float3 direct  = (diffuse + spec) * ndl * env_sun_radiance();
 
-    /* The ambient term stands in for the whole environment: kd*albedo is the
-       diffuse irradiance and f0*ambient is a flat radiance reflection. Without
-       that specular half every metal is black, because kd -> 0 and there is no
-       other light for it to reflect. */
-    float3 ambient = (kd * albedo + f0) * env_ambient(n, ao);
+    /* Ambient as a split-sum environment, done analytically so there is no
+       prefiltered cubemap and no BRDF LUT: the diffuse half is the hemispheric
+       irradiance, the specular half is the analytic EnvBRDF fit times an
+       approximate reflection color, occluded toward creases. This is what keeps
+       metal from being black (its kd is ~0) and rough dielectrics from getting a
+       free full-intensity specular. */
+    float2 ab      = env_brdf_approx(roughness, ndv);
+    float3 fss_ess = f0 * ab.x + ab.y;                       /* single-scatter specular */
+    float  ess     = ab.x + ab.y;
+    float3 f_avg   = f0 + (1.0f - f0) / 21.0f;               /* average Fresnel */
+    /* Energy lost to multiple bounces inside a rough microsurface comes back:
+       without this, roughness visibly darkens metal. */
+    float3 f_ms    = fss_ess * f_avg / max(1.0f - f_avg * (1.0f - ess), 1e-4f);
+    float  spec_ao = env_specular_occlusion(ao, ndv, roughness);
+
+    float3 env_diff = env_diffuse_irradiance(n) * ao;
+    float3 env_spec = env_reflection_color(reflect(-v, n), roughness);
+    float3 ambient  = (1.0f - fss_ess) * (1.0f - metallic) * albedo * env_diff
+                    + (fss_ess + f_ms) * env_spec * spec_ao;
 
     /* Gel rim: a fresnel edge tinted by the slime's own albedo, so the silhouette
        glows like wet gel. Gated on the material flag so ordinary props are
