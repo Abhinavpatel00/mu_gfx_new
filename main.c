@@ -92,7 +92,7 @@ static const char *const pets_assets[A_COUNT] = {
    the tile size: any other number opens seams at the joins. */
 #define MEADOW_TILES      72
 #define MEADOW_TILE_STEP  4.0f
-#define MEADOW_PATH_STEPS 120
+#define MEADOW_PATH_STEPS 180
 
 /* A species' planting rule. Radial bands rather than a hand-placed list: a
    couple of thousand props is past the point a table stays readable, and a
@@ -111,20 +111,20 @@ typedef struct Scatter {
    is load-bearing: the rejection list is filled as this is walked, so anything
    that must stand clear of a trunk has to be planted after one. */
 static const Scatter meadow_scatter[] = {
-    /* --- trees: the clearing's wall --------------------------------------- */
-    {A_TREE_COMMON_A, 16, 12.0f, 34.0f, 0.85f, 1.15f, 6.0f},
-    {A_TREE_COMMON_B, 14, 12.0f, 34.0f, 0.85f, 1.15f, 6.0f},
-    {A_TREE_COMMON_C, 14, 12.0f, 34.0f, 0.80f, 1.10f, 6.0f},
-    {A_PINE_A, 20, 14.0f, 36.0f, 0.85f, 1.20f, 5.5f},
-    {A_PINE_B, 20, 14.0f, 36.0f, 0.85f, 1.20f, 5.5f},
+    /* --- trees: a light frame around the clearing, not a wall ------------- */
+    {A_TREE_COMMON_A, 8, 12.0f, 34.0f, 0.85f, 1.15f, 7.0f},
+    {A_TREE_COMMON_B, 7, 12.0f, 34.0f, 0.85f, 1.15f, 7.0f},
+    {A_TREE_COMMON_C, 7, 12.0f, 34.0f, 0.80f, 1.10f, 7.0f},
+    {A_PINE_A, 10, 14.0f, 36.0f, 0.85f, 1.20f, 6.5f},
+    {A_PINE_B, 10, 14.0f, 36.0f, 0.85f, 1.20f, 6.5f},
     /* The twisted pair are the 16m ancients: kept large but rare and off centre. */
-    {A_TREE_TWISTED_A, 5, 17.0f, 32.0f, 0.50f, 0.70f, 9.0f},
-    {A_TREE_TWISTED_B, 5, 17.0f, 32.0f, 0.50f, 0.70f, 9.0f},
-    {A_TREE_BIRCH_A, 22, 11.0f, 34.0f, 0.90f, 1.30f, 4.5f},
-    {A_TREE_BIRCH_B, 20, 11.0f, 34.0f, 0.90f, 1.30f, 4.5f},
-    {A_TREE_OAK_A, 18, 12.0f, 34.0f, 0.90f, 1.25f, 5.0f},
-    {A_TREE_OAK_B, 16, 12.0f, 34.0f, 0.90f, 1.25f, 5.0f},
-    {A_TREE_BARE_A, 9, 13.0f, 33.0f, 1.10f, 1.60f, 6.0f},
+    {A_TREE_TWISTED_A, 3, 17.0f, 32.0f, 0.50f, 0.70f, 11.0f},
+    {A_TREE_TWISTED_B, 3, 17.0f, 32.0f, 0.50f, 0.70f, 11.0f},
+    {A_TREE_BIRCH_A, 11, 11.0f, 34.0f, 0.90f, 1.30f, 6.0f},
+    {A_TREE_BIRCH_B, 10, 11.0f, 34.0f, 0.90f, 1.30f, 6.0f},
+    {A_TREE_OAK_A, 9, 12.0f, 34.0f, 0.90f, 1.25f, 6.5f},
+    {A_TREE_OAK_B, 8, 12.0f, 34.0f, 0.90f, 1.25f, 6.5f},
+    {A_TREE_BARE_A, 5, 13.0f, 33.0f, 1.10f, 1.60f, 8.0f},
     /* --- rocks ------------------------------------------------------------ */
     {A_ROCK_A, 12, 6.0f, 30.0f, 0.70f, 1.20f, 5.0f},
     {A_ROCK_B, 12, 6.0f, 30.0f, 0.70f, 1.20f, 5.0f},
@@ -147,54 +147,54 @@ static const Scatter meadow_scatter[] = {
 };
 #define MEADOW_SCATTER_COUNT (sizeof(meadow_scatter) / sizeof(meadow_scatter[0]))
 
-/* The forest belt ringing the clearing. A clearing is a hole in a wood, and the
-   wood is what gives the scene its scale. Two bands per species: a dense inner
-   belt where the clearing's own trees stop (r ~34) up to r ~78, then a sparser
-   outer stand out to the terrain's edge (r ~132), so density falls off with
-   distance the way a real stand thins rather than stopping at a wall. Object
-   count is nearly free — the frame is fill-bound, not instance-bound. */
+/* The forest ringing the clearing: an open woodland, not a wall. Species are
+   scattered in two thin bands — a loose inner stand where the clearing's own
+   trees stop (r ~36) and a sparse outer treeline toward the terrain edge — with
+   large gaps so the player can wander between trunks and see across glades.
+   Density falls with distance, and each stand streams through its own LOD rung,
+   so the far wood is cheap in fill and locality alike. */
 static const Scatter forest_scatter[] = {
-    /* --- trees: inner belt ------------------------------------------------- */
-    {A_TREE_COMMON_A, 55, 34.0f, 78.0f, 0.90f, 1.60f, 5.0f},
-    {A_TREE_COMMON_B, 50, 34.0f, 78.0f, 0.90f, 1.60f, 5.0f},
-    {A_TREE_COMMON_C, 50, 34.0f, 78.0f, 0.90f, 1.60f, 5.0f},
-    {A_PINE_A, 80, 34.0f, 78.0f, 0.90f, 1.70f, 5.0f},
-    {A_PINE_B, 80, 34.0f, 78.0f, 0.90f, 1.70f, 5.0f},
-    {A_TREE_BIRCH_A, 65, 34.0f, 78.0f, 0.90f, 1.50f, 4.0f},
-    {A_TREE_BIRCH_B, 60, 34.0f, 78.0f, 0.90f, 1.50f, 4.0f},
-    {A_TREE_OAK_A, 45, 34.0f, 78.0f, 0.90f, 1.60f, 4.5f},
-    {A_TREE_OAK_B, 45, 34.0f, 78.0f, 0.90f, 1.60f, 4.5f},
-    {A_TREE_TWISTED_A, 10, 44.0f, 80.0f, 0.55f, 0.80f, 9.0f},
-    {A_TREE_TWISTED_B, 10, 44.0f, 80.0f, 0.55f, 0.80f, 9.0f},
-    /* --- trees: outer stand (sparser) ------------------------------------- */
-    {A_TREE_COMMON_A, 45, 72.0f, 132.0f, 0.90f, 1.60f, 6.5f},
-    {A_TREE_COMMON_B, 40, 72.0f, 132.0f, 0.90f, 1.60f, 6.5f},
-    {A_TREE_COMMON_C, 40, 72.0f, 132.0f, 0.90f, 1.60f, 6.5f},
-    {A_PINE_A, 70, 72.0f, 132.0f, 0.90f, 1.70f, 6.5f},
-    {A_PINE_B, 70, 72.0f, 132.0f, 0.90f, 1.70f, 6.5f},
-    {A_TREE_BIRCH_A, 55, 72.0f, 132.0f, 0.90f, 1.50f, 5.5f},
-    {A_TREE_BIRCH_B, 50, 72.0f, 132.0f, 0.90f, 1.50f, 5.5f},
-    {A_TREE_OAK_A, 40, 72.0f, 132.0f, 0.90f, 1.60f, 6.0f},
-    {A_TREE_OAK_B, 40, 72.0f, 132.0f, 0.90f, 1.60f, 6.0f},
-    {A_TREE_TWISTED_A, 8, 80.0f, 130.0f, 0.55f, 0.80f, 10.0f},
-    {A_TREE_TWISTED_B, 8, 80.0f, 130.0f, 0.55f, 0.80f, 10.0f},
-    /* --- underbrush filling the belt -------------------------------------- */
-    {A_BUSH_A, 70, 34.0f, 78.0f, 0.90f, 1.50f, 2.0f},
-    {A_BUSH_A, 60, 72.0f, 132.0f, 0.90f, 1.50f, 2.0f},
-    {A_BUSH_FLOWERS, 40, 34.0f, 78.0f, 0.90f, 1.50f, 2.0f},
-    {A_BUSH_FLOWERS, 30, 72.0f, 132.0f, 0.90f, 1.50f, 2.0f},
-    {A_BUSH_B, 70, 34.0f, 78.0f, 1.00f, 1.80f, 0.0f},
-    {A_BUSH_B, 60, 72.0f, 132.0f, 1.00f, 1.80f, 0.0f},
-    {A_BUSH_C, 70, 34.0f, 78.0f, 1.20f, 2.20f, 0.0f},
-    {A_BUSH_C, 60, 72.0f, 132.0f, 1.20f, 2.20f, 0.0f},
-    {A_FERN, 120, 34.0f, 78.0f, 0.40f, 0.80f, 0.0f},
-    {A_FERN, 110, 72.0f, 132.0f, 0.40f, 0.80f, 0.0f},
-    {A_ROCK_A, 24, 34.0f, 78.0f, 0.80f, 1.50f, 3.0f},
-    {A_ROCK_A, 20, 72.0f, 132.0f, 0.80f, 1.50f, 3.0f},
-    {A_ROCK_B, 24, 34.0f, 78.0f, 0.80f, 1.50f, 3.0f},
-    {A_ROCK_B, 20, 72.0f, 132.0f, 0.80f, 1.50f, 3.0f},
-    {A_ROCK_C, 48, 34.0f, 78.0f, 1.20f, 2.60f, 2.5f},
-    {A_ROCK_C, 40, 72.0f, 132.0f, 1.20f, 2.60f, 2.5f},
+    /* --- trees: loose inner stand ----------------------------------------- */
+    {A_TREE_COMMON_A, 25, 36.0f, 80.0f, 0.90f, 1.60f, 8.0f},
+    {A_TREE_COMMON_B, 22, 36.0f, 80.0f, 0.90f, 1.60f, 8.0f},
+    {A_TREE_COMMON_C, 22, 36.0f, 80.0f, 0.90f, 1.60f, 8.0f},
+    {A_PINE_A, 30, 36.0f, 80.0f, 0.90f, 1.70f, 8.0f},
+    {A_PINE_B, 30, 36.0f, 80.0f, 0.90f, 1.70f, 8.0f},
+    {A_TREE_BIRCH_A, 24, 36.0f, 80.0f, 0.90f, 1.50f, 7.0f},
+    {A_TREE_BIRCH_B, 22, 36.0f, 80.0f, 0.90f, 1.50f, 7.0f},
+    {A_TREE_OAK_A, 18, 36.0f, 80.0f, 0.90f, 1.60f, 8.0f},
+    {A_TREE_OAK_B, 18, 36.0f, 80.0f, 0.90f, 1.60f, 8.0f},
+    {A_TREE_TWISTED_A, 6, 46.0f, 82.0f, 0.55f, 0.80f, 12.0f},
+    {A_TREE_TWISTED_B, 6, 46.0f, 82.0f, 0.55f, 0.80f, 12.0f},
+    /* --- trees: sparse outer treeline ------------------------------------- */
+    {A_TREE_COMMON_A, 18, 78.0f, 132.0f, 0.90f, 1.60f, 11.0f},
+    {A_TREE_COMMON_B, 16, 78.0f, 132.0f, 0.90f, 1.60f, 11.0f},
+    {A_TREE_COMMON_C, 16, 78.0f, 132.0f, 0.90f, 1.60f, 11.0f},
+    {A_PINE_A, 24, 78.0f, 132.0f, 0.90f, 1.70f, 11.0f},
+    {A_PINE_B, 24, 78.0f, 132.0f, 0.90f, 1.70f, 11.0f},
+    {A_TREE_BIRCH_A, 18, 78.0f, 132.0f, 0.90f, 1.50f, 10.0f},
+    {A_TREE_BIRCH_B, 16, 78.0f, 132.0f, 0.90f, 1.50f, 10.0f},
+    {A_TREE_OAK_A, 14, 78.0f, 132.0f, 0.90f, 1.60f, 11.0f},
+    {A_TREE_OAK_B, 14, 78.0f, 132.0f, 0.90f, 1.60f, 11.0f},
+    {A_TREE_TWISTED_A, 4, 86.0f, 130.0f, 0.55f, 0.80f, 13.0f},
+    {A_TREE_TWISTED_B, 4, 86.0f, 130.0f, 0.55f, 0.80f, 13.0f},
+    /* --- underbrush: scattered patches, not a carpet ---------------------- */
+    {A_BUSH_A, 30, 36.0f, 80.0f, 0.90f, 1.50f, 3.0f},
+    {A_BUSH_A, 24, 78.0f, 132.0f, 0.90f, 1.50f, 4.0f},
+    {A_BUSH_FLOWERS, 18, 36.0f, 80.0f, 0.90f, 1.50f, 3.0f},
+    {A_BUSH_FLOWERS, 12, 78.0f, 132.0f, 0.90f, 1.50f, 4.0f},
+    {A_BUSH_B, 40, 36.0f, 80.0f, 1.00f, 1.80f, 0.0f},
+    {A_BUSH_B, 30, 78.0f, 132.0f, 1.00f, 1.80f, 0.0f},
+    {A_BUSH_C, 36, 36.0f, 80.0f, 1.20f, 2.20f, 0.0f},
+    {A_BUSH_C, 28, 78.0f, 132.0f, 1.20f, 2.20f, 0.0f},
+    {A_FERN, 60, 36.0f, 80.0f, 0.40f, 0.80f, 0.0f},
+    {A_FERN, 50, 78.0f, 132.0f, 0.40f, 0.80f, 0.0f},
+    {A_ROCK_A, 14, 36.0f, 80.0f, 0.80f, 1.50f, 5.0f},
+    {A_ROCK_A, 12, 78.0f, 132.0f, 0.80f, 1.50f, 6.0f},
+    {A_ROCK_B, 14, 36.0f, 80.0f, 0.80f, 1.50f, 5.0f},
+    {A_ROCK_B, 12, 78.0f, 132.0f, 0.80f, 1.50f, 6.0f},
+    {A_ROCK_C, 24, 36.0f, 80.0f, 1.20f, 2.60f, 4.0f},
+    {A_ROCK_C, 20, 78.0f, 132.0f, 1.20f, 2.60f, 5.0f},
 };
 #define FOREST_SCATTER_COUNT (sizeof(forest_scatter) / sizeof(forest_scatter[0]))
 
@@ -382,11 +382,12 @@ static uint32_t pets_build_assets(Scene *scene) {
     /* The wood around it, planted after so trunks clear the clearing's props. */
     planted += plant_scatter(scene, loads, forest_scatter, FOREST_SCATTER_COUNT);
 
-    /* A worn path from the spawn into the trees, wobbling as it goes. */
+    /* A worn path that wanders across the world, from the spawn into the far
+       wood, so there is a route to follow while exploring. */
     uint32_t path_steps = scaled_count(MEADOW_PATH_STEPS);
     for (uint32_t i = 0; i < path_steps; ++i) {
         float t = (float)i / (float)(path_steps - 1u);
-        plant(scene, &loads[A_ROCKPATH], sinf(t * 5.0f) * 1.4f, 0.02f, 60.0f - t * 120.0f * g_scene_scale,
+        plant(scene, &loads[A_ROCKPATH], sinf(t * 9.0f) * 6.0f, 0.02f, 60.0f - t * 200.0f * g_scene_scale,
               t * 3.0f, frange(0.9f, 1.15f));
         planted++;
     }
@@ -416,6 +417,7 @@ static uint32_t pets_build_assets(Scene *scene) {
 #define SLIME_COLLIDE_RADIUS 26.0f
 #define SLIME_CELL_SIZE      3.0f
 #define SLIME_SPREAD         100.0f /* spawn half-extent: the whole meadow and wood */
+#define SLIME_SPAWN_CLEAR    12.0f  /* keep the player's spawn clearing free of slimes */
 
 /* Lat/long UV-sphere: 2 poles + (SLIME_RING-1) rings of SLIME_SEG verts. */
 #define SLIME_SEG   16u
@@ -688,10 +690,10 @@ static bool slime_build(Scene *scene) {
 
     for (uint32_t i = 0; i < count; ++i) {
         struct SlimeState *s = &states[i];
-        /* Homes fill the clearing disc; sqrt keeps them uniform over area, which
-           is the density the old rejection sampling was approximating. */
+        /* Homes fill an annulus: sqrt keeps them uniform over area, and the inner
+           radius leaves the player's spawn clearing open. */
         float ang  = frand() * 6.2831853f;
-        float rad  = sqrtf(frand()) * SLIME_SPREAD;
+        float rad  = SLIME_SPAWN_CLEAR + sqrtf(frand()) * (SLIME_SPREAD - SLIME_SPAWN_CLEAR);
         s->home[0] = cosf(ang) * rad;
         s->home[1] = sinf(ang) * rad;
         s->pos[0]  = s->home[0];
