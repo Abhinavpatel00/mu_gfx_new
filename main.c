@@ -569,9 +569,10 @@ static bool slime_build(Scene *scene) {
         return false;
     }
 
-    /* Face quad: one unit quad in the XY plane, +/-0.5 in x/y. The VS
-       Y-billboards it onto the body's camera-facing surface, so the authored
-       positions only set the size ratio the shader scales. Normals face +Z. */
+    /* Face quad: one unit quad in the XY plane, +/-0.5 in x/y. The VS pins it
+       to the body's front (+Z in instance space) like a decal, so it shares
+       the body yaw, squash and jiggle; authored positions only set the size
+       ratio the shader scales. Normals face +Z. */
     static struct ScenePackedVertex qverts[4];
     static uint16_t                  qidxs[6] = {0, 1, 2, 0, 2, 3};
     {
@@ -593,7 +594,7 @@ static bool slime_build(Scene *scene) {
     if (fmi == UINT32_MAX)
         return false;
     SceneLodDesc face_lod = {.first_vertex = 0, .first_index = 0, .index_count = 6, .error = 1.0e9f};
-    /* Cull sphere covers the billboarded quad wherever the camera sits: centre
+    /* Cull sphere covers the face quad wherever the body yaws: centre
        at face height with a radius past the quad's reach. */
     g_slimes.face_mesh = scene_mesh_add(scene, &(SceneMeshDesc){.vertices     = qverts,
                                                                  .vertex_count = 4,
@@ -923,11 +924,11 @@ static void pets_frame(void *user, const GameFrame *frame) {
     SceneCounters c;
 
     if (p->scene && scene_counters(p->scene, &c)) {
-        renderer_hud(frame->renderer, "scene: %u submitted  %u frustum-culled  %u drawn", c.submitted, c.culled_frustum,
-                     c.drawn);
-        renderer_hud(frame->renderer, "groups %u  dropped %u  lod %u/%u/%u/%u", c.draws, c.dropped, c.lod[0], c.lod[1],
-                     c.lod[2], c.lod[3]);
-
+        // renderer_hud(frame->renderer, "scene: %u submitted  %u frustum-culled  %u drawn", c.submitted, c.culled_frustum,
+        //              c.drawn);
+        // renderer_hud(frame->renderer, "groups %u  dropped %u  lod %u/%u/%u/%u", c.draws, c.dropped, c.lod[0], c.lod[1],
+        //              c.lod[2], c.lod[3]);
+        //
         // log_info("[cubepets] counters: submitted=%u frustum_culled=%u drawn=%u draws=%u dropped=%u", c.submitted,
         //                    c.culled_frustum, c.drawn, c.draws, c.dropped);
         //
@@ -947,9 +948,9 @@ static void pets_frame(void *user, const GameFrame *frame) {
                      c.culled_frustum, c.drawn, c.draws, c.dropped);
         }
     }
-    renderer_hud(frame->renderer, "flycam: %.1f %.1f %.1f  yaw %.2f pitch %.2f  speed %.0f", p->cam.pos[0],
-                 p->cam.pos[1], p->cam.pos[2], p->cam.yaw, p->cam.pitch, p->cam.speed);
-    renderer_hud(frame->renderer, "WASD move  Q/E down-up  Shift boost  RMB look  wheel speed");
+    // renderer_hud(frame->renderer, "flycam: %.1f %.1f %.1f  yaw %.2f pitch %.2f  speed %.0f", p->cam.pos[0],
+    //              p->cam.pos[1], p->cam.pos[2], p->cam.yaw, p->cam.pitch, p->cam.speed);
+    // renderer_hud(frame->renderer, "WASD move  Q/E down-up  Shift boost  RMB look  wheel speed");
 }
 
 /* GameHooks.render: lazy-init (needs a command buffer for upload + the pass

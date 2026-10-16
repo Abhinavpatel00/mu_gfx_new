@@ -15,6 +15,7 @@
 #include "scene.h"
 
 #include "../../muasset/muasset.h"
+#include "../../external/dds-ktx/dds-ktx.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -28,6 +29,83 @@ _Static_assert(sizeof(MuassetMaterial) == sizeof(struct SceneGpuMaterial), "mate
 
 static void *read_whole_file(const char *path, uint32_t *size_out, char *err, uint32_t err_cap);
 
+/* BC sidecar upload: <asset>.mua.<index>.dds written by muasset_cook from
+   mu_texcomp blocks. dds-ktx parses with no allocation; every mip uploads
+   straight to VRAM and the GPU samples the blocks natively — the runtime
+   never decodes a texel. Returns false (with err set) only for a real
+   failure; a missing sidecar is not an error, it means "use the legacy
+   .tex", so the caller checks existence first. */
+static bool upload_dds_texture(VkBackend *vk, const char *dds_path, uint32_t *tex_out, char *err, uint32_t err_cap) {
+    uint32_t payload_size = 0;
+    uint8_t *payload = (uint8_t *)read_whole_file(dds_path, &payload_size, err, err_cap);
+    if (!payload)
+        return false;
+
+    ddsktx_texture_info tc;
+    ddsktx_error        derr;
+    if (!ddsktx_parse(&tc, payload, (int)payload_size, &derr)) {
+        snprintf(err, err_cap, "%s: dds parse failed: %s", dds_path, derr.msg);
+        free(payload);
+        return false;
+    }
+    if (tc.num_layers != 1 || tc.depth != 1 || (tc.flags & DDSKTX_TEXTURE_FLAG_VOLUME)) {
+        snprintf(err, err_cap, "%s: only plain 2D textures supported", dds_path);
+        free(payload);
+        return false;
+    }
+
+    bool srgb = (tc.flags & DDSKTX_TEXTURE_FLAG_SRGB) != 0;
+    VkFormat fmt;
+    switch (tc.format) {
+        case DDSKTX_FORMAT_BC1: fmt = srgb ? VK_FORMAT_BC1_RGBA_SRGB_BLOCK : VK_FORMAT_BC1_RGBA_UNORM_BLOCK; break;
+        case DDSKTX_FORMAT_BC3: fmt = srgb ? VK_FORMAT_BC3_SRGB_BLOCK : VK_FORMAT_BC3_UNORM_BLOCK; break;
+        case DDSKTX_FORMAT_BC7: fmt = srgb ? VK_FORMAT_BC7_SRGB_BLOCK : VK_FORMAT_BC7_UNORM_BLOCK; break;
+        case DDSKTX_FORMAT_RGBA8: fmt = srgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM; break;
+        default:
+            snprintf(err, err_cap, "%s: unsupported BC format %d", dds_path, (int)tc.format);
+            free(payload);
+            return false;
+    }
+
+    /* BC is optional in Vulkan, universal on desktop. Fail loudly with the
+       format name instead of drawing garbage on exotic hardware. */
+    VkFormatProperties props;
+    vkGetPhysicalDeviceFormatProperties(vk->devc.physical_device, fmt, &props);
+    if (!(props.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)) {
+        snprintf(err, err_cap, "%s: GPU lacks sampling support for format %d", dds_path, (int)fmt);
+        free(payload);
+        return false;
+    }
+
+    TextureID tex = create_texture(vk, &(TextureCreateDesc){.width     = (uint32_t)tc.width,
+                                                            .height    = (uint32_t)tc.height,
+                                                            .depth     = 1,
+                                                            .layers    = 1,
+                                                            .mip_count = (uint32_t)tc.num_mips,
+                                                            .format    = fmt,
+                                                            .usage     = IMG_SAMPLED | IMG_XFER_DST,
+                                                            .debug_name = "mua_dds"});
+    if (tex == UINT32_MAX) {
+        snprintf(err, err_cap, "%s: texture pool exhausted", dds_path);
+        free(payload);
+        return false;
+    }
+    for (int m = 0; m < tc.num_mips; ++m) {
+        ddsktx_sub_data sub;
+        ddsktx_get_sub(&tc, &sub, payload, (int)payload_size, 0, 0, m);
+        if (!texture_upload(vk, tex, (uint32_t)m, 0, (VkOffset3D){0, 0, 0},
+                            (VkExtent3D){(uint32_t)sub.width, (uint32_t)sub.height, 1},
+                            (ByteSpan){sub.buff, (uint32_t)sub.size_bytes})) {
+            snprintf(err, err_cap, "%s: texture mip %d upload failed", dds_path, m);
+            free(payload);
+            return false;
+        }
+    }
+    free(payload);
+    *tex_out = tex;
+    return true;
+}
+
 /* Uploads the companion .tex payload and hands back one bindless id per
    texture row, in row order. The blob's ids are indices into the texture
    section; they are rewritten in place to the TextureID the backend allocated,
@@ -40,9 +118,21 @@ static uint32_t *load_textures(VkBackend *vk, const Muasset *blob, const char *m
     char     tex_path[1024];
     snprintf(tex_path, sizeof(tex_path), "%s.tex", mua_path);
     uint32_t payload_size = 0;
-    uint8_t *payload       = (uint8_t *)read_whole_file(tex_path, &payload_size, err, err_cap);
-    if (!payload)
-        return NULL;
+    /* The legacy payload is optional now: a fully BC-migrated asset ships
+       sidecars only, and per-texture fallback below covers mixed sets. */
+    uint8_t *payload = (uint8_t *)read_whole_file(tex_path, &payload_size, err, err_cap);
+    if (!payload) {
+        bool any_dds = false;
+        for (uint32_t i = 0; i < blob->texture_count; ++i) {
+            char dp[1024];
+            snprintf(dp, sizeof(dp), "%s.%u.dds", mua_path, i);
+            FILE *pr = fopen(dp, "rb");
+            if (pr) { fclose(pr); any_dds = true; break; }
+        }
+        if (!any_dds)
+            return NULL; /* err already set by read_whole_file */
+        err[0] = '\0';
+    }
 
     uint32_t *ids = (uint32_t *)malloc(blob->texture_count * sizeof(uint32_t));
     if (!ids) {
@@ -52,6 +142,20 @@ static uint32_t *load_textures(VkBackend *vk, const Muasset *blob, const char *m
     }
 
     for (uint32_t i = 0; i < blob->texture_count; ++i) {
+        /* Prefer the BC sidecar the cooker writes beside the blob; fall back
+           to the legacy .tex payload per texture, so a half-migrated asset
+           set (data-role textures have no sidecar by design) still loads. */
+        char dds_path[1024];
+        snprintf(dds_path, sizeof(dds_path), "%s.%u.dds", mua_path, i);
+        FILE *probe = fopen(dds_path, "rb");
+        if (probe) {
+            fclose(probe);
+            uint32_t tex;
+            if (!upload_dds_texture(vk, dds_path, &tex, err, err_cap))
+                goto fail;
+            ids[i] = tex;
+            continue;
+        }
         const MuassetTexture *t = &blob->textures[i];
         if ((uint64_t)t->offset + t->size > payload_size) {
             snprintf(err, err_cap, "%s: texture %u runs past the payload", tex_path, i);

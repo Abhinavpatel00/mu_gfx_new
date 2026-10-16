@@ -1,9 +1,18 @@
 == mu_gfx perf report ==
-frames            : 5593
-frame time        : 14.308 ms (69.9 fps)
-cpu active (ema)  : 8.506 ms
-cpu wait (ema)    : 6.429 ms
-gpu frame         : 0.000 ms (avg 0.000 ms)
+frames            : 3764
+frame time        : 17.411 ms (57.4 fps)
+cpu active (ema)  : 2.346 ms
+cpu wait (ema)    : 14.392 ms
+gpu frame         : 18.355 ms (avg 17.852 ms)
 resolution        : 1362x749
 
 pass                            cur(ms)    avg(ms)    min(ms)    max(ms)   primitives
+Scene                            10.446     10.353      7.896     65.798      7924772
+SSAO                              1.497      1.396      1.036      9.049            0
+Bloom                             0.946      0.915      0.697      5.399            0
+Tonemap                           2.910      2.770      1.987     16.772            0
+SMAA Edge                         0.529      0.505      0.355      3.051      1021500
+SMAA Weight                       1.018      0.974      0.682      6.173      1021500
+SMAA Blend                        0.576      0.539      0.379      3.213      1021500
+Blit Swapchain                    0.220      0.203      0.147      1.122            0
+Nuklear Render                    0.212      0.197      0.149      1.221       842900

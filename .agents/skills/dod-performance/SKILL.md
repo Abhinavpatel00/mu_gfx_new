@@ -15,8 +15,7 @@ description: >
 
 This skill turns a request like "make this fast", "write a particle system",
 "add an ECS", or "refactor this object-oriented C" into data-oriented C that is
-measurably faster. It is distilled from `dod.txt`, Richard Fabian's
-*Data-Oriented Design*, the Algorithmica *HPC* series, and the repository
+measurably faster., and the repository
 `AGENT.md` style contract.
 
 **Before writing code, read `AGENT.md` and `dodnotes.txt` at the project root.**

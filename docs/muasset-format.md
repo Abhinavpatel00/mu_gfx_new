@@ -213,6 +213,29 @@ existing `texture_load_async` SPSC path. Rationale: textures stream and mip
 independently of geometry — packing them together would force re-cooking
 megabytes when a material tweaks one scalar.
 
+### 8.1 BC sidecars (implemented, format 1.1)
+
+Albedo-only images are compressed at cook time with `mu_texcomp.h` (BC1 when
+level 0 is fully opaque, else BC7 FAST; `--bc7ultra` selects ULTRA) and
+written beside the blob as `<asset>.mua.<row>.dds` (row = MUASEC_TEXTURE
+index, real DDS + DX10 header, sRGB by material role). The runtime parses
+them with `dds-ktx` (zero-alloc) and uploads the blocks untouched — the GPU
+samples BC natively. Measured: meadow set 606 MB → 76 MB RGBA payload
+(7.9x, BC1-heavy), BC1 46dB / BC7 FAST 53dB / BC7 ULTRA 61dB on a 1 Mpx
+albedo. Missing sidecars fall back to the legacy `.tex` payload per texture,
+so half-migrated sets load.
+
+Deliberately excluded for now:
+- **Data-role images (normals, ORM)** stay RGBA8. BC-packing XYZ normals
+  wants BC5 (XY + shader Z-reconstruct) — a shader change, not just a cook
+  change. Documented here so it isn't "discovered" later.
+- **SDF face atlas** (`scene_face_atlas_load`) stays uncompressed RGBA8.
+  BC endpoints would relocate the 0.5 isolevel and fray every face edge;
+  8×256px tiles are 2 MB — not worth degrading.
+- **2D sprites / LUTs** still `stbi_load` at runtime (small, single-mip).
+- **KTX2 / Basis**: dds-ktx parses KTX1, not KTX2 supercompression; if we
+  ever need streaming, the sidecar reader is the seam to replace.
+
 ## 9. Versioning
 
 - `major` bump = breaking row layout; loader rejects older blobs with

@@ -30,6 +30,12 @@
 #define STBI_ONLY_JPEG
 #include "../external/stb/stb_image.h"
 
+/* mu_texcomp (repo root): BC codecs. Decode stripped here — the cooker only
+   encodes; quality numbers come from the offline probe, not per cook. */
+#define MU_TEXCOMP_ENABLE_DECODE 0
+#define MU_TEXCOMP_IMPLEMENTATION
+#include "../mu_texcomp.h"
+
 #include "muasset.h"
 #include "muasset_cook.h"
 
@@ -633,6 +639,113 @@ bool muasset_cook(const CookOptions *opt, CookStats *stats_out, char *err, uint3
                 (image_role[ii] == IMG_ALBEDO) ? MUASSET_TEX_RGBA8_SRGB : MUASSET_TEX_RGBA8;
     st.texture_count = (uint32_t)(textures.size / sizeof(MuassetTexture));
 
+    /* ---- BC sidecars (.dds) ----
+       Albedo-only images compress with mu_texcomp (BC1 when level 0 is fully
+       opaque, else BC7) and land beside the blob as <output>.<row>.dds, row =
+       index into MUASEC_TEXTURE. The DDS header carries format + sRGB, so
+       MuassetTexture grows no fields and the runtime parses them with
+       dds-ktx. Data-role images (normals, ORM) stay RGBA8: BC-packing XYZ
+       normals wants BC5 plus a shader rework first (see
+       docs/muasset-format.md). The legacy .tex is still written below and
+       goes away once every consumer reads the sidecars. */
+    {
+        uint32_t tex_rows = (uint32_t)(textures.size / sizeof(MuassetTexture));
+        uint32_t *row_role = (uint32_t *)calloc(tex_rows ? tex_rows : 1, sizeof(uint32_t));
+        if (!row_role)
+            FAIL("out of memory");
+        for (cgltf_size ii = 0; ii < gltf->images_count; ++ii)
+            if (image_id[ii] >= 0)
+                row_role[image_id[ii]] |= image_role[ii];
+        for (uint32_t r = 0; r < tex_rows; ++r) {
+            if (row_role[r] != IMG_ALBEDO)
+                continue; /* data role: stays RGBA8, see above */
+            const MuassetTexture *tr = (const MuassetTexture *)textures.data + r;
+            const uint8_t *l0 = (const uint8_t *)tex_payload.data + tr->offset;
+            bool opaque = true;
+            for (uint32_t p = 0; p < tr->width * tr->height; ++p)
+                if (l0[p * 4u + 3u] != 255u) { opaque = false; break; }
+            Mu_Texcomp_Format bcfmt = opaque ? MU_TEXCOMP_FMT_BC1 : MU_TEXCOMP_FMT_BC7;
+            bool srgb = tr->format == MUASSET_TEX_RGBA8_SRGB;
+            uint32_t dxgi = opaque ? (srgb ? 72u : 71u) : (srgb ? 99u : 98u);
+            /* Vulkan BC copies need 4x4-aligned extents, so levels pad up by
+               edge clamp and the tail stops at 4x4 (a 1x1 BC level is not
+               expressible). Header dims are the padded level-0 size. */
+            uint32_t pw0 = (tr->width + 3u) & ~3u, ph0 = (tr->height + 3u) & ~3u;
+            if (pw0 < 4u || ph0 < 4u)
+                continue; /* tiny icon: no BC representation, stays RGBA8 */
+            uint8_t *pad = (uint8_t *)malloc((size_t)pw0 * ph0 * 4u);
+            if (!pad)
+                FAIL("out of memory");
+            Buf bc = {0};
+            uint32_t lw = tr->width, lh = tr->height, off = tr->offset, dmips = 0;
+            while (lw >= 4u && lh >= 4u) {
+                uint32_t pw = (lw + 3u) & ~3u, ph = (lh + 3u) & ~3u;
+                const uint8_t *src = (const uint8_t *)tex_payload.data + off;
+                for (uint32_t y = 0; y < ph; ++y) {
+                    uint32_t sy = y < lh ? y : lh - 1u;
+                    for (uint32_t x = 0; x < pw; ++x) {
+                        uint32_t sx = x < lw ? x : lw - 1u;
+                        memcpy(pad + ((size_t)y * pw + x) * 4u, src + ((size_t)sy * lw + sx) * 4u, 4u);
+                    }
+                }
+                uint64_t need = mu_texcomp_image_bytes(pw, ph, bcfmt);
+                size_t base = bc.size;
+                if (!buf_reserve(&bc, (size_t)need)) {
+                    free(pad);
+                    FAIL("out of memory");
+                }
+                bc.size = base + (size_t)need;
+                Mu_Texcomp_Error be = mu_texcomp_encode_image(
+                    (Mu_Texcomp_ConstBytes){pad, (uint64_t)pw * ph * 4u}, pw, ph, pw * 4u,
+                    (Mu_Texcomp_Bytes){bc.data + base, need},
+                    MU_TEXCOMP_ENCODE_PARAMS_DEFAULT(bcfmt, opt->bc7ultra ? MU_TEXCOMP_ULTRA : MU_TEXCOMP_FAST));
+                if (be != MU_TEXCOMP_OK) {
+                    free(pad);
+                    FAIL("BC compress failed for texture %u", r);
+                }
+                dmips++;
+                off += lw * lh * 4u;
+                lw = lw > 1u ? lw / 2u : 1u;
+                lh = lh > 1u ? lh / 2u : 1u;
+            }
+            free(pad);
+            Buf dds = {0};
+            /* magic + DDS header + DX10 header, then levels back to back */
+            uint8_t head[4 + 124 + 20] = {0};
+            head[0] = 'D'; head[1] = 'D'; head[2] = 'S'; head[3] = ' ';
+            /* dwSize, dwFlags, h, w, linearSize, depth, mips */
+            uint32_t *hh = (uint32_t *)(head + 4);
+            hh[0] = 124u; hh[1] = 0x000A1007u; hh[2] = ph0; hh[3] = pw0;
+            hh[4] = (uint32_t)mu_texcomp_image_bytes(pw0, ph0, bcfmt);
+            hh[5] = 0u; hh[6] = dmips;
+            /* pixel format: size 32, FOURCC, "DX10" */
+            hh[18] = 32u; hh[19] = 0x4u; hh[20] = 0x30315844u;
+            /* caps: TEXTURE | MIPMAP | COMPLEX */
+            hh[26] = 0x00401008u;
+            /* DX10 header: format, TEXTURE2D, misc, arraySize 1, misc2 */
+            uint32_t *dx = (uint32_t *)(head + 4 + 124);
+            dx[0] = dxgi; dx[1] = 3u; dx[2] = 0u; dx[3] = 1u; dx[4] = 0u;
+            if (!buf_append(&dds, head, sizeof(head)) || !buf_append(&dds, bc.data, bc.size)) {
+                free(bc.data);
+                FAIL("out of memory");
+            }
+            free(bc.data);
+            char dds_path[1024];
+            snprintf(dds_path, sizeof(dds_path), "%s.%u.dds", opt->output_path, r);
+            FILE *df = fopen(dds_path, "wb");
+            if (!df)
+                FAIL("cannot open %s for writing", dds_path);
+            if (fwrite(dds.data, 1, dds.size, df) != dds.size) {
+                fclose(df);
+                FAIL("short write to %s", dds_path);
+            }
+            fclose(df);
+            st.dds_bytes += (uint32_t)dds.size;
+            free(dds.data);
+        }
+        free(row_role);
+    }
+
     uint32_t mesh_index = 0;
     uint32_t batch_mask = 0;
 
@@ -983,6 +1096,7 @@ bool muasset_cook(const CookOptions *opt, CookStats *stats_out, char *err, uint3
             FAIL("short write to %s", tex_path);
         }
         fclose(tf);
+        st.tex_bytes = (uint32_t)tex_payload.size;
     }
 
     /* Counted from the section table, not from the staging buffers: the
@@ -1118,6 +1232,7 @@ static void usage(void) {
             "\n"
             "  --lods N             rungs per mesh, 1..%u (100/50/25/12.5%% of triangles)\n"
             "  --bake-rest-pose     cook skinned input at its bind pose instead of failing\n"
+            "  --bc7ultra           BC7 ULTRA (~60dB, minutes/Mpx) instead of FAST (~53dB)\n"
             "  --stats              print the cook budget\n"
             "  --dump               print the blob's tables and validate it\n"
             "  --validate           check magic, offsets, row sizes and crc32 only\n",
@@ -1128,6 +1243,7 @@ int main(int argc, char **argv) {
     const char *input = NULL, *output = NULL;
     uint32_t    lod_count = 3;
     bool        bake_rest_pose = false, stats = false, want_dump = false, want_validate = false;
+    bool        bc7ultra = false;
 
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "-o") == 0 && i + 1 < argc)
@@ -1136,6 +1252,8 @@ int main(int argc, char **argv) {
             lod_count = (uint32_t)atoi(argv[++i]);
         else if (strcmp(argv[i], "--bake-rest-pose") == 0)
             bake_rest_pose = true;
+        else if (strcmp(argv[i], "--bc7ultra") == 0)
+            bc7ultra = true;
         else if (strcmp(argv[i], "--stats") == 0)
             stats = true;
         else if (strcmp(argv[i], "--dump") == 0)
@@ -1193,6 +1311,7 @@ int main(int argc, char **argv) {
         .lod_count     = lod_count,
         .bake_rest_pose = bake_rest_pose,
         .stats         = stats,
+        .bc7ultra      = bc7ultra,
     };
     if (!muasset_cook(&opt, &st, err, sizeof(err))) {
         fprintf(stderr, "cook failed: %s\n", err);
@@ -1202,6 +1321,8 @@ int main(int argc, char **argv) {
     printf("%s -> %s\n", input, output);
     printf("  meshes %u  rungs %u  vertices %u  indices %u  vert_bytes %u  idx_bytes %u\n", st.mesh_count, st.lod_count,
            st.vertex_count, st.index_count, st.vert_bytes, st.idx_bytes);
+    if (st.dds_bytes || st.tex_bytes)
+        printf("  textures %u  dds_bytes %u  tex_bytes %u\n", st.texture_count, st.dds_bytes, st.tex_bytes);
     if (st.baked_rigs)
         printf("  %u skinned primitives cooked at their bind pose\n", st.baked_rigs);
     if (stats)

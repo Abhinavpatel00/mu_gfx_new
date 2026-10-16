@@ -35,6 +35,8 @@ typedef struct CookStats {
     uint32_t baked_rigs;   /* primitives cooked from a skinned mesh */
     uint32_t vert_bytes;
     uint32_t idx_bytes;
+    uint32_t dds_bytes;  /* BC sidecars written beside the blob (0 = none) */
+    uint32_t tex_bytes;  /* legacy RGBA payload bytes, kept until the BC path is proven */
     double   cook_ms;
 } CookStats;
 
@@ -44,6 +46,7 @@ typedef struct CookOptions {
     uint32_t    lod_count;    /* 1..MUACOOK_MAX_LODS; rungs are 100/50/25/12.5% */
     bool        bake_rest_pose; /* cook skinned input at its bind pose instead of failing */
     bool        stats;
+    bool        bc7ultra; /* BC7 ULTRA (~60dB, minutes/Mpx) instead of FAST (~53dB); bulk default is FAST */
 } CookOptions;
 
 bool muasset_cook(const CookOptions *opt, CookStats *stats_out, char *err, uint32_t err_cap);

@@ -367,6 +367,7 @@ struct Renderer {
     mat4      cam_inv_view;
     mat4      cam_prev_viewproj;
     bool      debug_ui_open;
+    bool      show_gpu_text; /* GPU profiler text overlay (text.slang), F1 */
     TextureID dummy_texture;
     TextureID smaa_area_tex;
     TextureID smaa_search_tex;
@@ -395,6 +396,7 @@ struct Renderer {
         uint32_t grass;
         uint32_t bloom;
         uint32_t ssao;
+        uint32_t text;
     } EnginePipelines;
 };
 
@@ -1341,6 +1343,7 @@ static void renderer_resources_create(Renderer *r, VkBackendDesc *desc) {
 
         r->EnginePipelines.bloom = pipeline_create_compute(&r->vk, "compiledshaders/bloom.comp.spv");
         r->EnginePipelines.ssao  = pipeline_create_compute(&r->vk, "compiledshaders/ssao.comp.spv");
+        r->EnginePipelines.text  = pipeline_create_compute(&r->vk, "compiledshaders/text.comp.spv");
 
         {
             GraphicsPipelineConfig cfg = pipeline_config_fullscreen();
@@ -1409,7 +1412,7 @@ Renderer *renderer_create(bool use_wayland, GameHooks game) {
         .swapchain_preferred_color_space = VK_COLORSPACE_SRGB_NONLINEAR_KHR,
         .swapchain_preferred_format      = VK_FORMAT_B8G8R8A8_UNORM,
         .swapchain_extra_usage_flags =
-            IMG_XFER_DST | IMG_SAMPLED | IMG_XFER_SRC,
+            IMG_XFER_DST | IMG_SAMPLED | IMG_XFER_SRC | IMG_STORAGE,
         .vsync               = false,
         .enable_debug_printf = true,
 
@@ -1420,9 +1423,9 @@ Renderer *renderer_create(bool use_wayland, GameHooks game) {
         .enable_graphics_profiler         = true,
         .swapchain_preferred_present_mode = VK_PRESENT_MODE_MAILBOX_KHR,
 
-        .size_of_cpu_pool     = MB(32),
-        .size_of_gpu_pool     = MB(100),
-        .size_of_staging_pool = MB(100),
+        .size_of_cpu_pool     = MU_MB(32),
+        .size_of_gpu_pool     = MU_MB(100),
+        .size_of_staging_pool = MU_MB(100),
 
     };
 
@@ -1430,6 +1433,7 @@ Renderer *renderer_create(bool use_wayland, GameHooks game) {
     (void)posix_memalign((void **)&r, _Alignof(Renderer), sizeof(*r));
     memset(r, 0, sizeof(*r)); // zero-value = safe defaults everywhere
     r->game = game;
+    r->show_gpu_text = true; /* F1 toggles the GPU profiler text overlay */
     vk_instance_create(&r->vk, &desc);
     glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API); /* we drive Vulkan ourselves */
     r->window = glfwCreateWindow((int)desc.width, (int)desc.height, "Vulkan", NULL, NULL);
@@ -1990,6 +1994,85 @@ static void pass_smaa(Renderer *r, VkCommandBuffer cmd) {
     }
 }
 
+/* GPU profiler text overlay (text.slang): one compute dispatch per line,
+   5x8 glyphs blitted straight into the swapchain image. Reads the CPU-side
+   profiler copy (a frame old — fine for an overlay). Deliberately outside
+   any GPU_SCOPE so the overlay never profiles itself. */
+typedef struct TextPush {
+    int32_t  ox, oy;     /* origin in characters */
+    int32_t  scale;      /* pixel replication per glyph texel */
+    uint32_t color;      /* ABGR */
+    uint32_t image;      /* bindless storage slot of the target */
+    uint32_t data[28];   /* 112 chars, one byte each */
+} TextPush;
+
+#define GPU_TEXT_MAX_LINES 10
+#define GPU_TEXT_MAX_CHARS 112
+#define GPU_TEXT_SCALE     2
+
+static void pass_text_overlay(Renderer *r, VkCommandBuffer cmd) {
+    if (!r->show_gpu_text || !r->vk.enable_graphics_profiler)
+        return;
+    FlowSwapchain *sc = &r->vk.swapchain;
+    if (!(sc->image_usage & VK_IMAGE_USAGE_STORAGE_BIT))
+        return; /* surface refused STORAGE: overlay impossible, stay silent */
+
+    /* Read the live per-frame profiler rather than the Nuklear profiler
+       snapshot: the snapshot stays frozen while its Pause box is ticked, which
+       would leave the overlay permanently blank. Timings here are one collect
+       old (a pass's value lands with the frame's own submission), which is
+       exactly what an overlay wants. */
+    GpuProfiler *fp = &r->vk.gpuprofiler[r->vk.current_frame];
+    if (fp->pass_count == 0)
+        return;
+    uint32_t image = sc->current_image;
+
+    /* Headline total, lightly smoothed so it does not flicker frame to frame. */
+    static double s_total_ema = 0.0;
+    double        total       = 0.0;
+    for (uint32_t i = 0; i < fp->pass_count; ++i)
+        total += fp->passes[i].time_ms;
+    s_total_ema += (total - s_total_ema) * 0.1;
+
+    char lines[GPU_TEXT_MAX_LINES][GPU_TEXT_MAX_CHARS + 1];
+    int  nlines = 0;
+    snprintf(lines[nlines++], sizeof(lines[0]), "GPU %.2fms avg %.2fms", total, s_total_ema);
+    for (uint32_t i = 0; i < fp->pass_count && nlines < GPU_TEXT_MAX_LINES; ++i) {
+        const char *name = fp->passes[i].name ? fp->passes[i].name : "?";
+        snprintf(lines[nlines++], sizeof(lines[0]), "%-16.16s %6.2f", name, fp->passes[i].time_ms);
+    }
+
+    image_transition_swapchain(&r->vk, cmd, sc, LAYOUT_GENERAL, STAGE_CS, ACCESS_SSBO_W);
+    flush_barriers(&r->vk, cmd);
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                      r->vk.render_pipelines.pipelines[r->EnginePipelines.text - 1]);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, r->vk.bindless_system.pipeline_layout, 0, 1,
+                            &r->vk.bindless_system.set, 0, NULL);
+
+    /* Right-aligned block: one origin per line since lengths differ. */
+    int cols = (int)sc->extent.width / (6 * GPU_TEXT_SCALE);
+    for (int i = 0; i < nlines; ++i) {
+        size_t n = strlen(lines[i]);
+        if (n == 0 || n > GPU_TEXT_MAX_CHARS)
+            n = n > GPU_TEXT_MAX_CHARS ? GPU_TEXT_MAX_CHARS : n;
+        if (n == 0)
+            continue;
+        TextPush p;
+        memset(&p, 0, sizeof(p));
+        p.ox    = cols - (int)n - 1;
+        p.oy    = 1 + i;
+        p.scale = GPU_TEXT_SCALE;
+        p.color = (i == 0) ? 0xFFFFFFFFu : 0xFFB0B0B0u;
+        p.image = sc->bindless_index[image];
+        memcpy(p.data, lines[i], n);
+        dispatch_push(&r->vk, cmd, (ByteSpan){&p, sizeof(p)}, (uint32_t)n, 1, 1);
+    }
+    flush_barriers(&r->vk, cmd);
+    /* Layout stays GENERAL here; the PRESENT transition below picks it up
+       through the swapchain state tracker. */
+}
+
 static void pass_ldr_to_swapchain(Renderer *r, VkCommandBuffer cmd) {
     GpuProfiler *frame_prof = &r->vk.gpuprofiler[r->vk.current_frame];
     GPU_SCOPE(frame_prof, cmd, "Blit Swapchain", STAGE_XFER) {
@@ -2397,6 +2480,8 @@ bool renderer_frame(Renderer *r) {
        key toggling every frame is what the old local did. */
     if (key_pressed(&r->input, KEY_TAB))
         r->debug_ui_open = !r->debug_ui_open;
+    if (key_pressed(&r->input, KEY_F1))
+        r->show_gpu_text = !r->show_gpu_text;
 
     GPU_SCOPE(frame_prof, cmd, "SSAO", STAGE_CS) {
         /* The checkbox gates the pass itself: when SSAO is off post does not
@@ -2408,6 +2493,7 @@ bool renderer_frame(Renderer *r) {
     post_pass(r, cmd);
     pass_smaa(r, cmd);
     pass_ldr_to_swapchain(r, cmd);
+    pass_text_overlay(r, cmd);
     render_gpu_profiler_ui(r);
 
     /* The game HUD belongs to the game, not to the debug windows, so it draws

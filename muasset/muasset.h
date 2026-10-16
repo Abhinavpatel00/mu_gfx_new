@@ -21,7 +21,7 @@
 
 #define MUASSET_MAGIC 0x2E41554Du /* ".MUA" read as a little-endian u32 */
 #define MUASSET_MAJOR 1u
-#define MUASSET_MINOR 0u
+#define MUASSET_MINOR 1u /* 1: cooker also emits BC .dds sidecars (<asset>.mua.<row>.dds) */
 
 /* Section tags are a stable ABI: append only, never renumber. */
 #define MUASEC_VERT_ARENA 1u /* MuassetVertex rows; all meshes x all rungs */

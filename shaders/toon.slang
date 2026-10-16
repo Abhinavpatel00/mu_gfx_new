@@ -66,19 +66,19 @@ SceneVOut vs_main(uint vid : SV_VertexID, uint iid : SV_InstanceID, uint base_in
     SceneVOut o;
     o.face = pc.face_id[slot];
 
-    /* SDF face quad: Y-billboard, same anchor math as scene.slang. */
+    /* SDF face quad: body-locked decal, same math as scene.slang. */
     if ((pc.materials[gs.material].flags & SCENE_MAT_FACE) != 0u) {
-        float3 to_cam = pc.camera.xyz - ipos;
-        to_cam.y      = 0.0f;
-        float dl      = max(length(to_cam), 1e-4f);
-        to_cam /= dl;
-        float3 right  = float3(-to_cam.z, 0.0f, to_cam.x);
-        float3 anchor = ipos + to_cam * (1.02f * s) + float3(0.0f, 0.12f * s * sy, 0.0f);
-        float3 world  = anchor + right * (local.x * 1.05f * s * widen)
-                               + float3(0.0f, local.y * 0.85f * s * sy, 0.0f);
+        float3 fq = float3(local.x * 1.05f * s * widen, (local.y * 0.85f + 0.12f) * s * sy, 1.02f * s * widen);
+        float3 world = ipos + quat_rotate(inst.quat, fq);
+        float famp = pc.wiggle[slot];
+        if (famp != 0.0f) {
+            float fh  = local.y + 0.5f;
+            float fph = global_data.time * 6.0f + float(slot / 2u) * 2.399963f;
+            world += quat_rotate(inst.quat, unpack_oct(v.normal_oct)) * (sin(fph) * famp * fh * s);
+        }
         o.position = float4(dot(pc.clip_rows[0], float4(world, 1.0f)), dot(pc.clip_rows[1], float4(world, 1.0f)),
                             dot(pc.clip_rows[2], float4(world, 1.0f)), dot(pc.clip_rows[3], float4(world, 1.0f)));
-        o.normal   = -to_cam;
+        o.normal   = quat_rotate(inst.quat, unpack_oct(v.normal_oct));
         o.uv       = unpack_half2(v.uv);
         o.material = gs.material;
         o.world    = world;

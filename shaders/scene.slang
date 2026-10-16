@@ -82,24 +82,24 @@ SceneVOut vs_main(uint vid : SV_VertexID, uint iid : SV_InstanceID, uint base_in
     SceneVOut o;
     o.face = pc.face_id[slot];
 
-    /* SDF face quad: a Y-billboard anchored to the body's camera-facing surface
-       so the expression stays readable from any orbit angle. The anchor rides
-       the same squash (height) and widen (width) as the body, and sits 2%
-       proud of the unit body radius so the GREATER depth test keeps the quad.
-       Group-uniform branch: the material is per group, never per lane. */
+    /* SDF face quad: rigidly attached to the body's front (+Z in instance
+       space) so ears, jiggle and face share one transform — a billboard would
+       slide against the yawed body. The quad inherits squash/widen and the
+       gel jiggle below via the shared slot-pair phase, and sits 2% proud of
+       the unit body radius so the GREATER depth test keeps it. From behind
+       you see plain body, like SR's decal faces. Group-uniform branch. */
     if ((pc.materials[gs.material].flags & SCENE_MAT_FACE) != 0u) {
-        float3 to_cam = pc.camera.xyz - ipos;
-        to_cam.y      = 0.0f;
-        float dl      = max(length(to_cam), 1e-4f);
-        to_cam /= dl;
-        float3 right  = float3(-to_cam.z, 0.0f, to_cam.x);
-        float3 anchor = ipos + to_cam * (1.02f * s) + float3(0.0f, 0.12f * s * sy, 0.0f);
-        /* Quad verts are authored +/-0.5 in x/y. */
-        float3 world = anchor + right * (local.x * 1.05f * s * widen)
-                              + float3(0.0f, local.y * 0.85f * s * sy, 0.0f);
+        float3 fq = float3(local.x * 1.05f * s * widen, (local.y * 0.85f + 0.12f) * s * sy, 1.02f * s * widen);
+        float3 world = ipos + quat_rotate(inst.quat, fq);
+        float amp = pc.wiggle[slot];
+        if (amp != 0.0f) {
+            float h  = local.y + 0.5f;
+            float ph = global_data.time * 6.0f + float(slot / 2u) * 2.399963f;
+            world += quat_rotate(inst.quat, unpack_oct(v.normal_oct)) * (sin(ph) * amp * h);
+        }
         o.position = float4(dot(pc.clip_rows[0], float4(world, 1.0f)), dot(pc.clip_rows[1], float4(world, 1.0f)),
                             dot(pc.clip_rows[2], float4(world, 1.0f)), dot(pc.clip_rows[3], float4(world, 1.0f)));
-        o.normal   = -to_cam; /* unused: the face fragment path is unlit */
+        o.normal   = quat_rotate(inst.quat, unpack_oct(v.normal_oct)); /* unused: face path is unlit */
         o.uv       = unpack_half2(v.uv);
         o.material = gs.material;
         o.world    = world;
