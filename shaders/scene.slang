@@ -76,8 +76,14 @@ SceneVOut vs_main(uint vid : SV_VertexID, uint iid : SV_InstanceID, uint base_in
        so every non-slime instance (the default) is bit-identical to the rigid
        path. */
     float  sy      = pc.squash[slot];
+    float  sz      = pc.stretch[slot];
     float  widen   = rsqrt(max(sy, 1e-3f));
-    float3 su      = float3(widen, sy, widen);
+    /* Forward stretch along local +Z (the facing the yaw already points at),
+       traded against x so volume holds: widen/rsqrt(sz) * widen*sqrt(sz) leaves
+       the horizontal area at widen^2 under any sz. sz==1 is the identity. */
+    float  ax      = widen * rsqrt(max(sz, 1e-3f));
+    float  az      = widen * sqrt(max(sz, 1e-3f));
+    float3 su      = float3(ax, sy, az);
 
     SceneVOut o;
     o.face = pc.face_id[slot];
@@ -89,7 +95,7 @@ SceneVOut vs_main(uint vid : SV_VertexID, uint iid : SV_InstanceID, uint base_in
        the unit body radius so the GREATER depth test keeps it. From behind
        you see plain body, like SR's decal faces. Group-uniform branch. */
     if ((pc.materials[gs.material].flags & SCENE_MAT_FACE) != 0u) {
-        float3 fq = float3(local.x * 1.05f * s * widen, (local.y * 0.85f + 0.12f) * s * sy, 1.02f * s * widen);
+        float3 fq = float3(local.x * 1.05f * s * ax, (local.y * 0.85f + 0.12f) * s * sy, 1.02f * s * az);
         float3 world = ipos + quat_rotate(inst.quat, fq);
         float amp = pc.wiggle[slot];
         if (amp != 0.0f) {

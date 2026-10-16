@@ -212,6 +212,13 @@ struct Scene {
     bool        squash_dirty;
     BufferSlice squash_table; /* max_instances x float on the GPU */
 
+    /* Stretch: per-instance forward-axis stretch along the instance's facing,
+       same machinery again. 1 = rest; >1 elongates the body along +Z (the
+       movement direction the yaw already points at). */
+    float      *stretch_v;
+    bool        stretch_dirty;
+    BufferSlice stretch_table; /* max_instances x float on the GPU */
+
     /* Face: per-instance slime-face atlas tile, same machinery as wiggle.
        Read only by FACE-material quads. 0 is the default tile. */
     uint32_t   *face_id;    /* max_instances */
@@ -338,6 +345,7 @@ Scene *scene_create(VkBackend *vk, const SceneDesc *desc) {
         b += (uint64_t)s->max_instances * sizeof(float);             /* bloom_strength */
         b += (uint64_t)s->max_instances * sizeof(float);             /* wiggle_amp */
         b += (uint64_t)s->max_instances * sizeof(float);             /* squash_v */
+        b += (uint64_t)s->max_instances * sizeof(float);             /* stretch_v */
         b += (uint64_t)s->max_instances * sizeof(uint32_t);          /* face_id */
         b += (uint64_t)s->max_instances * sizeof(uint32_t);          /* compact_dst */
         b += (uint64_t)s->max_meshes * sizeof(struct SceneCullMesh); /* cpu_cull */
@@ -396,6 +404,12 @@ Scene *scene_create(VkBackend *vk, const SceneDesc *desc) {
         s->squash_v[i] = 1.0f; /* rest shape is the default, not 0 */
     s->squash_table = alloc_slice(s, (VkDeviceSize)s->max_instances * sizeof(float), 16);
 
+    s->stretch_v     = mu_arena_alloc(&s->arena, s->max_instances * sizeof(float), 16);
+    s->stretch_dirty = false;
+    for (uint32_t i = 0; i < s->max_instances; ++i)
+        s->stretch_v[i] = 1.0f; /* rest shape is the default, not 0 */
+    s->stretch_table = alloc_slice(s, (VkDeviceSize)s->max_instances * sizeof(float), 16);
+
     s->face_id     = mu_arena_alloc(&s->arena, s->max_instances * sizeof(uint32_t), 16);
     s->face_dirty  = false;
     memset(s->face_id, 0, (size_t)s->max_instances * sizeof(uint32_t));
@@ -449,6 +463,7 @@ void scene_destroy(Scene *s) {
     buffer_pool_free(s->bloom_table);
     buffer_pool_free(s->wiggle_table);
     buffer_pool_free(s->squash_table);
+    buffer_pool_free(s->stretch_table);
     buffer_pool_free(s->face_table);
     buffer_pool_free(s->group_static);
     buffer_pool_free(s->group_shade);
@@ -813,6 +828,7 @@ void scene_instance_destroy(Scene *s, uint32_t slot) {
         s->bloom_strength[slot] = s->bloom_strength[last_slot];
         s->wiggle_amp[slot]     = s->wiggle_amp[last_slot];
         s->squash_v[slot]       = s->squash_v[last_slot];
+        s->stretch_v[slot]      = s->stretch_v[last_slot];
         s->face_id[slot]        = s->face_id[last_slot];
         mu_bitset_set_bit(&s->bloom_bits, slot, mu_bitset_test(&s->bloom_bits, last_slot));
         s->row_of[slot]             = moved_row;
@@ -822,6 +838,7 @@ void scene_instance_destroy(Scene *s, uint32_t slot) {
     s->bloom_strength[last_slot] = 0.0f;
     s->wiggle_amp[last_slot]     = 0.0f;
     s->squash_v[last_slot]       = 1.0f;
+    s->stretch_v[last_slot]      = 1.0f;
     s->face_id[last_slot]        = 0u;
     mu_bitset_reset(&s->bloom_bits, last_slot);
     s->bloom_dirty = true;
@@ -889,6 +906,7 @@ void scene_compact_slots(Scene *s) {
             s->bloom_strength[to]     = s->bloom_strength[i];
             s->wiggle_amp[to]         = s->wiggle_amp[i];
             s->squash_v[to]           = s->squash_v[i];
+            s->stretch_v[to]          = s->stretch_v[i];
             s->face_id[to]            = s->face_id[i];
             s->cpu_instances[i].alive = 0;
             s->row_of[i]              = UINT32_MAX;
@@ -909,12 +927,14 @@ void scene_compact_slots(Scene *s) {
             s->bloom_strength[i] = 0.0f;
             s->wiggle_amp[i]     = 0.0f;
             s->squash_v[i]       = 1.0f;
+            s->stretch_v[i]      = 1.0f;
             s->face_id[i]        = 0u;
         }
     }
     s->bloom_dirty  = true;
     s->wiggle_dirty = true;
     s->squash_dirty = true;
+    s->stretch_dirty = true;
     s->face_dirty   = true;
 
     s->dynamic_count      = dyn;
@@ -1058,10 +1078,13 @@ bool scene_upload_scene(Scene *s, VkCommandBuffer cmd) {
                                     (ByteSpan){s->wiggle_amp, (size_t)s->max_instances * sizeof(float)});
     renderer_upload_buffer_to_slice(vk, cmd, s->squash_table,
                                     (ByteSpan){s->squash_v, (size_t)s->max_instances * sizeof(float)});
+    renderer_upload_buffer_to_slice(vk, cmd, s->stretch_table,
+                                    (ByteSpan){s->stretch_v, (size_t)s->max_instances * sizeof(float)});
     renderer_upload_buffer_to_slice(vk, cmd, s->face_table,
                                     (ByteSpan){s->face_id, (size_t)s->max_instances * sizeof(uint32_t)});
     s->wiggle_dirty = false;
     s->squash_dirty = false;
+    s->stretch_dirty = false;
     s->face_dirty   = false;
 
     /* Seed both ping-pong state buffers with the same spawn state. From here the
@@ -1273,6 +1296,7 @@ static void build_draw_push(Scene *s, uint32_t view, uint32_t lane, struct Scene
     p->bloom       = slice_addr(vk, s->bloom_table);
     p->wiggle      = slice_addr(vk, s->wiggle_table);
     p->squash      = slice_addr(vk, s->squash_table);
+    p->stretch     = slice_addr(vk, s->stretch_table);
     p->face_id     = slice_addr(vk, s->face_table);
 
     p->counts[5] = getenv("MU_SHADER_DEBUG") ? 1u : 0u;
@@ -1303,6 +1327,7 @@ static void slime_record(Scene *s, VkCommandBuffer cmd, uint32_t view) {
     sp.state_out  = slice_addr(vk, *st_out);
     sp.instances  = slice_addr(vk, s->instances);
     sp.squash     = slice_addr(vk, s->squash_table);
+    sp.stretch    = slice_addr(vk, s->stretch_table);
     sp.face       = slice_addr(vk, s->face_table);
     sp.grid_count = slice_addr(vk, s->slime_grid_count);
     sp.grid_items = slice_addr(vk, s->slime_grid_items);
@@ -1352,16 +1377,17 @@ static void slime_record(Scene *s, VkCommandBuffer cmd, uint32_t view) {
         {.slice = s->slime_grid_count, .stage = STAGE_CS, .access = ACCESS_SSBO_R},
         {.slice = s->slime_grid_items, .stage = STAGE_CS, .access = ACCESS_SSBO_R},
     };
-    BufferAccess res_writes[4] = {
+    BufferAccess res_writes[5] = {
         {.slice = *st_out, .stage = STAGE_CS, .access = ACCESS_SSBO_W},
         {.slice = s->instances, .stage = STAGE_CS, .access = ACCESS_SSBO_W},
         {.slice = s->squash_table, .stage = STAGE_CS, .access = ACCESS_SSBO_W},
+        {.slice = s->stretch_table, .stage = STAGE_CS, .access = ACCESS_SSBO_W},
         {.slice = s->face_table, .stage = STAGE_CS, .access = ACCESS_SSBO_W},
     };
     PassDesc res_pass = {.buf_reads       = res_reads,
                          .buf_read_count  = 3,
                          .buf_writes      = res_writes,
-                         .buf_write_count = 4,
+                         .buf_write_count = 5,
                          .pipeline        = s->cs_slime_resolve};
     begin_pass(vk, cmd, &res_pass);
     dispatch_push(vk, cmd, (ByteSpan){&sp, (uint32_t)sizeof(sp)}, groups, 1, 1);
@@ -1484,15 +1510,18 @@ void scene_frame(Scene *s, VkCommandBuffer cmd, RenderTarget *color, RenderTarge
        after the first upload, so mirror bloom's dirty re-upload here. Face and
        squash ride along: all three are small whole-table uploads. Under the
        slime sim, squash and face are GPU-owned and must not be overwritten. */
-    if (!s->slime_active && (s->wiggle_dirty || s->squash_dirty || s->face_dirty)) {
+    if (!s->slime_active && (s->wiggle_dirty || s->squash_dirty || s->stretch_dirty || s->face_dirty)) {
         renderer_upload_buffer_to_slice(vk, cmd, s->wiggle_table,
                                         (ByteSpan){s->wiggle_amp, (size_t)s->max_instances * sizeof(float)});
         renderer_upload_buffer_to_slice(vk, cmd, s->squash_table,
                                         (ByteSpan){s->squash_v, (size_t)s->max_instances * sizeof(float)});
+        renderer_upload_buffer_to_slice(vk, cmd, s->stretch_table,
+                                        (ByteSpan){s->stretch_v, (size_t)s->max_instances * sizeof(float)});
         renderer_upload_buffer_to_slice(vk, cmd, s->face_table,
                                         (ByteSpan){s->face_id, (size_t)s->max_instances * sizeof(uint32_t)});
         s->wiggle_dirty = false;
         s->squash_dirty = false;
+        s->stretch_dirty = false;
         s->face_dirty   = false;
     }
 
@@ -1771,7 +1800,7 @@ void scene_frame(Scene *s, VkCommandBuffer cmd, RenderTarget *color, RenderTarge
         PassAttachment dep = {.target = depth, .load = LOAD_CLEAR, .store = STORE_KEEP};
         dep.clear[0]       = 0.0f; /* reverse-Z: the far plane is 0.0 */
 
-        BufferAccess draw_reads[12] = {
+        BufferAccess draw_reads[14] = {
             {.slice  = s->instances,
              .stage  = STAGE_VERT,
              .access = ACCESS_SSBO_R},
@@ -1806,6 +1835,9 @@ void scene_frame(Scene *s, VkCommandBuffer cmd, RenderTarget *color, RenderTarge
              .stage  = STAGE_VERT,
              .access = ACCESS_SSBO_R},
             {.slice  = s->squash_table,
+             .stage  = STAGE_VERT,
+             .access = ACCESS_SSBO_R},
+            {.slice  = s->stretch_table,
              .stage  = STAGE_VERT,
              .access = ACCESS_SSBO_R},
             {.slice  = s->face_table,

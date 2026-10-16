@@ -215,6 +215,7 @@ struct SceneDrawPush {
     SCENE_PTR(float) bloom;
     SCENE_PTR(float) wiggle; /* per-instance jiggle amplitude; 0 = static */
     SCENE_PTR(float) squash; /* per-instance vertical squash; 1 = rest */
+    SCENE_PTR(float) stretch; /* per-instance forward stretch; 1 = rest */
     SCENE_PTR(SCENE_U32) face_id; /* per-instance face atlas tile; read only by FACE quads */
     SCENE_U32 counts[8]; /* 5 shader printf */
 };
@@ -261,12 +262,13 @@ struct SlimeState {
     float     event_t;    /* remaining random-mood time; 0 = none */
     float     squash;     /* current vertical squash (1 = rest) */
     float     wobble;     /* collision wobble, decays to 0 */
+    float     stretch;    /* forward-axis stretch along facing (1 = rest) */
     float     scale;      /* uniform body scale */
     SCENE_U32 face_id;    /* current face atlas tile */
     SCENE_U32 event_id;   /* FACE_SAD / FACE_ANGRY while event_t runs */
     SCENE_U32 flags;      /* bit0 air, bit1 land_hard */
     SCENE_U32 rng;        /* per-slime xorshift word */
-    SCENE_U32 pad[2];
+    SCENE_U32 pad;
 };
 
 #define SLIME_FLAG_AIR       0x1u
@@ -280,6 +282,7 @@ struct SceneSlimePush {
     SCENE_PTR(SlimeState) state_out;
     SCENE_PTR(SceneInstance) instances;
     SCENE_PTR(float) squash;
+    SCENE_PTR(float) stretch;
     SCENE_PTR(SCENE_U32) face;
     SCENE_PTR(SCENE_U32) grid_count;
     SCENE_PTR(SCENE_U32) grid_items;

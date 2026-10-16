@@ -75,6 +75,7 @@ void cs_main(uint3 tid : SV_DispatchThreadID)
        rows of the pair. The body centre rides at bottom + 0.8*squash*scale,
        matching the VS's local extent. */
     float sq = clamp(s.squash - s.wobble, 0.5f, 1.6f);
+    float st = clamp(s.stretch, 0.7f, 1.6f);
     float cy = s.pos[1] + 0.8f * sq * s.scale;
 
     float hy   = sin(s.yaw * 0.5f);
@@ -94,6 +95,8 @@ void cs_main(uint3 tid : SV_DispatchThreadID)
     pc.instances[bslot + 1u] = inst;
     pc.squash[bslot]         = sq;
     pc.squash[bslot + 1u]    = sq;
+    pc.stretch[bslot]        = st;
+    pc.stretch[bslot + 1u]   = st;
     pc.face[bslot + 1u]      = s.face_id;
 
     pc.state_out[i] = s;

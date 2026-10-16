@@ -704,6 +704,7 @@ static bool slime_build(Scene *scene) {
         s->scale            = 0.9f + frand() * 0.5f;
         s->squash           = 1.0f;
         s->wobble           = 0.0f;
+        s->stretch          = 1.0f;
         s->dwell            = frand() * 2.0f + (float)(i % 16u) * 0.05f;
         s->blink            = 1.5f + frand() * 3.0f;
         s->blink_len        = 0.0f;
@@ -713,7 +714,7 @@ static bool slime_build(Scene *scene) {
         s->face_id          = FACE_HAPPY;
         s->flags            = 0u;
         s->rng              = 0x9E3779B9u ^ (i * 2654435761u + 1u);
-        s->pad[0] = s->pad[1] = 0u;
+        s->pad              = 0u;
 
         SceneInstanceDesc d = {.pos = {s->pos[0], 0.8f * s->scale, s->pos[2]}, .scale = s->scale};
         d.mesh              = g_slimes.body_mesh[i % 3u];

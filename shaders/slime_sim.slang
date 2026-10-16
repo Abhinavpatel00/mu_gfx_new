@@ -35,7 +35,8 @@ void cs_main(uint3 tid : SV_DispatchThreadID)
     uint       rng = s.rng ^ (global_data.frame_count * 747796405u + i * 2891336453u + 1u);
 
     bool  air    = (s.flags & SLIME_FLAG_AIR) != 0u;
-    float squash = 1.0f;
+    float squash = 1.0f;   /* vertical: 1 = rest */
+    float stretch = 1.0f;  /* forward along facing: 1 = rest */
 
     if (air)
     {
@@ -43,11 +44,13 @@ void cs_main(uint3 tid : SV_DispatchThreadID)
         s.pos[0] += s.vel[0] * dt;
         s.pos[1] += s.vel[1] * dt;
         s.pos[2] += s.vel[2] * dt;
+        float hsp = sqrt(s.vel[0] * s.vel[0] + s.vel[2] * s.vel[2]);
         if (s.pos[1] <= 0.0f)
         {
             bool hard = s.vel[1] < -9.0f;
             s.pos[1]  = 0.0f;
-            s.squash  = 0.55f; /* landing pancake */
+            s.squash  = 0.55f; /* landing pancake: short and wide */
+            s.stretch = 1.0f;
             s.flags   = (s.flags & ~(SLIME_FLAG_AIR | SLIME_FLAG_LAND_HARD)) |
                         (hard ? SLIME_FLAG_LAND_HARD : 0u);
             s.land_t  = 0.45f;
@@ -60,7 +63,10 @@ void cs_main(uint3 tid : SV_DispatchThreadID)
         }
         else
         {
-            squash = 1.0f + min(abs(s.vel[1]) * 0.03f, 0.35f); /* fast fall = long slime */
+            /* Fast fall reads as a long drop; horizontal speed reads as a
+               forward lean along the yaw the hop already points down. */
+            squash  = 1.0f + min(abs(s.vel[1]) * 0.03f, 0.35f);
+            stretch = 1.0f + min(hsp * 0.045f, 0.35f);
         }
     }
     else
@@ -88,8 +94,10 @@ void cs_main(uint3 tid : SV_DispatchThreadID)
         }
     }
 
-    /* One fast ease toward the target so the pancake reads as a single impact. */
-    s.squash += (squash - s.squash) * min(dt * 15.0f, 1.0f);
+    /* One fast ease toward the target so the pancake reads as a single impact
+       and the resting shape returns gradually (dt*15 = quick, ~0.1 s). */
+    s.squash  += (squash - s.squash) * min(dt * 15.0f, 1.0f);
+    s.stretch += (stretch - s.stretch) * min(dt * 12.0f, 1.0f);
 
     float dy = s.yaw_tgt - s.yaw;
     while (dy > 3.14159265f) dy -= 6.2831853f;
