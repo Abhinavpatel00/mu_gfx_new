@@ -23,6 +23,6 @@
   "bloom_knee": 0.5,
   "bloom_radius": 1,
   "ssao_strength": 0.96,
-  "toon": true,
+  "toon": false,
   "toon_style": 2
 }

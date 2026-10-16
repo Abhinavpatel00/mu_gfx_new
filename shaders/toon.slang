@@ -202,7 +202,7 @@ float4 fs_main(SceneVOut i) : SV_Target0
         diffuse   = kd * albedo * ramp * lerp(float3(1.0f), shadow, 1.0f - ramp);
         float  sp = pow(ndh, 48.0f);
         specular  = f0 * smoothstep(0.35f, 0.42f, sp) * (1.0f - roughness * 0.7f);
-        rim       = albedo * pow(1.0f - ndv, 4.0f) * 0.6f * (0.4f + 0.6f * ramp);
+        rim       = albedo * pow(1.0f - ndv, 4.0f) * 0.18f * (0.4f + 0.6f * ramp);
         outline   = pow(1.0f - ndv, 5.0f) * 0.45f;
     } else if (style == 1u) {
         /* Soft stylized: four gently smoothed steps, a neutral-warm shadow, a
@@ -213,7 +213,7 @@ float4 fs_main(SceneVOut i) : SV_Target0
         diffuse   = kd * albedo * ramp * lerp(float3(1.0f), shadow, 1.0f - ramp);
         float  sp = pow(ndh, 32.0f);
         specular  = f0 * smoothstep(0.28f, 0.55f, sp) * 0.6f;
-        rim       = env_sky_color() * pow(1.0f - ndv, 2.5f) * (0.4f + 0.4f * ramp) * 0.5f;
+        rim       = env_sky_color() * pow(1.0f - ndv, 2.5f) * (0.4f + 0.4f * ramp) * 0.12f;
     } else {
         /* Painterly: two wide soft steps, a warm shadow, a strong sky-to-ground
            ambient gradient and almost no specular — an illustrated look. */
@@ -223,17 +223,15 @@ float4 fs_main(SceneVOut i) : SV_Target0
         diffuse   = kd * albedo * ramp * lerp(float3(1.0f), shadow, 1.0f - ramp);
         specular  = f0 * pow(ndh, 24.0f) * 0.25f;
         float3 warm = lerp(env_sky_color(), env_sun_radiance(), 0.5f);
-        rim       = warm * pow(1.0f - ndv, 2.0f) * (0.5f + 0.5f * ramp) * 0.6f;
+        rim       = warm * pow(1.0f - ndv, 2.0f) * (0.5f + 0.5f * ramp) * 0.16f;
     }
 
     /* Gel slimes keep their wet albedo-tinted fresnel on top of any style. */
     if ((m.flags & SCENE_MAT_GEL) != 0u)
-        rim += albedo * pow(1.0f - ndv, 3.0f) * 0.8f;
+        rim += albedo * pow(1.0f - ndv, 3.0f) * 0.25f;
 
-    /* The direct diffuse carries the same Lambert 1/pi the PBR path uses, so a
-       cel-shaded surface sits at the same exposure as everything else. Without
-       it the diffuse term is pi times too strong and the whole toon image blows
-       past the bloom threshold and reads as a wash. The bands still read. */
+     /* The band is an irradiance multiplier, so keep the direct term on the same
+         Lambert 1/pi HDR scale as the PBR path instead of adding white light. */
     float3 col = diffuse * LIGHT_INV_PI * sun + ambient + specular * sun * ao + rim;
 
     /* The anime ink darkens the silhouette rather than adding light, so folds
