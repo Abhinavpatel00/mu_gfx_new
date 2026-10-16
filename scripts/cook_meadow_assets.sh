@@ -82,6 +82,6 @@ for a in "${ASSETS[@]}"; do
     continue
   fi
   echo "  cook  $name"
-  "$COOK" "$dir/$model.gltf" -o "assets/$name.mua" --lods "$lods" >/dev/null
+  "$COOK" "$dir/$model.gltf" -o "assets/$name.mua" --lods "${LODS_OVERRIDE:-$lods}" >/dev/null
 done
 echo "cooked ${#ASSETS[@]} assets into assets/"

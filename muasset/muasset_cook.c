@@ -51,7 +51,12 @@
 #define ATTR_STRIDE (ATTR_FLOATS * sizeof(float))
 
 /* Each rung keeps this fraction of the rung above it. */
-#define kTargetError 0.05f /* guard only; see rung_simplify */
+/* Large enough not to bind: meshoptimizer stops at target_index_count and
+   reports the error it actually reached, which is what the runtime's
+   screen-space metric compares against. A small value here stopped the collapse
+   almost immediately, so every rung came out a copy of rung 0 and the runtime
+   paid full detail everywhere. */
+#define kTargetError 1.0e9f
 static const float kLodRatio[MUACOOK_MAX_LODS] = {1.0f, 0.5f, 0.25f, 0.125f};
 
 #define FAIL(...)                                                                                                    \
@@ -219,7 +224,7 @@ static bool rung_simplify(Rung *dst, const Rung *src, uint32_t target_index_coun
     out.idx_count = (uint32_t)meshopt_simplifyWithAttributes(out.idx, src->idx, src->idx_count, src->pos,
                                                              src->vert_count, POS_STRIDE, src->attr, ATTR_STRIDE,
                                                              weights, ATTR_FLOATS, NULL, target_index_count,
-                                                             kTargetError, meshopt_SimplifyLockBorder, &out.error);
+                                                             kTargetError, 0, &out.error);
     if (out.idx_count < 3) {
         rung_free(&out);
         return false;

@@ -1,0 +1,13 @@
+- Falling: stretch slightly along the vertical axis.
+- Landing: squash vertically and expand horizontally.
+- Moving: stretch slightly along the movement direction.
+- Resting: gradually return to the original shape.
+- Colliding with another slime: add a small, damped wobble.
+
+
+
+add sparkles in scene which comes from seperate trasparent pass after opaque pass
+
+
+
+Use a uniform spatial grid instead. Each slime is assigned to a cell based on its position. A slime checks only its own cell and neighboring cells. This is a standard GPU broad-phase collision technique

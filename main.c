@@ -151,6 +151,19 @@ static const Scatter meadow_scatter[] = {
 };
 #define MEADOW_SCATTER_COUNT (sizeof(meadow_scatter) / sizeof(meadow_scatter[0]))
 
+/* Runtime density/extent multiplier (MU_SCENE_SCALE). Scales the planted
+   counts and the terrain grid together, so capacity sizing and placement walk
+   exactly the same numbers; used to profile how the frame scales with size. */
+static float    g_scene_scale = 1.0f;
+static uint32_t scaled_count(uint32_t base) {
+    uint32_t n = (uint32_t)((float)base * g_scene_scale + 0.5f);
+    return n > 0u ? n : 1u;
+}
+static uint32_t meadow_tiles(void) {
+    uint32_t t = (uint32_t)((float)MEADOW_TILES * g_scene_scale + 0.5f);
+    return t > 1u ? t : 1u;
+}
+
 /* Cooked .mua room pieces (see the table above). Node transforms are baked
    into the vertices, so a model is a group of meshes in one space: every mesh
    of a piece gets its own instance at the same transform. */
@@ -196,7 +209,7 @@ static float frange(float lo, float hi) { return lo + (hi - lo) * frand(); }
 
 /* XZ of everything planted with a min_gap, as flat pairs. A few hundred entries
    makes the linear scan cheaper than a grid would cost to build and update. */
-#define MEADOW_PLACED_MAX 1024
+#define MEADOW_PLACED_MAX 8192
 static float    g_placed_xz[MEADOW_PLACED_MAX * 2];
 static uint32_t g_placed_count;
 
@@ -234,10 +247,11 @@ static void plant(Scene *scene, const SceneAssetLoad *ld, float x, float y, floa
 /* The instance total the scene must be created with, derived from the same two
    tables the builder walks so the capacity and the planting cannot disagree. */
 static uint32_t pets_instance_total(const uint32_t asset_meshes[A_COUNT]) {
-    uint32_t total = MEADOW_TILES * MEADOW_TILES * asset_meshes[A_GROUND];
+    uint32_t tiles = meadow_tiles();
+    uint32_t total = tiles * tiles * asset_meshes[A_GROUND];
     for (uint32_t i = 0; i < MEADOW_SCATTER_COUNT; ++i)
-        total += meadow_scatter[i].count * asset_meshes[meadow_scatter[i].asset];
-    return total + MEADOW_PATH_STEPS * asset_meshes[A_ROCKPATH];
+        total += scaled_count(meadow_scatter[i].count) * asset_meshes[meadow_scatter[i].asset];
+    return total + scaled_count(MEADOW_PATH_STEPS) * asset_meshes[A_ROCKPATH];
 }
 
 /* Loads the roster, then plants the clearing.
@@ -269,10 +283,11 @@ static uint32_t pets_build_assets(Scene *scene) {
     /* Ground: one tile per cell at exactly the tile pitch — any other spacing
        opens seams at the joins. Every fifth cell takes the rocky variant, a
        deterministic wear pattern so the same tiles are worn every run. */
-    for (uint32_t z = 0; z < MEADOW_TILES; ++z) {
-        for (uint32_t x = 0; x < MEADOW_TILES; ++x) {
-            float    px    = ((float)x - (float)(MEADOW_TILES - 1) * 0.5f) * MEADOW_TILE_STEP;
-            float    pz    = ((float)z - (float)(MEADOW_TILES - 1) * 0.5f) * MEADOW_TILE_STEP;
+    uint32_t tiles = meadow_tiles();
+    for (uint32_t z = 0; z < tiles; ++z) {
+        for (uint32_t x = 0; x < tiles; ++x) {
+            float    px    = ((float)x - (float)(tiles - 1) * 0.5f) * MEADOW_TILE_STEP;
+            float    pz    = ((float)z - (float)(tiles - 1) * 0.5f) * MEADOW_TILE_STEP;
             uint32_t asset = ((x * 7u + z * 13u) % 5u == 0u) ? A_GROUND_ROCKY : A_GROUND;
             plant(scene, &loads[asset], px, 0.0f, pz, 0.0f, 1.0f);
             planted++;
@@ -284,29 +299,34 @@ static uint32_t pets_build_assets(Scene *scene) {
     for (uint32_t s = 0; s < MEADOW_SCATTER_COUNT; ++s) {
         const Scatter        *sp     = &meadow_scatter[s];
         const SceneAssetLoad *ld     = &loads[sp->asset];
+        uint32_t              want   = scaled_count(sp->count);
+        float                 r_min  = sp->r_min * g_scene_scale;
+        float                 r_max  = sp->r_max * g_scene_scale;
+        float                 gap    = sp->min_gap * g_scene_scale;
         uint32_t              placed = 0;
-        for (uint32_t tries = 0; tries < sp->count * 32u && placed < sp->count; ++tries) {
+        for (uint32_t tries = 0; tries < want * 32u && placed < want; ++tries) {
             float ang = frand() * 6.2831853f;
-            float rad = sqrtf(frange(sp->r_min * sp->r_min, sp->r_max * sp->r_max));
+            float rad = sqrtf(frange(r_min * r_min, r_max * r_max));
             float x   = cosf(ang) * rad;
             float z   = sinf(ang) * rad;
-            if (!meadow_clear(x, z, sp->min_gap))
+            if (!meadow_clear(x, z, gap))
                 continue;
-            if (sp->min_gap > 0.0f)
+            if (gap > 0.0f)
                 meadow_record(x, z);
             plant(scene, ld, x, 0.0f, z, frand() * 6.2831853f, frange(sp->s_min, sp->s_max));
             planted++;
             placed++;
         }
-        if (placed < sp->count)
-            log_info("[pets] %s: placed %u of %u", pets_assets[sp->asset], placed, sp->count);
+        if (placed < want)
+            log_info("[pets] %s: placed %u of %u", pets_assets[sp->asset], placed, want);
     }
 
     /* A worn path from the spawn into the trees, wobbling as it goes. */
-    for (uint32_t i = 0; i < MEADOW_PATH_STEPS; ++i) {
-        float t = (float)i / (float)(MEADOW_PATH_STEPS - 1u);
-        plant(scene, &loads[A_ROCKPATH], sinf(t * 5.0f) * 1.4f, 0.02f, 8.0f - t * 36.0f, t * 3.0f,
-              frange(0.9f, 1.15f));
+    uint32_t path_steps = scaled_count(MEADOW_PATH_STEPS);
+    for (uint32_t i = 0; i < path_steps; ++i) {
+        float t = (float)i / (float)(path_steps - 1u);
+        plant(scene, &loads[A_ROCKPATH], sinf(t * 5.0f) * 1.4f, 0.02f, 8.0f - t * 36.0f * g_scene_scale,
+              t * 3.0f, frange(0.9f, 1.15f));
         planted++;
     }
 
@@ -804,6 +824,14 @@ static void pets_start(void *user, Renderer *renderer) {
     p->vk         = renderer_vk(renderer);
     p->renderer   = renderer;
     p->dist       = 14.0f;
+    {
+        const char *scale = getenv("MU_SCENE_SCALE");
+        if (scale && scale[0]) {
+            float s = strtof(scale, NULL);
+            if (s > 0.0f)
+                g_scene_scale = s;
+        }
+    }
     /* Standing at the clearing's south edge, looking north across it along the
        path, so the first frame already frames the thing the scene is for. */
     p->cam.pos[0] = 0.0f;

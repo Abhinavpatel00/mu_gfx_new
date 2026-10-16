@@ -1613,11 +1613,12 @@ static void perf_dump(const Renderer *r) {
     fprintf(f, "cpu wait (ema)    : %.3f ms\n", wait_ms);
     fprintf(f, "gpu frame         : %.3f ms (avg %.3f ms)\n", gpu_ms, g_gpu_profiler_ui.avg_total_gpu_time_ms);
     fprintf(f, "resolution        : %ux%u\n", r->vk.swapchain.extent.width, r->vk.swapchain.extent.height);
-    fprintf(f, "\n%-28s %10s %10s %10s %10s %12s\n", "pass", "cur(ms)", "avg(ms)", "min(ms)", "max(ms)", "primitives");
+    fprintf(f, "\n%-28s %10s %10s %10s %10s %12s %12s\n", "pass", "cur(ms)", "avg(ms)", "min(ms)", "max(ms)", "verts", "frags");
     for (uint32_t i = 0; i < g_gpu_profiler_ui.pass_count; i++) {
         const GpuPassStats *ps = &g_gpu_profiler_ui.pass_stats[i];
-        fprintf(f, "%-28s %10.3f %10.3f %10.3f %10.3f %12llu\n", ps->name, ps->time_ms, ps->avg_ms, ps->min_ms,
-                ps->max_ms, (unsigned long long)ps->primitives);
+        fprintf(f, "%-28s %10.3f %10.3f %10.3f %10.3f %12llu %12llu\n", ps->name, ps->time_ms, ps->avg_ms,
+                ps->min_ms, ps->max_ms, (unsigned long long)ps->vs_invocations,
+                (unsigned long long)ps->fs_invocations);
     }
     fclose(f);
     fprintf(stderr, "[config] wrote %s\n", PERF_REPORT_PATH);
