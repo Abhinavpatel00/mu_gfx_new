@@ -124,3 +124,34 @@ build_*_push() functions in scene.c.
      they live outside the "upload once" rule.
    - Transient view slabs (§3) are allocated on first use, not at upload:
      scene uploads can happen before scene views finish registering.
+
+7. Frame images (renderer-owned, recreated on resize; one set per frame in flight)
+   -----------------------------------------------------------------------
+   image                written by              read by
+   ------------------   ----------------------  -------------------------------
+   hdr_color[lane]      sky pass, scene draws   SSAO (depth pair), tonemap
+     (HDR, srgb-linear)
+   depth[lane] 1x       opaque route draw;      SSAO, sparkle depth test,
+     (reverse-Z, 0=far)   alpha route (EQUAL      slime_resolve neighbour
+                          when MU_PREZ)           reads, depth resolve source
+   hdr_color_msaa /     MSAA chain only:        opaque route color+depth
+   depth_msaa[lane]     rasterized at samples     resolve TARGETS (created only
+                        by scene/sky draws,      when renderer_scene_sample_
+                        resolves INTO hdr/       count() > 1; renderer_msaa_
+                        depth at opaque end.     apply recreates per toggle;
+                        hdr_color_msaa usage is  vk.h spec = IMG_COLOR only:
+                        IMG_COLOR (Mesa/anv      Mesa rejects MSAA STORAGE)
+                        asserts on MSAA STORAGE)
+   ldr[lane]            tonemap compute (rw)    SMAA edge/weight/blend (raster
+                                                samples it); mirrored in raw
+                                                rows — negated-Y viewport
+                                                (renderer.txt Notes)
+   smsc_final           SMAA blend raster       1:1 vkCmdBlitImage -> swapchain
+   swapchain            pass_ldr_to_swapchain:  present
+                          MSAA-off+SMAA-off:
+                          raster blit_swapchain
+                          (upright); else vkCmd
+                          BlitImage of smaa_final
+   bloom mips, ssao     pass_bloom / compute    tonemap composite
+                          scene chain (1x where noted). Prefab/resources live in
+                          renderer_resources_create (spent_mx → vk resource lists).

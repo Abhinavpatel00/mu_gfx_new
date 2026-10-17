@@ -1,35 +1,32 @@
 == mu_gfx perf report ==
-frames            : 19
-frame time        : 9.179 ms (108.9 fps)
-cpu active (ema)  : 1.690 ms
-cpu wait (ema)    : 4.345 ms
-gpu frame         : 8.820 ms (avg 11.127 ms)
-resolution        : 678x747
+frames            : 3431
+frame time        : 28.169 ms (35.5 fps)
+cpu active (ema)  : 2.858 ms
+cpu wait (ema)    : 24.284 ms
+gpu frame         : 28.503 ms (avg 27.914 ms)
+resolution        : 1362x749
 
 pass                            cur(ms)    avg(ms)    min(ms)    max(ms)        verts        frags
-Sky                               0.203      0.342      0.195      0.503            3            1
-Scene Upload                      0.001      0.054      0.001      0.120            0            0
-Slime Sim                         0.027      0.038      0.026      0.048            0            0
-Slime Grid                        0.010      0.027      0.009      0.049            0            0
-Slime Resolve                     0.081      0.055      0.016      0.100            0            0
-Cull                              0.059      0.119      0.016      0.197            0            0
-Sort Clear                        0.003      0.039      0.003      0.084            0            0
-Sort Hist                         0.030      0.021      0.007      0.041            0            0
-Sort Scan                         0.009      0.048      0.008      0.098            0            0
-Sort Scatter                      0.018      0.019      0.010      0.031            0            0
-Compact Count                     0.029      0.036      0.009      0.046            0            0
-Scan Block                        0.016      0.041      0.016      0.072            0            0
-Scan Blocks                       0.021      0.029      0.020      0.038            0            0
-Emit Draws                        0.010      0.027      0.007      0.048            0            0
-Scatter                           0.044      0.033      0.009      0.052            0            0
-Scene Draw                        1.984      1.075      0.089      2.181       308631       305141
-Scene Draw Alpha                  3.447      3.950      0.036      4.832       712972       429600
-Sparkle                           0.083      2.072      0.083      4.586        49152         3510
-SSAO                              0.558      0.437      0.059      1.585            0            0
-Bloom                             0.315      0.607      0.313      0.947            0            0
-Tonemap                           1.003      0.739      0.374      1.428            0            0
-SMAA Edge                         0.180      0.552      0.151      1.026            3            1
-SMAA Weight                       0.409      0.296      0.096      0.446            3            1
-SMAA Blend                        0.188      0.276      0.147      0.373            3            1
-Blit Swapchain                    0.074      0.140      0.062      0.219            0            0
-Nuklear Render                    0.016      0.045      0.015      0.081          152          168
+Sky                               0.614      0.599      0.156      4.862            3            1
+Scene Upload                      0.002      0.002      0.001      0.076            0            0
+Slime Sim                         0.035      0.035      0.022      1.372            0            0
+Slime Grid                        0.013      0.012      0.008      0.059            0            0
+Slime Resolve                     0.105      0.104      0.013      0.650            0            0
+Cull                              0.061      0.064      0.020      0.308            0            0
+Sort Clear                        0.005      0.005      0.002      0.064            0            0
+Sort Hist                         0.053      0.046      0.004      0.339            0            0
+Sort Scan                         0.012      0.012      0.007      0.071            0            0
+Sort Scatter                      0.035      0.034      0.007      0.221            0            0
+Compact Count                     0.068      0.080      0.007      0.604            0            0
+Scan Block                        0.023      0.022      0.012      0.124            0            0
+Scan Blocks                       0.028      0.028      0.016      0.157            0            0
+Emit Draws                        0.014      0.013      0.004      0.108            0            0
+Scatter                           0.087      0.079      0.007      0.540            0            0
+Scene Draw                       12.793     12.508      0.095     37.363       556912       525944
+Scene Draw Alpha                  9.667      9.452      0.029     63.814      1359807       845116
+Sparkle                           0.128      0.125      0.066      6.055        49152         5686
+SSAO                              1.035      1.025      0.047      6.859            0            0
+Bloom                             0.886      0.874      0.244      5.462            0            0
+Tonemap                           2.443      2.403      0.479     15.291            0            0
+Blit Swapchain                    0.208      0.214      0.133      3.018            3            1
+Nuklear Render                    0.187      0.176      0.085      6.127         5276         3823

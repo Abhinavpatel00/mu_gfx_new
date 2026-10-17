@@ -30,11 +30,23 @@ typedef struct GameHooks {
     void (*start)(void *user, Renderer *renderer); /* once, after the stages exist */
     void (*frame)(void *user, const GameFrame *frame); /* every frame, before the passes */
     /* Every frame after the 2D stage, before post-processing. Record GPU
-       work here (it has the scene color/depth targets). */
-    void (*render)(void *user, VkCommandBuffer cmd, RenderTarget *color, RenderTarget *depth);
+       work here (it has the scene color/depth targets).
+       color/depth: the attachments to draw into — the MSAA working targets
+       when scene MSAA is on, else the final 1x ones.
+       color_resolve/depth_resolve: the 1x targets the last scene pass must
+       resolve into (NULL when MSAA is off). */
+    void (*render)(void *user, VkCommandBuffer cmd, RenderTarget *color, RenderTarget *depth,
+                   RenderTarget *color_resolve, RenderTarget *depth_resolve);
     /* Once at shutdown, after wait_idle and delete-queue drain. */
     void (*shutdown)(void *user);
 } GameHooks;
+
+/* Scene-chain sample count shared by the sky pass, the scene draw pipelines
+   and the resolve attachment wiring. Controlled from the Color Grade window;
+   MU_MSAA env seeds the startup state for headless runs. Same value at
+   pipeline-building sites keeps attachment and pipeline sample counts matched
+   (a mismatch is undefined). */
+uint32_t renderer_scene_sample_count(void);
 
 Renderer *renderer_create(bool use_wayland, GameHooks game);
 void      renderer_destroy(Renderer *renderer);
@@ -48,6 +60,14 @@ struct SpriteSystem *renderer_sprites(Renderer *renderer);
 /* Whether the user has switched the scene to the cel-shaded pipeline in the
    Color Grade window. The app mirrors this onto its own scene each frame. */
 bool renderer_toon(Renderer *renderer);
+
+/* Scene MSAA chain switches in the Color Grade window. renderer_set_msaa only
+   records the request; the swap happens at the start of the next frame (device
+   idle, MSAA targets recreated, msaa_scaled pipelines hot-rebuilt). */
+void renderer_set_msaa(Renderer *renderer, bool on);
+bool renderer_msaa_enabled(void);
+bool renderer_smaa_enabled(Renderer *renderer);
+void renderer_set_smaa(Renderer *renderer, bool on);
 
 /* Feed the renderer this frame's view and projection (column-major, cglm
    layout). The renderer derives view-proj, its inverse, and keeps the previous

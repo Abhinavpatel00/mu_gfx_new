@@ -116,8 +116,14 @@ exact buffer slices it reads/writes (`begin_pass`/`end_pass` + `BufferAccess`),
 so barriers only touch those ranges.
 
 Compute: upload (when dirty) -> slime sim/grid/resolve -> cull -> compaction.
-Graphics: depth prepass (if used) -> scene (PBR **or** toon) -> sky/grass/fire ->
-sparkle -> SSAO -> SMAA -> bloom -> post (exposure/tonemap/grade) -> UI -> present.
+Graphics: sky -> scene (PBR **or** toon) -> sparkle -> SSAO -> SMAA (raster) ->
+bloom -> tonemap compute -> swapchain route -> UI -> present. MSAA is **opt-in
+(default 1x)**: when on, the opaque route rasters at samples into
+`depth_msaa[]/hdr_color_msaa[]`, owns the resolves (color AVERAGE, depth
+SAMPLE_ZERO), and the alpha route draws 1x directly over the resolved targets.
+The alpha pre-Z scheme (depth-only prepass + EQUAL-retest shade, `MU_PREZ`) is
+implemented but DEFAULT OFF — measured a wash/loss because it re-rasterizes the
+whole alpha list (see renderer.txt, Opaque section).
 
 `GlobalData` (in `src/slangtypes.h`, mirrored in the Slang copy) is the per-frame
 constant block every shading path reads: view/proj matrices, `camera_pos/dir`,
@@ -275,6 +281,30 @@ in `update_global_data()`.
     agent PIDs before measuring; take 3+ runs; compare matched rows (cur/avg
     of `Scene Draw`) rather than whole-frame numbers; prefer instruction counts
     (see §10) as a noise-free signal.
+12. **`begin_pass` color-count-0 convention:** a `PassDesc` with
+    `color_count == 0` is a COMPUTE pass (it binds RENDER_PIPELINE_COMPUTE).
+    A depth-only *graphics* pass must set `PassDesc.depth_only = true`, which
+    gives it a rendering scope with zero color attachments instead
+    (vk.c). Otherwise Mesa asserts `pipeline->bind_point == pipelineBindPoint`.
+13. **MSAA + STORAGE images:** Mesa/anv (TGL) asserts when an MSAA attachment
+    is used as a storage image. `hdr_color_msaa` spec = `IMG_COLOR` only;
+    MSAA depth = `IMG_DEPTH` only. Keep it that way through refactors.
+14. **Negated-Y viewport:** `vk_cmd_set_viewport_scissor` rasters with
+    `height = -h` (bottom-up). Anything compute-written sits mirrored in raw
+    rows vs rasterized passes. The SMAA-off swapchain route must therefore
+    RASTERIZE the final blit (shaders/blit_swapchain.slang) instead of blitting
+    the compute tonemap output — never "fix" the negated-Y naively.
+15. **UI is the primary control, env seeds startup state only** (MSAA/SMAA
+    toggles, Color Grade window). Do not auto-disable SMAA when MSAA turns on:
+    both are independent user choices.
+16. **Profiler duplicate-row shape:** the hud's stats rows are keyed by pass
+    slot order, so structurally identical rows appearing twice means the pass
+    is recorded twice per frame. A misplaced `record_scene_draw` drew the
+    opaque list twice for a whole A/B session and skewed everything ~2x.
+    Sanity-check `grep -c "Scene Draw"` in `perf_report.txt`.
+17. `MU_PREZ` default off: drawing the alpha list twice (depth-only prepass)
+    costs about what the EQUAL-retest shading saves, so the plain
+    opaque-clears + late-Z-alpha ordering stays the default.
 
 ---
 
@@ -287,9 +317,12 @@ in `update_global_data()`.
 - **Do not nest GPU_SCOPEs** — the report sums every scope into the frame
   total, so a nested scope double-counts. One scope per pass ("Sky", "Cull",
   "Scene Draw", ...), post passes keep their own ("SSAO", "Bloom", ...).
-- Baseline per-pass budget at 678x747 (iGPU, mid-noise): Scene Draw ~9.5 ms of
-  ~13.7 ms frame; then Tonemap ~1.3, SSAO ~0.8, SMAA ~0.9 total, Bloom ~0.4,
-  rest ~1 ms combined.
+- Baseline per-pass budget at 678x747 (iGPU, MSAA off, MU_FREEZE, 600-frame
+  avg, Oct 2026 state): Scene Draw ~2.6 + Scene Draw Alpha ~4.8 = ~7.5 ms of
+  ~12 ms frame; the rest is post chain (Tonemap ~1.6, SSAO ~0.8-1.5, SMAA ~0.7,
+  Bloom ~0.5, sky ~0.3) + slime/cull/sort compute ~1.5. Noise history: the
+  audio "was" numbers (9.5/13.7) pre-date the SceneVsRow consolidation and the
+  4x alpha shader work.
 
 ### SPIR-V instruction audit (noise-free signal)
 - `spirv-dis` (v2026.4, `/usr/bin/`) disassembles `compiledshaders/*.spv`.
@@ -355,7 +388,14 @@ is the outline, which is a post-process** (NOT geometry extrusion). Key pieces:
   (`post_effect.hpp`) to anti-alias the jaggy lines, `tonemap.frag`.
 - `example.cpp` / `example.hpp` orchestrate the pass chain.
 
-### Status: BROUGHT IN (done)
+### Status: BROUGHT IN, then REMOVED (kept as reference)
+The outline pass shipped (details below), but during the MSAA redesign the
+`outline_data` render target and the second color attachment were dropped
+(scene pipelines are `color_attachment_count = 1` again; `toon_outline`,
+`MU_TOON_OUTLINE`, `r->outline_data[]` no longer exist anywhere). Section kept
+because the plan/reference material and the edge-detect-in-post design notes
+are the natural starting point if outlines come back. What follows describes
+the shipped-and-then-removed implementation:
 Implemented, differing from the plan above in three deliberate ways:
 1. **Data target**: a second color attachment (`r->outline_data[image]`, full-res
    RGBA32F `IMG_COLOR|IMG_SAMPLED`) on the scene/toon draw. Writes the
@@ -382,7 +422,8 @@ Implemented, differing from the plan above in three deliberate ways:
    painterly 0.8 warm ink; PBR scenes get the cel ink), blend-mixed toward ink
    like the reference's compositing pass.
 Plumbing: `GameHooks.render` gained the outline target parameter (renderer.h,
-main.c); `scene_frame(scene, cmd, color, depth, outline_data)`; scene/toon
+main.c); `scene_frame(scene, cmd, color, depth, color_resolve, depth_resolve)`
+— the resolve pair is non-NULL only when the MSAA chain is active; scene/toon
 pipelines are `color_attachment_count = 2` (sparkle stays 1); toggle is
 `post.toon_outline` (UI checkbox "Toon outline", JSON key `toon_outline`, env
 `MU_TOON_OUTLINE`). Runtime-verified headless: 39 frames, ~14.6 ms on the
@@ -406,3 +447,35 @@ mesh and naturally produces interior crease lines.
 - When you finish a task, **update this file** with anything a future agent would
   otherwise have to re-discover (new env knobs, gotchas, feature state).
 - Don't commit unless asked. Don't read screenshots back into context.
+
+---
+
+## 11. Session status (MSAA + pre-Z, know before you start)
+
+- **MSAA chain complete and verified.** Opaque route rasters at chain samples
+  into `depth_msaa[]/hdr_color_msaa[]` and owns the resolves; alpha route is
+  always 1x over the resolved targets (draw_alpha_1x_pipeline /
+  toon_alpha_1x_pipeline). Hot toggle: UI checkbox (Color Grade window) ->
+  `renderer_msaa_apply` (device idle + MSAA rt recreate +
+  `pipeline_rebuild_msaa_samples`,vk.c — mirrors the shader hot-reload path).
+  `GraphicsPipelineConfig.msaa_scaled` marks which pipelines follow the chain;
+  sparkle/alpha-1x/sky-pass-1x things set it false. Validation round-trip
+  on->off->on was clean. At 1362x749 MSAA-on nearly DOUBLES scene cost — that
+  is why the default is 1x.
+- **Alpha pre-Z + EQUAL-retest exists but is default OFF (`MU_PREZ`).** Depth-
+  only prepass (scene_prez.frag/toon_prez.frag, `SCENE_PREZ`, no lighting after
+  the discards) + `draw_alpha_eq_pipeline`/`toon_alpha_eq_pipeline` (compare
+  EQUAL, write on). A/B (600 freeze frames, 678x747, renice): ON 3.3+1.9+2.5 =
+  7.7 vs OFF 2.6+4.8 = 7.4 ms (scene ~430k alpha frags); at ~850k frags ON 16.5
+  vs OFF 14.6. The prepass re-rasterizes the alpha list, burning what the
+  retest saves. Sweep target for a later agent: make the pre-Z draw only the
+  NEAREST slice of alpha geometry (bucketed by sort depth) or fold the leaf
+  depth into the existing depth sort instead of a whole extra pass.
+- Where spend of perf work made sense (current known wins already in): 1x
+  alpha route under MSAA, pow expansions (still), SceneVsRow consolidation,
+  route split, depth sort sweep, sky MSAA scaling. Remaining visible targets:
+  alpha-pass raster volume (grass LOD / min-size cull in cs_cull), tonemap
+  ILP (16x16 1px/thread compute at ~1.6 ms), SMAA weight pass.
+- Shader hot-reload + MSAA pipeline rebuilds coexist; both use the delete
+  queue. dmon watch triggers `pipeline_mark_dirty`; MSAA rebuild path is
+  `pipeline_rebuild_msaa_samples`.

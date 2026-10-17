@@ -23,13 +23,6 @@
 enum {
     A_GROUND,
     A_GROUND_ROCKY,
-    A_TREE_COMMON_A,
-    A_TREE_COMMON_B,
-    A_TREE_COMMON_C,
-    A_PINE_A,
-    A_PINE_B,
-    A_TREE_TWISTED_A,
-    A_TREE_TWISTED_B,
     A_TREE_BIRCH_A,
     A_TREE_BIRCH_B,
     A_TREE_OAK_A,
@@ -57,13 +50,6 @@ enum {
 static const char *const pets_assets[A_COUNT] = {
     [A_GROUND]         = "assets/md_ground.mua",
     [A_GROUND_ROCKY]   = "assets/md_ground_rocky.mua",
-    [A_TREE_COMMON_A]  = "assets/md_tree_common_a.mua",
-    [A_TREE_COMMON_B]  = "assets/md_tree_common_b.mua",
-    [A_TREE_COMMON_C]  = "assets/md_tree_common_c.mua",
-    [A_PINE_A]         = "assets/md_pine_a.mua",
-    [A_PINE_B]         = "assets/md_pine_b.mua",
-    [A_TREE_TWISTED_A] = "assets/md_tree_twisted_a.mua",
-    [A_TREE_TWISTED_B] = "assets/md_tree_twisted_b.mua",
     [A_TREE_BIRCH_A]   = "assets/md_tree_birch_a.mua",
     [A_TREE_BIRCH_B]   = "assets/md_tree_birch_b.mua",
     [A_TREE_OAK_A]     = "assets/md_tree_oak_a.mua",
@@ -121,19 +107,11 @@ typedef struct Scatter {
    underbrush that must stand clear of their trunks. Counts are per 32 m chunk,
    so a window's density is fixed regardless of how far the player travels. */
 static const Scatter chunk_scatter[] = {
-    /* --- trees ------------------------------------------------------------- */
-    {A_TREE_COMMON_A, 2, 2.0f, 20.0f, 0.85f, 1.30f, 6.5f},
-    {A_TREE_COMMON_B, 2, 2.0f, 20.0f, 0.85f, 1.30f, 6.5f},
-    {A_TREE_COMMON_C, 2, 2.0f, 20.0f, 0.80f, 1.25f, 6.5f},
-    {A_PINE_A, 2, 2.0f, 21.0f, 0.85f, 1.35f, 6.0f},
-    {A_PINE_B, 2, 2.0f, 21.0f, 0.85f, 1.35f, 6.0f},
+    /* --- trees: low poly only (single-mesh KayKit fillers, <=1k tris) ------- */
     {A_TREE_BIRCH_A, 2, 2.0f, 20.0f, 0.90f, 1.35f, 5.5f},
     {A_TREE_BIRCH_B, 2, 2.0f, 20.0f, 0.90f, 1.35f, 5.5f},
     {A_TREE_OAK_A, 2, 2.0f, 20.0f, 0.90f, 1.30f, 6.0f},
     {A_TREE_OAK_B, 2, 2.0f, 20.0f, 0.90f, 1.30f, 6.0f},
-    /* The twisted pair are the ancients: large, rare, off in the corners. */
-    {A_TREE_TWISTED_A, 1, 10.0f, 20.0f, 0.50f, 0.75f, 12.0f},
-    {A_TREE_TWISTED_B, 1, 10.0f, 20.0f, 0.50f, 0.75f, 12.0f},
     {A_TREE_BARE_A, 1, 4.0f, 20.0f, 1.05f, 1.55f, 8.0f},
     /* --- rocks ------------------------------------------------------------- */
     {A_ROCK_A, 1, 2.0f, 20.0f, 0.70f, 1.20f, 5.0f},
@@ -183,6 +161,9 @@ typedef struct FlyCam {
     float pitch;
     float speed;
     float dt;
+    float vel_y;   /* vertical velocity (first-person gravity) */
+    bool  on_ground;
+    bool  fps_mode;
 } FlyCam;
 
 typedef struct CubePets {
@@ -245,18 +226,11 @@ static uint32_t              g_obstacle_count;
 
 static float obstacle_radius(uint32_t asset) {
     switch (asset) {
-    case A_TREE_COMMON_A:
-    case A_TREE_COMMON_B:
-    case A_TREE_COMMON_C:
-    case A_PINE_A:
-    case A_PINE_B:
     case A_TREE_BIRCH_A:
     case A_TREE_BIRCH_B:
     case A_TREE_OAK_A:
     case A_TREE_OAK_B:
         return 0.55f;
-    case A_TREE_TWISTED_A:
-    case A_TREE_TWISTED_B:
     case A_TREE_BARE_A:
         return 0.80f;
     case A_ROCK_A:
@@ -822,9 +796,18 @@ static void pets_start(void *user, Renderer *renderer) {
     }
     /* Standing at the clearing's south edge, looking north across it along the
        path, so the first frame already frames the thing the scene is for. */
-    p->cam.pos[0] = 0.0f;
-    p->cam.pos[1] = 2.6f;
-    p->cam.pos[2] = 14.0f;
+    p->cam.fps_mode = getenv("MU_FPS") != NULL;
+    if (p->cam.fps_mode) {
+        p->cam.pos[0] = 0.0f;
+        p->cam.pos[1] = 1.7f;
+        p->cam.pos[2] = 14.0f;
+        p->cam.vel_y  = 0.0f;
+        p->cam.on_ground = true;
+    } else {
+        p->cam.pos[0] = 0.0f;
+        p->cam.pos[1] = 2.6f;
+        p->cam.pos[2] = 14.0f;
+    }
     p->cam.yaw    = 0.0f;
     p->cam.pitch  = -0.10f;
     p->cam.speed  = 8.0f;
@@ -850,6 +833,61 @@ static void flycam_update(FlyCam *c, const Input *in, float dt) {
     if (dt > 0.1f)
         dt = 0.1f;
     c->dt = dt;
+
+    if (c->fps_mode) {
+        /* First-person: always look, horizontal movement, gravity + jump. */
+        c->yaw -= (float)mouse_dx(in) * 0.0025f;
+        c->pitch -= (float)mouse_dy(in) * 0.0025f;
+        c->pitch = CLAMP(c->pitch, -1.5533f, 1.5533f);
+
+        float cy = cosf(c->pitch), sy = sinf(c->pitch);
+        vec3 fwd, right, up;
+        fwd[0]   = sinf(c->yaw); /* horizontal forward */
+        fwd[1]   = 0.0f;
+        fwd[2]   = -cosf(c->yaw);
+        right[0] = cosf(c->yaw);
+        right[1] = 0.0f;
+        right[2] = sinf(c->yaw);
+        up[0]    = 0.0f;
+        up[1]    = 1.0f;
+        up[2]    = 0.0f;
+
+        float boost = key_down(in, KEY_LEFT_SHIFT) ? 1.6f : 1.0f;
+        float move = 0.0f, strafe = 0.0f;
+        if (key_down(in, KEY_W) || key_down(in, KEY_UP))    move += 1.0f;
+        if (key_down(in, KEY_S) || key_down(in, KEY_DOWN))  move -= 1.0f;
+        if (key_down(in, KEY_D) || key_down(in, KEY_RIGHT)) strafe += 1.0f;
+        if (key_down(in, KEY_A) || key_down(in, KEY_LEFT))  strafe -= 1.0f;
+
+        float speed = 6.0f * boost;
+        c->pos[0] += (fwd[0] * move + right[0] * strafe) * speed * dt;
+        c->pos[2] += (fwd[2] * move + right[2] * strafe) * speed * dt;
+
+        /* gravity */
+        c->vel_y -= 9.81f * dt;
+        c->pos[1] += c->vel_y * dt;
+        if (c->pos[1] <= 1.7f) {
+            c->pos[1] = 1.7f;
+            c->vel_y = 0.0f;
+            c->on_ground = true;
+        } else {
+            c->on_ground = false;
+        }
+        if (key_pressed(in, KEY_SPACE) && c->on_ground) {
+            c->vel_y = 5.0f;
+            c->on_ground = false;
+        }
+
+        /* derive view basis for camera (pitch affects look only) */
+        vec3 vfwd;
+        vfwd[0] = cosf(c->pitch) * sinf(c->yaw);
+        vfwd[1] = sinf(c->pitch);
+        vfwd[2] = -cosf(c->pitch) * cosf(c->yaw);
+        glm_vec3_copy(vfwd, c->forward);
+        glm_vec3_copy(right, c->right);
+        glm_vec3_copy(up, c->up);
+        return;
+    }
 
     if (mouse_down(in, MOUSE_RIGHT)) {
         c->yaw -= (float)mouse_dx(in) * 0.0025f;
@@ -905,6 +943,14 @@ static void pets_frame(void *user, const GameFrame *frame) {
     else
         p->dt = frame->dt;
 
+    if (key_pressed(frame->input, KEY_F)) {
+        p->cam.fps_mode = !p->cam.fps_mode;
+        p->cam.vel_y = 0.0f;
+        p->cam.on_ground = true;
+        if (p->cam.fps_mode)
+            p->cam.pos[1] = 1.7f;
+        log_info("[mode] %s", p->cam.fps_mode ? "first-person" : "flycam");
+    }
     flycam_update(&p->cam, frame->input, frame->dt);
 
     /* The slime crowd is simulated entirely on the GPU in scene_frame, so there
@@ -987,7 +1033,8 @@ static void pets_frame(void *user, const GameFrame *frame) {
 
 /* GameHooks.render: lazy-init (needs a command buffer for upload + the pass
    formats for the pipeline), then set the view and record the scene. */
-static void pets_render(void *user, VkCommandBuffer cmd, RenderTarget *color, RenderTarget *depth) {
+static void pets_render(void *user, VkCommandBuffer cmd, RenderTarget *color, RenderTarget *depth,
+                        RenderTarget *color_resolve, RenderTarget *depth_resolve) {
     CubePets *p = (CubePets *)user;
 
     /* The Color Grade window owns the toon switch; mirror it onto the scene. */
@@ -1139,7 +1186,7 @@ static void pets_render(void *user, VkCommandBuffer cmd, RenderTarget *color, Re
     vd.far_z         = 400.0f;
     scene_view_set(p->scene, 0, &vd);
 
-    scene_frame(p->scene, cmd, color, depth);
+    scene_frame(p->scene, cmd, color, depth, color_resolve, depth_resolve);
 }
 
 static void pets_shutdown(void *user) {

@@ -81,14 +81,38 @@ Opaque (route split, both passes share ONE indirect structure)
                                    EARLY-Z on — depth-failed fragments die before the
                                    FS (this recovered ~25% of frame shading time)
                                  depth: reverse-Z, LOAD_CLEAR 0.0, STORE_KEEP
+
+    MSAA chain (samples > 1): the opaque pass rasters at the chain sample count
+    into depth_msaa[]/hdr_color_msaa[] and OWNS the resolves (color AVERAGE,
+    depth SAMPLE_ZERO) at its end. Depth LOAD_CLEAR as above.
+
     Draw alpha-test groups       record_scene_draw "Scene Draw Alpha"  (split only)
                                  vkCmdDrawIndexedIndirectCount draws_alpha[] /
                                  draw_count_alpha[]
-                                 pipeline: draw_pipeline (or toon_pipeline) — the
-                                   original FS WITH the discards; late-Z by necessity
+                                 MSAA on: draw_alpha_1x_pipeline / toon_alpha_1x_pipeline
+                                   — the 1x alpha-test route draws straight onto the
+                                   RESOLVED HDR/depth, so grass shading costs once
+                                   per PIXEL, not 4x per covered sample (always
+                                   created, msaa_scaled=false, sample 1)
+                                 MSAA off (default 1x chain): draw_pipeline / toon_pipeline,
+                                   the original FS WITH the discards; late-Z by necessity
                                  depth: LOAD_KEEP / STORE_KEEP (occluders final first)
     MU_NO_SPLIT=1 falls back to one combined pass reading draws[] on the original
     pipeline (the pre-split behaviour), for A/B timing.
+
+    Alpha pre-Z scheme (MU_PREZ, default OFF — measured a wash at 678p and
+    loses as the scene grows because it re-rasterises the whole alpha list):
+    1. "Scene PreZ Alpha" — depth-only pass (color writes off, real discard FS:
+       scene_prez.frag / toon_prez.frag via SCENE_PREZ — no lighting after the
+       alpha test, depth write is the entire output), LOAD_CLEAR, depth write on.
+    2. "Scene Draw" — opaque early-Z route over the seeded depth (LOAD_KEEP:
+       leaf geometry now rejects opaque fragments behind it).
+    3. "Scene Draw Alpha" — EQUAL-retest pipeline (draw_alpha_eq_pipeline /
+       toon_alpha_eq_pipeline, depth compare EQUAL, write on): re-shades only
+       texels that survive against the pre-Z depth, pruning leaf-on-leaf
+       overdraw. VK: PassDesc.depth_only = true makes begin_pass take a
+       graphics rendering path with zero color attachments (color_count == 0
+       otherwise means compute).
 
 Transparent
     Draw sparkles additive       scene frame T5b vkCmdDraw(6, slime_count * sparkles_per_slime)
@@ -123,9 +147,25 @@ Notes
   survivors INSIDE each group's slot range (cs_count histograms groups either
   way), so any combination is valid.
 * Env knobs: MU_NO_SORT (skip T2.5), MU_NO_SPLIT (one early-Z-naive draw pass),
+  MU_PREZ (alpha depth-only prepass + EQUAL-retest scheme, default off),
+  MU_MSAA (startup MSAA 4x; MSAA is opt-in — the Color Grade UI checkboxes are
+  the primary control, env only seeds startup state), MU_NO_SMAA,
   MU_SPARKLES=N (0 disables), MU_TOON (pipeline swap), MU_TOON_STYLE,
   MU_FREEZE_TIME (deterministic frames), MU_RES=WxH, MU_PERF=N (headless dump),
   MU_SHOT=N (screenshot after N frames, keeps running).
+* Hot MSAA toggle: GraphicsPipelineConfig.msaa_scaled flags sky + the 4 scene
+  draw pipelines; pipeline_rebuild_msaa_samples retires and rebuilds them at the
+  chain's new sample count; renderer_msaa_apply (device idle) destroys/recreates
+  the MSAA rt pair and flips g_msaa_samples. Sparkle and the 1x alpha routes set
+  msaa_scaled=false so they never follow the rebuild.
+* Negated-Y viewport warning: vk_cmd_set_viewport_scissor rasters with a
+  negated Y viewport (bottom-up). Compute-written targets are mirrored in raw
+  rows vs rasterized ones. The SMAA-off swapchain route therefore RASTERIZES
+  ldr into the swapchain (shaders/blit_swapchain.slang via
+  EnginePipelines.swapchain_blit) instead of vkCmdBlitImage'ing the compute
+  tonemap output — blitting it showed the scene upside-down. SMAA-on keeps the
+  1:1 blit of smaa_final (it re-rasterizes, so it is upright). Do not "fix" the
+  negated-Y naively: every rasterized pass in the chain assumes it.
 * SPVs are read from compiledshaders/ at pipeline creation; editing a shared
   header (scene_shared.h) does NOT touch their mtimes — rm *.spv before
   measuring anything (agentcontext §7.8).

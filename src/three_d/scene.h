@@ -171,7 +171,13 @@ void scene_set_clear(Scene *s, const float rgba[4]);
 
 /* Record one frame: dirty upload, cull, compact, draw. Opens and closes its own
    graphics pass into color/depth. */
-void scene_frame(Scene *s, VkCommandBuffer cmd, RenderTarget *color, RenderTarget *depth);
+/* One scene frame: slime state advance (view 0), cull + sort + route-split
+   compaction and the two draw passes per view.
+   color/depth: draw targets (the MSAA working targets when MSAA is on).
+   color_resolve/depth_resolve: the 1x targets the LAST scene pass resolves
+   into (NULL when MSAA is off or the 1x chain is disabled). */
+void scene_frame(Scene *s, VkCommandBuffer cmd, RenderTarget *color, RenderTarget *depth,
+                 RenderTarget *color_resolve, RenderTarget *depth_resolve);
 
 /* GPU truth, lag-2; false until the first sample is available. */
 bool scene_counters(const Scene *s, SceneCounters *out);

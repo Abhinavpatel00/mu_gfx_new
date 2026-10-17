@@ -352,6 +352,13 @@ struct Renderer {
     NuklearUi          ui;
     RenderTarget       depth[MAX_SWAPCHAIN_IMAGES];
     RenderTarget       hdr_color[MAX_SWAPCHAIN_IMAGES];
+    /* MSAA working targets for the 3D scene chain: the opaque route draws
+       into these and resolves into hdr_color/depth in the same pass, then the
+       alpha route rasterizes 1x straight onto the resolved results. Sparkle
+       and the post chain stay single-sample. The MSAA targets only exist with
+       MSAA enabled (Color Grade checkbox / MU_MSAA env). */
+    RenderTarget       depth_msaa[MAX_SWAPCHAIN_IMAGES];
+    RenderTarget       hdr_color_msaa[MAX_SWAPCHAIN_IMAGES];
     RenderTarget       ldr_color[MAX_SWAPCHAIN_IMAGES];
     RenderTarget       smaa_final[MAX_SWAPCHAIN_IMAGES];
     RenderTarget       smaa_edges[MAX_SWAPCHAIN_IMAGES];
@@ -374,6 +381,8 @@ struct Renderer {
     mat4      cam_prev_viewproj;
     bool      debug_ui_open;
     bool      show_gpu_text; /* GPU profiler text overlay (text.slang), F1 */
+    bool      smaa_enabled;  /* SMAA edge pass + blend over the tonemapped LDR */
+    bool      smaa_unused_pad;
     TextureID dummy_texture;
     TextureID smaa_area_tex;
     TextureID smaa_search_tex;
@@ -403,6 +412,7 @@ struct Renderer {
         uint32_t bloom;
         uint32_t ssao;
         uint32_t text;
+        uint32_t swapchain_blit;
     } EnginePipelines;
 };
 
@@ -709,7 +719,7 @@ static void capture_record(Renderer *r, VkCommandBuffer cmd) {
         return;
 
     uint32_t image = r->vk.swapchain.current_image;
-    VkImage  src   = r->vk.swapchain.images[image];
+    VkImage  src = r->vk.swapchain.images[image];
 
     ImageState           *st          = &r->vk.swapchain.states[image];
     VkImageLayout         prev_layout = st->layout;
@@ -1011,6 +1021,80 @@ static void create_identity_lut(Renderer *r) {
     free(px);
 }
 
+/* Scene MSAA chain state lives in the Color Grade window; the checkbox is the
+   primary control. Env vars only seed the startup state for headless A/B runs:
+   MU_MSAA=1 starts with 4x, no env means 1x. The toggle happens at the next
+   frame start (device idle, MSAA targets recreated, msaa_scaled pipelines
+   hot-rebuilt), exactly like the shader hot-reload path. */
+static uint32_t g_msaa_samples = 1u;
+static int32_t  g_msaa_wanted  = -1; /* -1 = no pending toggle */
+
+/* Destroy + recreate the MSAA working targets and hot-rebuild every
+   msaa_scaled pipeline (sky + scene draws; sparkles/post/SMAA stay 1x).
+   Mirrors the swapchain-recreate flow: idle the device first so no frame in
+   flight still references the old images. */
+static void renderer_msaa_apply(Renderer *r, uint32_t samples) {
+    assert(samples == 1u || samples == 4u);
+    vkDeviceWaitIdle(r->vk.devc.device);
+
+    forEach(i, MAX_SWAPCHAIN_IMAGES) {
+        if (r->depth_msaa[i].image)
+            rt_destroy(&r->vk, &r->depth_msaa[i]);
+        if (r->hdr_color_msaa[i].image)
+            rt_destroy(&r->vk, &r->hdr_color_msaa[i]);
+    }
+    if (samples > 1u) {
+        RenderTargetSpec depth_msaa_spec = {
+            .width      = r->vk.swapchain.extent.width,
+            .height     = r->vk.swapchain.extent.height,
+            .layers     = 1,
+            .format     = r->depth[0].format,
+            .usage      = IMG_DEPTH,
+            .aspect     = VK_IMAGE_ASPECT_DEPTH_BIT,
+            .mip_count  = 1,
+            .samples    = samples,
+            .debug_name = "depth_buffer_msaa",
+        };
+        RenderTargetSpec hdr_msaa_spec = {
+            .width      = r->vk.swapchain.extent.width,
+            .height     = r->vk.swapchain.extent.height,
+            .layers     = 1,
+            .format     = r->hdr_color[0].format,
+            .usage      = IMG_COLOR, /* no STORAGE: Mesa/anv rejects it on MSAA */
+            .mip_count  = 1,
+            .samples    = samples,
+            .debug_name = "hdr_color_msaa",
+        };
+        forEach(i, r->vk.swapchain.image_count) {
+            rt_create(&r->vk, &r->depth_msaa[i], &depth_msaa_spec);
+            rt_create(&r->vk, &r->hdr_color_msaa[i], &hdr_msaa_spec);
+        }
+    }
+
+    pipeline_rebuild_msaa_samples(&r->vk, samples);
+    g_msaa_samples = samples;
+    fprintf(stderr, "[msaa] scene chain %ux\n", samples);
+}
+
+uint32_t renderer_scene_sample_count(void) {
+    static bool seeded = false;
+    if (!seeded) {
+        seeded        = true;
+        g_msaa_samples = getenv("MU_MSAA") != NULL ? 4u : 1u;
+    }
+    return g_msaa_samples;
+}
+
+void renderer_set_msaa(Renderer *renderer, bool on) {
+    if (!renderer)
+        return;
+    g_msaa_wanted = on ? 1 : 0;
+}
+
+bool renderer_msaa_enabled(void) {
+    return renderer_scene_sample_count() > 1u;
+}
+
 static void renderer_resources_create(Renderer *r, VkBackendDesc *desc) {
     MemTag   prev         = vk_mem_set_tag(&r->vk, MEM_TAG_POST);
     VkFormat depth_format = pick_depth_format(r->vk.devc.physical_device);
@@ -1029,6 +1113,11 @@ static void renderer_resources_create(Renderer *r, VkBackendDesc *desc) {
 
                                    .mip_count  = 1,
                                    .debug_name = "depth_buffer"};
+
+    RenderTargetSpec depth_msaa_spec = depth_spec;
+    depth_msaa_spec.samples          = renderer_scene_sample_count();
+    depth_msaa_spec.usage            = IMG_DEPTH; /* resolve target is the 1x sampled copy */
+    depth_msaa_spec.debug_name       = "depth_buffer_msaa";
     RenderTargetSpec hdr_spec   = {.width      = r->vk.swapchain.extent.width,
                                    .height     = r->vk.swapchain.extent.height,
                                    .layers     = 1,
@@ -1037,6 +1126,12 @@ static void renderer_resources_create(Renderer *r, VkBackendDesc *desc) {
                                                  IMG_SAMPLED,
                                    .mip_count  = 1,
                                    .debug_name = "hdr_color"};
+    RenderTargetSpec hdr_msaa_spec = hdr_spec;
+    /* MSAA color re-derives from hdr_spec but Mesa/anv refuses STORAGE on multisampled
+       images (aux-surface assert), and nothing samples it: color attachment only. */
+    hdr_msaa_spec.usage      = IMG_COLOR;
+    hdr_msaa_spec.samples    = renderer_scene_sample_count();
+    hdr_msaa_spec.debug_name = "hdr_color_msaa";
     RenderTargetSpec ldr_spec   = {.width  = r->vk.swapchain.extent.width,
                                    .height = r->vk.swapchain.extent.height,
                                    .layers = 1,
@@ -1202,6 +1297,10 @@ static void renderer_resources_create(Renderer *r, VkBackendDesc *desc) {
     forEach(i, r->vk.swapchain.image_count) {
         rt_create(&r->vk, &r->depth[i], &depth_spec);
         rt_create(&r->vk, &r->hdr_color[i], &hdr_spec);
+        if (renderer_scene_sample_count() > 1u) {
+            rt_create(&r->vk, &r->depth_msaa[i], &depth_msaa_spec);
+            rt_create(&r->vk, &r->hdr_color_msaa[i], &hdr_msaa_spec);
+        }
         rt_create(&r->vk, &r->ldr_color[i], &ldr_spec);
         rt_create(&r->vk, &r->smaa_final[i], &smaa_final_spec);
 
@@ -1351,11 +1450,24 @@ static void renderer_resources_create(Renderer *r, VkBackendDesc *desc) {
         r->EnginePipelines.ssao  = pipeline_create_compute(&r->vk, "compiledshaders/ssao.comp.spv");
         r->EnginePipelines.text  = pipeline_create_compute(&r->vk, "compiledshaders/text.comp.spv");
 
+        /* Raster copy of the tonemapped LDR into the swapchain for SMAA-off
+           runs; the negated-Y viewport restores the upright rows here. */
+        {
+            GraphicsPipelineConfig cfg = pipeline_config_fullscreen();
+            cfg.vert_path                 = "compiledshaders/blit_swapchain.vert.spv";
+            cfg.frag_path                 = "compiledshaders/blit_swapchain.frag.spv";
+            cfg.color_formats             = &r->vk.swapchain.format;
+            cfg.rasterization_samples     = VK_SAMPLE_COUNT_1_BIT;
+            r->EnginePipelines.swapchain_blit = pipeline_create_graphics(&r->vk, &cfg);
+        }
+
         {
             GraphicsPipelineConfig cfg = pipeline_config_fullscreen();
             cfg.vert_path              = "compiledshaders/sky.vert.spv";
             cfg.frag_path              = "compiledshaders/sky.frag.spv";
             cfg.color_formats          = &r->hdr_color[0].format;
+            cfg.rasterization_samples  = (VkSampleCountFlagBits)renderer_scene_sample_count();
+            cfg.msaa_scaled            = true;
             r->EnginePipelines.sky     = pipeline_create_graphics(&r->vk, &cfg);
         }
     }
@@ -1446,6 +1558,7 @@ Renderer *renderer_create(bool use_wayland, GameHooks game) {
     memset(r, 0, sizeof(*r)); // zero-value = safe defaults everywhere
     r->game = game;
     r->show_gpu_text = true; /* F1 toggles the GPU profiler text overlay */
+    r->smaa_enabled  = getenv("MU_NO_SMAA") == NULL; /* MU_NO_SMAA seeds the startup state only */
     /* MU_RES=WxH overrides the window size, so headless runs can measure the
        per-pixel passes at a target resolution instead of the 1362x749 default. */
     {
@@ -1495,7 +1608,7 @@ Renderer *renderer_create(bool use_wayland, GameHooks game) {
     return r;
 }
 #define GPU_PROF_HISTORY_SIZE 128
-#define MAX_RECORDED_PASSES   32
+#define MAX_RECORDED_PASSES   128 /* == GPU_PROF_MAX_SCOPES: list every pass, not the first 32 */
 
 typedef struct GpuPassStats {
     char     name[64];
@@ -1672,6 +1785,11 @@ static MU_INLINE bool frame_start(Renderer *r) {
         forEach(i, r->vk.swapchain.image_count) {
             rt_resize(&r->vk, &r->depth[i], fb_w, fb_h);
             rt_resize(&r->vk, &r->hdr_color[i], fb_w, fb_h);
+            /* The MSAA pair only exists while the scene chain samples > 1. */
+            if (r->depth_msaa[i].image) {
+                rt_resize(&r->vk, &r->depth_msaa[i], fb_w, fb_h);
+                rt_resize(&r->vk, &r->hdr_color_msaa[i], fb_w, fb_h);
+            }
 
             rt_resize(&r->vk, &r->ldr_color[i], fb_w, fb_h);
 
@@ -1687,6 +1805,15 @@ static MU_INLINE bool frame_start(Renderer *r) {
         r->vk.swapchain.needs_recreate = false;
         TracyCZoneEnd(ctx);
         return false;
+    }
+
+    /* MSAA toggle from the Color Grade window: apply after any swapchain
+       recreate so the rebuilt targets are created at the final size. */
+    if (g_msaa_wanted >= 0) {
+        uint32_t want = g_msaa_wanted ? 4u : 1u;
+        if (want != g_msaa_samples)
+            renderer_msaa_apply(r, want);
+        g_msaa_wanted = -1;
     }
 
     uint64_t wait_start  = mu_time_now();
@@ -1782,6 +1909,8 @@ PUSH_CONSTANT(EdgePush, uint32_t texture_id; uint32_t sampler_id;);
 PUSH_CONSTANT(BlendPush, uint32_t color_tex; uint32_t weight_tex; uint32_t sampler_id; uint32_t pad;);
 
 PUSH_CONSTANT(WeightPush, uint32_t edge_tex; uint32_t area_tex; uint32_t search_tex; uint32_t sampler_id;);
+
+PUSH_CONSTANT(SwapchainBlitPush, uint32_t texture_id; uint32_t sampler_id;);
 
 #include "src/nuklear_profiler.inl"
 
@@ -2054,7 +2183,9 @@ typedef struct TextPush {
     uint32_t data[28];   /* 112 chars, one byte each */
 } TextPush;
 
-#define GPU_TEXT_MAX_LINES 10
+/* All profiler scopes, not just the first few: the scene now runs cull, sort,
+   compact, two draw passes and the slime chain before post even starts. */
+#define GPU_TEXT_MAX_LINES 48
 #define GPU_TEXT_MAX_CHARS 112
 #define GPU_TEXT_SCALE     2
 
@@ -2123,11 +2254,36 @@ static void pass_text_overlay(Renderer *r, VkCommandBuffer cmd) {
 
 static void pass_ldr_to_swapchain(Renderer *r, VkCommandBuffer cmd) {
     GpuProfiler *frame_prof = &r->vk.gpuprofiler[r->vk.current_frame];
+
+    if (!r->smaa_enabled) {
+        /* Raster route: the tonemapped LDR sits mirrored in raw rows because
+           the negated-Y viewport is not seen by the tonemap's compute store,
+           so a plain 1:1 blit of it arrives on the screen upside down. The
+           same fullscreen-raster convention the SMAA chain uses applies the
+           viewport flip once against the mirrored store and reads upright. */
+        uint32_t     image = r->vk.swapchain.current_image;
+        PassAttachment color = {.swapchain_view = r->vk.swapchain.image_views[image],
+                                .load           = LOAD_KEEP,
+                                .store          = STORE_KEEP};
+        PassDesc pd = {.colors = &color, .color_count = 1, .pipeline = r->EnginePipelines.swapchain_blit};
+        GPU_SCOPE(frame_prof, cmd, "Blit Swapchain", STAGE_COLOR) {
+            begin_pass(&r->vk, cmd, &pd);
+            SwapchainBlitPush push = {
+                .texture_id = r->ldr_color[image].bindless_index,
+                .sampler_id = r->vk.default_samplers.samplers[SAMPLER_LINEAR_CLAMP],
+            };
+            cmd_draw(&r->vk, cmd, BYTE_SPAN(push), 3, 1);
+            end_pass(&r->vk, cmd, &pd);
+        }
+        return;
+    }
+
+    /* With SMAA active the blended result is the final LDR color. */
+    RenderTarget *src = &r->smaa_final[r->vk.swapchain.current_image];
     GPU_SCOPE(frame_prof, cmd, "Blit Swapchain", STAGE_XFER) {
         uint32_t image = r->vk.swapchain.current_image;
 
-        rt_transition_all(&r->vk, cmd, &r->smaa_final[image], LAYOUT_XFER_SRC,
-                          STAGE_XFER, ACCESS_XFER_R);
+        rt_transition_all(&r->vk, cmd, src, LAYOUT_XFER_SRC, STAGE_XFER, ACCESS_XFER_R);
 
         image_transition_swapchain(&r->vk, cmd, &r->vk.swapchain, LAYOUT_XFER_DST,
                                    STAGE_XFER, ACCESS_XFER_W);
@@ -2164,9 +2320,10 @@ static void pass_ldr_to_swapchain(Renderer *r, VkCommandBuffer cmd) {
                 },
         };
 
-        vkCmdBlitImage(cmd, r->smaa_final[image].image, LAYOUT_XFER_SRC,
+        vkCmdBlitImage(cmd, src->image, LAYOUT_XFER_SRC,
                        r->vk.swapchain.images[image], LAYOUT_XFER_DST, 1, &blit,
                        VK_FILTER_NEAREST);
+
     }
 }
 
@@ -2379,6 +2536,13 @@ VkBackend *renderer_vk(Renderer *r) { return &r->vk; }
 
 bool renderer_toon(Renderer *r) { return r ? r->post.toon : false; }
 
+bool renderer_smaa_enabled(Renderer *r) { return r ? r->smaa_enabled : false; }
+
+void renderer_set_smaa(Renderer *r, bool on) {
+    if (r)
+        r->smaa_enabled = on;
+}
+
 RenderEnvironment renderer_environment_default(void) {
     return (RenderEnvironment){
         /* Both stops carry red on purpose. A physically blue sky has almost no
@@ -2439,6 +2603,24 @@ static const float kSceneClear[4] = {0.02f, 0.025f, 0.03f, 1.0f};
 static void pass_sky(Renderer *r, VkCommandBuffer cmd, RenderTarget *target) {
     PassAttachment color = {.target = target, .load = LOAD_CLEAR, .store = STORE_KEEP};
     PassDesc       pd    = {.colors = &color, .color_count = 1, .pipeline = r->EnginePipelines.sky};
+    GPU_SCOPE(&r->vk.gpuprofiler[r->vk.current_frame], cmd, "Sky", STAGE_COLOR) {
+        begin_pass(&r->vk, cmd, &pd);
+        SkyPush sp = {.exponent        = r->env.sky_exponent,
+                      .glow_strength   = r->env.sun_glow,
+                      .glow_power      = r->env.sun_glow_power,
+                      .ground_fade     = 0.85f};
+        push_constants(&r->vk, cmd, (ByteSpan){&sp, sizeof(sp)});
+        vkCmdDraw(cmd, 3, 1, 0, 0);
+        end_pass(&r->vk, cmd, &pd);
+    }
+}
+
+/* MSAA variant of pass_sky: targets the multisampled HDR color. No depth (the
+   sky leaves none behind); the scene's first draw pass opens the MSAA depth. */
+static void pass_sky_msaa(Renderer *r, VkCommandBuffer cmd, RenderTarget *target, uint32_t samples) {
+    PassAttachment color = {.target = target, .load = LOAD_CLEAR, .store = STORE_KEEP};
+    PassDesc       pd    = {.colors = &color, .color_count = 1, .samples = samples,
+                            .pipeline = r->EnginePipelines.sky};
     GPU_SCOPE(&r->vk.gpuprofiler[r->vk.current_frame], cmd, "Sky", STAGE_COLOR) {
         begin_pass(&r->vk, cmd, &pd);
         SkyPush sp = {.exponent        = r->env.sky_exponent,
@@ -2535,13 +2717,31 @@ bool renderer_frame(Renderer *r) {
             flush_barriers(&r->vk, cmd);
         }
     }
-    if (r->two_d)
+    uint32_t msaa = 0;
+    if (!r->two_d) {
+        msaa = renderer_scene_sample_count();
+        if (msaa <= 1u)
+            msaa = 0;
+    }
+    if (r->two_d) {
         two_d_render(r->two_d, cmd, hdr, kSceneClear);
-    else
-        pass_sky(r, cmd, hdr);
-    if (r->game.render) {
+        if (r->game.render) {
+            uint32_t image = r->vk.swapchain.current_image;
+            r->game.render(r->game.user, cmd, &r->hdr_color[image], &r->depth[image], NULL, NULL);
+        }
+    } else if (msaa > 1u) {
         uint32_t image = r->vk.swapchain.current_image;
-        r->game.render(r->game.user, cmd, &r->hdr_color[image], &r->depth[image]);
+        pass_sky_msaa(r, cmd, &r->hdr_color_msaa[image], msaa);
+        if (r->game.render) {
+            r->game.render(r->game.user, cmd, &r->hdr_color_msaa[image], &r->depth_msaa[image],
+                           &r->hdr_color[image], &r->depth[image]);
+        }
+    } else {
+        uint32_t image = r->vk.swapchain.current_image;
+        pass_sky(r, cmd, hdr);
+        if (r->game.render) {
+            r->game.render(r->game.user, cmd, &r->hdr_color[image], &r->depth[image], NULL, NULL);
+        }
     }
 
     /* Edge-triggered so the windows persist while you drag a slider; a held
@@ -2559,7 +2759,8 @@ bool renderer_frame(Renderer *r) {
             pass_ssao(r, cmd);
     }
     post_pass(r, cmd);
-    pass_smaa(r, cmd);
+    if (r->smaa_enabled)
+        pass_smaa(r, cmd);
     pass_ldr_to_swapchain(r, cmd);
     pass_text_overlay(r, cmd);
     render_gpu_profiler_ui(r);
@@ -2603,6 +2804,8 @@ void renderer_destroy(Renderer *r) {
     forEach(i, MAX_SWAPCHAIN_IMAGES) {
         rt_destroy(&r->vk, &r->depth[i]);
         rt_destroy(&r->vk, &r->hdr_color[i]);
+        rt_destroy(&r->vk, &r->depth_msaa[i]);
+        rt_destroy(&r->vk, &r->hdr_color_msaa[i]);
         rt_destroy(&r->vk, &r->ldr_color[i]);
         rt_destroy(&r->vk, &r->smaa_final[i]);
         rt_destroy(&r->vk, &r->smaa_edges[i]);

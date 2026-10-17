@@ -12,6 +12,8 @@
 #define GAME_STATE_BINDING 4
 // Sprite stream (sorted instances + cull scratch) and the compacted stream the
 // vertex shader reads. Must match the [[vk::binding]] lines in shaders/sprite*.slang.
+
+
 #define SPRITE_CPU_BINDING 5
 #define SPRITE_GPU_BINDING 6
 #define MAX_MIPS 16
@@ -24,7 +26,8 @@
 #define MAX_PIPELINES                256
 #define MAX_BINDLESS_SAMPLERS        256
 #define MAX_BINDLESS_TEXTURES        65536
-
+#define MAX_IMAGE_BARRIERS 512
+#define MAX_BUFFER_BARRIERS 512
 
 #define IMGUI_DESCRIPTOR_SET_COUNT  64
 #define IMGUI_SAMPLER_COUNT         64
@@ -38,8 +41,8 @@
 
 
 #define MAX_COLOR_ATTACHMENTS 8
-#define VALIDATION false
-#define GPU_VALIDATION false 
+#define VALIDATION false 
+#define GPU_VALIDATION false
 
 #define GPU_PRINTF false 
 

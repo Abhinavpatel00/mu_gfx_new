@@ -137,6 +137,11 @@ float4 fs_main(SceneVOut i) : SV_Target0
         discard;
 #endif
 
+#ifdef SCENE_PREZ
+    /* Depth-only pre-Z route: stop after the alpha test, no shading. */
+    return float4(0.0f, 0.0f, 0.0f, 0.0f);
+#endif
+
     /* SDF slime face: same atlas resolve as scene.slang, unlit. FACE materials
        are routed to the late-Z pipeline when SCENE_NO_DISCARD is set, so the
        whole branch (and its discard) vanishes from the early-Z variant. */
@@ -152,6 +157,9 @@ float4 fs_main(SceneVOut i) : SV_Target0
         float  white   = smoothstep(0.5f - w, 0.5f + w, sdf.b);
         if (max(max(eye, mouth), white) < 0.02f)
             discard;
+#ifdef SCENE_PREZ
+        return float4(0.0f, 0.0f, 0.0f, 0.0f);
+#endif
         float3 dark = float3(0.05f, 0.055f, 0.09f);
         float3 eye_col = dark * (0.25f + 0.75f * sdf.g) + float3(1.0f) * (smoothstep(0.75f, 0.95f, sdf.g) * 0.8f);
         float3 col     = float3(1.0f) * white;

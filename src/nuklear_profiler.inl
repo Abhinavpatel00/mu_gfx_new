@@ -215,6 +215,21 @@ static void render_grade_ui(Renderer *r) {
     nk_checkbox_label(ctx, "Toon shade", &toon);
     s->toon = toon != 0;
 
+    /* Anti-aliasing switches. MSAA swaps the scene chain at the next frame
+       start (targets + pipelines rebuild); SMAA just skips the passes. */
+    nk_layout_row_dynamic(ctx, 24, 1);
+    {
+        int msaa = renderer_msaa_enabled();
+        nk_checkbox_label(ctx, "MSAA (4x)", &msaa);
+        if (msaa != renderer_msaa_enabled())
+            renderer_set_msaa(r, msaa != 0);
+    }
+    {
+        int smaa = r->smaa_enabled;
+        nk_checkbox_label(ctx, "SMAA", &smaa);
+        r->smaa_enabled = smaa != 0;
+    }
+
     {
         static const char *styles[] = {"Anime cel", "Soft stylized", "Painterly"};
         nk_label(ctx, "Toon style", NK_TEXT_LEFT);

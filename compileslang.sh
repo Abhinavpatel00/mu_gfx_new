@@ -74,10 +74,11 @@ for file in "$SRC_DIR"/*.slang; do
         fi
     done
 
-    # Early-Z route fragments: the whole main shader included with SCENE_NO_DISCARD
-    # set, so the alpha-test/face discards vanish and the driver keeps early-Z on.
-    # Explicit entries: the include hides fs_main from has_entry's scan.
-    if [ "$file" = "$SRC_DIR/scene_opaque.frag.slang" ] || [ "$file" = "$SRC_DIR/toon_opaque.frag.slang" ]; then
+    # Early-Z / depth-only-preZ route fragments: scene.slang (or toon.slang)
+    # included with SCENE_NO_DISCARD / SCENE_PREZ set. Explicit entries: the
+    # include hides fs_main from has_entry's scan.
+    if [ "$file" = "$SRC_DIR/scene_opaque.frag.slang" ] || [ "$file" = "$SRC_DIR/toon_opaque.frag.slang" ] \
+        || [ "$file" = "$SRC_DIR/scene_prez.frag.slang" ] || [ "$file" = "$SRC_DIR/toon_prez.frag.slang" ]; then
         # $name already ends in .frag (basename without .slang)
         compile_stage fragment fs_main "$file" "$OUT_DIR/$name.spv"
     fi

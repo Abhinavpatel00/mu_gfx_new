@@ -2,6 +2,7 @@
    T1 upload, T2 cull, T3 compact, T5 draw, T6 counters.
    See docs/gpu-driven-dod-redesign.md. */
 #include "scene.h"
+#include "../renderer.h"
 
 #include "../../common.h"
 #include <math.h>
@@ -263,6 +264,19 @@ struct Scene {
     PipelineID draw_pipeline_early; /* route split: same FS without discards, early-Z */
     PipelineID toon_pipeline; /* cel-shaded variant of the scene draw */
     PipelineID toon_pipeline_early; /* toon early-Z variant */
+    /* 1x alpha-test pipelines: the alpha route draws straight onto the 1x HDR
+       when MSAA is on, so a 4x late-Z pipeline would both cost 4x shading and
+       hit a 4x attachment it no longer has. Created always; msaa_scaled=false
+       keeps them 1x across the MSAA chain rebuild. */
+    PipelineID draw_alpha_1x_pipeline;
+    PipelineID toon_alpha_1x_pipeline;
+    /* 1x alpha pre-Z (depth-only, real discard) + EQUAL-retest shade pair.
+       The prepass turns the leaf geometry into early-Z occluders for the
+       opaque pass; the shade pass re-tests EQUAL against that depth. */
+    PipelineID draw_alpha_prez_pipeline;
+    PipelineID toon_alpha_prez_pipeline;
+    PipelineID draw_alpha_eq_pipeline;
+    PipelineID toon_alpha_eq_pipeline;
     PipelineID sparkle_pipeline; /* additive transparent sparkle pass */
     bool       toon;
     bool       pipelines_ready;
@@ -1356,6 +1370,10 @@ static void ensure_pipelines(Scene *s, RenderTarget *color, RenderTarget *depth)
     cfg.color_attachment_count = 1;
     cfg.color_formats          = &s->color_format;
     cfg.depth_format           = s->depth_format;
+    /* Sky + scene draws run sampled against the MSAA chain (sky uses the same
+       count); sparkles stay 1x over the 1x resolve targets below. */
+    cfg.rasterization_samples  = (VkSampleCountFlagBits)renderer_scene_sample_count();
+    cfg.msaa_scaled            = true;
 //    cfg.polygon_mode=VK_POLYGON_MODE_LINE ;
     /* reverse-Z: near is 1.0 and the far limit is 0.0, so nearer geometry has
        the greater depth. Any Hi-Z pyramid built from this must MAX-reduce. */
@@ -1380,11 +1398,54 @@ static void ensure_pipelines(Scene *s, RenderTarget *color, RenderTarget *depth)
     cfg.frag_path        = "compiledshaders/toon_opaque.frag.spv";
     s->toon_pipeline_early = pipeline_create_graphics(s->vk, &cfg);
 
+    /* 1x alpha-test routes (late-Z, real discard FS). They draw directly onto
+       the 1x HDR/depth targets after the opaque pass resolved its MSAA output,
+       so they never carry sample counts. */
+    cfg.vert_path             = "compiledshaders/scene.vert.spv";
+    cfg.frag_path             = "compiledshaders/scene.frag.spv";
+    cfg.rasterization_samples = VK_SAMPLE_COUNT_1_BIT;
+    cfg.msaa_scaled           = false;
+    s->draw_alpha_1x_pipeline = pipeline_create_graphics(s->vk, &cfg);
+
+    /* Alpha depth-only prepass (1x path): color writes off, real discard FS,
+       depth writes on with a fresh clear. It seeds the shared depth with the
+       leaf geometry so the opaque pass gets early-Z rejections behind the
+       grass field, and the alpha shade pass below re-tests EQUAL against it. */
+    cfg.color_attachment_count = 0;
+    cfg.color_formats          = NULL;
+    cfg.frag_path              = "compiledshaders/scene_prez.frag.spv";
+    s->draw_alpha_prez_pipeline = pipeline_create_graphics(s->vk, &cfg);
+
+    cfg.color_attachment_count = 1;
+    cfg.color_formats          = &s->color_format;
+    cfg.depth_compare_op       = VK_COMPARE_OP_EQUAL; /* re-test against preZ */
+    cfg.frag_path              = "compiledshaders/scene.frag.spv";
+    s->draw_alpha_eq_pipeline  = pipeline_create_graphics(s->vk, &cfg);
+
+    cfg.frag_path                = "compiledshaders/toon.frag.spv";
+    s->toon_alpha_eq_pipeline    = pipeline_create_graphics(s->vk, &cfg);
+
+    cfg.frag_path = "compiledshaders/toon_prez.frag.spv";
+    cfg.depth_compare_op = VK_COMPARE_OP_GREATER;
+    cfg.color_attachment_count = 0;
+    cfg.color_formats          = NULL;
+    s->toon_alpha_prez_pipeline = pipeline_create_graphics(s->vk, &cfg);
+
+    cfg.depth_format           = s->depth_format;
+    cfg.color_attachment_count = 1;
+    cfg.color_formats          = &s->color_format;
+    cfg.frag_path              = "compiledshaders/toon.frag.spv";
+    s->toon_alpha_1x_pipeline  = pipeline_create_graphics(s->vk, &cfg);
+
     /* Sparkles share the draw's clip rows and color/depth formats but blend
        additively and never write depth: a transparent pass that runs after the
-       opaque draw. Same reverse-Z compare, so a sparkle hides behind a trunk. */
-    cfg.vert_path          = "compiledshaders/sparkle.vert.spv";
-    cfg.frag_path          = "compiledshaders/sparkle.frag.spv";
+       opaque draw. Same reverse-Z compare, so a sparkle hides behind a trunk.
+       They draw into the 1x resolve targets, so the pipeline is 1x and does
+       NOT follow the MSAA chain: reset the shared-config flag the draw set. */
+    cfg.vert_path             = "compiledshaders/sparkle.vert.spv";
+    cfg.frag_path             = "compiledshaders/sparkle.frag.spv";
+    cfg.rasterization_samples = VK_SAMPLE_COUNT_1_BIT;
+    cfg.msaa_scaled           = false;
     cfg.depth_write_enable = false;
     cfg.depth_test_enable  = true;
     cfg.blends[0]          = blend_additive();
@@ -1664,6 +1725,17 @@ static bool split_disabled(void) {
     return v;
 }
 
+/* Alpha pre-Z + EQUAL-retest scheme: costs one extra depth-only pass over the
+   alpha list and saves leaf-on-leaf FS work; measured a wash at 678p and a
+   small loss as the scene grows, so it is opt-in (MU_PREZ) and OFF spells the
+   old opaque-clears + late-Z-alpha ordering. */
+static bool prez_enabled(void) {
+    static bool v = -1;
+    if (v == (bool)-1)
+        v = getenv("MU_PREZ") != NULL;
+    return v;
+}
+
 /* One record of the instance draw. The route split reuses this verbatim for
    the alpha-test command list: own pipeline, own buffers, and the depth load
    keeps whatever the opaque pass wrote (a fragment that survives the
@@ -1671,12 +1743,23 @@ static bool split_disabled(void) {
    after the opaque pass makes the occluders final before the overdraw-heavy
    foliage shades against them). */
 static void record_scene_draw(Scene *s, const SceneViewFrame *vf, GpuProfiler *prof, VkCommandBuffer cmd,
-                              RenderTarget *color, RenderTarget *depth, ByteSpan dp_span, BufferSlice draws,
+                              uint32_t samples, RenderTarget *color, RenderTarget *depth, RenderTarget *color_resolve,
+                              RenderTarget *depth_resolve, ByteSpan dp_span, BufferSlice draws,
                               BufferSlice draw_count, PipelineID pipeline, const char *tag, bool dep_clear) {
-    VkBackend     *vk = s->vk;
-    uint32_t       G  = s->group_count ? s->group_count : 1;
-    PassAttachment col = {.target = color, .load = LOAD_KEEP, .store = STORE_KEEP};
-    PassAttachment dep = {.target = depth, .load = dep_clear ? LOAD_CLEAR : LOAD_KEEP, .store = STORE_KEEP};
+    VkBackend  *vk = s->vk;
+    uint32_t    G  = s->group_count ? s->group_count : 1;
+    /* color == NULL records a depth-only pass (the 1x alpha pre-Z prepass). */
+    bool        depth_only = color == NULL;
+    PassAttachment col = {.target    = color,
+                          .load      = LOAD_KEEP,
+                          .store     = STORE_KEEP,
+                          .resolve   = color_resolve,
+                          .resolve_mode = VK_RESOLVE_MODE_AVERAGE_BIT};
+    PassAttachment dep = {.target    = depth,
+                          .load      = dep_clear ? LOAD_CLEAR : LOAD_KEEP,
+                          .store     = STORE_KEEP,
+                          .resolve   = depth_resolve,
+                          .resolve_mode = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT};
     if (dep_clear)
         dep.clear[0] = 0.0f; /* reverse-Z: the far plane is 0.0 */
 
@@ -1707,14 +1790,16 @@ static void record_scene_draw(Scene *s, const SceneViewFrame *vf, GpuProfiler *p
          .access = ACCESS_SSBO_R},
     };
     PassDesc draw_pass = {
-        .colors         = &col,
-        .color_count    = 1,
+        .colors         = depth_only ? NULL : &col,
+        .color_count    = depth_only ? 0 : 1,
         .depth          = &dep,
+        .samples        = samples,
         .buf_reads      = draw_reads,
         .buf_read_count = ARRAY_COUNT(draw_reads),
         .pipeline       = pipeline,
+        .depth_only     = depth_only,
     };
-    GPU_SCOPE(prof, cmd, tag, STAGE_COLOR) {
+    GPU_SCOPE(prof, cmd, tag, depth_only ? STAGE_EARLY_Z : STAGE_COLOR) {
         begin_pass(vk, cmd, &draw_pass);
 
         vkCmdBindIndexBuffer(cmd, vk->gpu_pool.buffer, s->index_arena.offset, VK_INDEX_TYPE_UINT16);
@@ -1724,7 +1809,10 @@ static void record_scene_draw(Scene *s, const SceneViewFrame *vf, GpuProfiler *p
     }
 }
 
-void scene_frame(Scene *s, VkCommandBuffer cmd, RenderTarget *color, RenderTarget *depth) {
+void scene_frame(Scene *s, VkCommandBuffer cmd, RenderTarget *color, RenderTarget *depth,
+                 RenderTarget *color_resolve, RenderTarget *depth_resolve) {
+    /* Sparkles run 1x: they sample the bodies they orbit, so they land in the
+       resolved 1x targets after the last scene draw. */
     if (!s || !s->uploaded || s->view_count == 0 || s->group_count == 0)
         return;
     VkBackend *vk   = s->vk;
@@ -2321,12 +2409,61 @@ void scene_frame(Scene *s, VkCommandBuffer cmd, RenderTarget *color, RenderTarge
         PipelineID opaque_pipeline =
             (s->toon ? (split ? s->toon_pipeline_early : s->toon_pipeline)
                      : (split ? s->draw_pipeline_early : s->draw_pipeline));
-        record_scene_draw(s, vf, prof, cmd, color, depth, (ByteSpan){&dp, (uint32_t)sizeof(dp)}, vf->draws,
-                          vf->draw_count, opaque_pipeline, "Scene Draw", true);
+        uint32_t samples = renderer_scene_sample_count();
+        bool     msaa    = samples > 1u && color_resolve && depth_resolve;
         if (split) {
-            PipelineID alpha_pipeline = s->toon ? s->toon_pipeline : s->draw_pipeline;
-            record_scene_draw(s, vf, prof, cmd, color, depth, (ByteSpan){&dp, (uint32_t)sizeof(dp)}, vf->draws_alpha,
-                              vf->draw_count_alpha, alpha_pipeline, "Scene Draw Alpha", false);
+            if (msaa) {
+                /* Opaque route at the chain's sample count; it owns the resolve
+                   so the alpha route can raster 1x directly over the result.
+                   1x alpha route: full shading cost once per pixel instead of
+                   once per covered sample, over the resolved HDR + depth. */
+                PipelineID alpha_pipeline =
+                    s->toon ? s->toon_alpha_1x_pipeline : s->draw_alpha_1x_pipeline;
+                record_scene_draw(s, vf, prof, cmd, samples, color, depth, color_resolve, depth_resolve,
+                                  (ByteSpan){&dp, (uint32_t)sizeof(dp)}, vf->draws,
+                                  vf->draw_count, opaque_pipeline, "Scene Draw", true);
+                record_scene_draw(s, vf, prof, cmd, 1u, color_resolve, depth_resolve, NULL, NULL,
+                                  (ByteSpan){&dp, (uint32_t)sizeof(dp)}, vf->draws_alpha,
+                                  vf->draw_count_alpha, alpha_pipeline, "Scene Draw Alpha", false);
+            } else if (prez_enabled()) {
+                /* No MSAA, pre-Z on: the alpha list first runs depth-only (preZ
+                   real discard FS, color writes off) so the leaf geometry acts
+                   as an early-Z occluder before the opaque pass; the opaque
+                   pass then keeps rather than clears that depth, and the alpha
+                   shade pass re-tests EQUAL against it to prune leaf-on-leaf
+                   overdraw. */
+                record_scene_draw(s, vf, prof, cmd, 1u, NULL, depth, NULL, NULL,
+                                  (ByteSpan){&dp, (uint32_t)sizeof(dp)}, vf->draws_alpha,
+                                  vf->draw_count_alpha,
+                                  s->toon ? s->toon_alpha_prez_pipeline : s->draw_alpha_prez_pipeline,
+                                  "Scene PreZ Alpha", true);
+                record_scene_draw(s, vf, prof, cmd, 1u, color, depth, NULL, NULL,
+                                  (ByteSpan){&dp, (uint32_t)sizeof(dp)}, vf->draws,
+                                  vf->draw_count, opaque_pipeline, "Scene Draw", false);
+                PipelineID alpha_pipeline =
+                    s->toon ? s->toon_alpha_eq_pipeline : s->draw_alpha_eq_pipeline;
+                record_scene_draw(s, vf, prof, cmd, 1u, color, depth, NULL, NULL,
+                                  (ByteSpan){&dp, (uint32_t)sizeof(dp)}, vf->draws_alpha,
+                                  vf->draw_count_alpha, alpha_pipeline, "Scene Draw Alpha", false);
+            } else {
+                /* No MSAA, pre-Z off (MU_NO_PREZ): the old ordering — opaque
+                   clears the depth, alpha draws late-Z over it with the
+                   discard-FS pipeline. */
+                PipelineID alpha_pipeline =
+                    s->toon ? s->toon_alpha_1x_pipeline : s->draw_alpha_1x_pipeline;
+                record_scene_draw(s, vf, prof, cmd, 1u, color, depth, NULL, NULL,
+                                  (ByteSpan){&dp, (uint32_t)sizeof(dp)}, vf->draws,
+                                  vf->draw_count, opaque_pipeline, "Scene Draw", true);
+                record_scene_draw(s, vf, prof, cmd, 1u, color, depth, NULL, NULL,
+                                  (ByteSpan){&dp, (uint32_t)sizeof(dp)}, vf->draws_alpha,
+                                  vf->draw_count_alpha, alpha_pipeline, "Scene Draw Alpha", false);
+            }
+        } else {
+            /* Single list over the original late-Z pipeline; it is the last
+               draw, so it owns the resolves for the MSAA chain. */
+            record_scene_draw(s, vf, prof, cmd, samples, color, depth, color_resolve, depth_resolve,
+                              (ByteSpan){&dp, (uint32_t)sizeof(dp)}, vf->draws,
+                              vf->draw_count, opaque_pipeline, "Scene Draw", true);
         }
 
         /* T5b: transparent sparkle pass, after the opaque draw. Reads the slime
@@ -2351,8 +2488,12 @@ void scene_frame(Scene *s, VkCommandBuffer cmd, RenderTarget *color, RenderTarge
             spk.counts[1] = s->slime_count;
             spk.counts[2] = s->sparkles_per_slime;
 
-            PassAttachment scol = {.target = color, .load = LOAD_KEEP, .store = STORE_KEEP};
-            PassAttachment sdep = {.target = depth, .load = LOAD_KEEP, .store = STORE_KEEP};
+            PassAttachment scol = {.target = color_resolve ? color_resolve : color,
+                                   .load   = LOAD_KEEP,
+                                   .store  = STORE_KEEP};
+            PassAttachment sdep = {.target = depth_resolve ? depth_resolve : depth,
+                                   .load   = LOAD_KEEP,
+                                   .store  = STORE_KEEP};
             BufferAccess   sreads[1] = {
                 {.slice = s->instances, .stage = STAGE_VERT, .access = ACCESS_SSBO_R},
             };

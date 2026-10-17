@@ -61,14 +61,14 @@ typedef enum Access {
 } Access;
 
 typedef enum Layout {
-    LAYOUT_UNDEFINED  = VK_IMAGE_LAYOUT_UNDEFINED,
-    LAYOUT_GENERAL    = VK_IMAGE_LAYOUT_GENERAL,
-    LAYOUT_COLOR      = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-    LAYOUT_DEPTH      = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
-    LAYOUT_SHADER_RO  = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-    LAYOUT_XFER_SRC   = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-    LAYOUT_XFER_DST   = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-    LAYOUT_PRESENT    = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+    LAYOUT_UNDEFINED = VK_IMAGE_LAYOUT_UNDEFINED,
+    LAYOUT_GENERAL   = VK_IMAGE_LAYOUT_GENERAL,
+    LAYOUT_COLOR     = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+    LAYOUT_DEPTH     = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+    LAYOUT_SHADER_RO = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+    LAYOUT_XFER_SRC  = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+    LAYOUT_XFER_DST  = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+    LAYOUT_PRESENT   = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
 } Layout;
 
 typedef enum ImgUsage {
@@ -330,6 +330,7 @@ typedef struct RenderTargetSpec {
     VkImageUsageFlags  usage;     // required, asserted non-zero
     VkImageAspectFlags aspect;    // 0 = infer from format
     uint32_t           mip_count; // 0 = auto-compute, 1 = no mips
+    uint32_t           samples;   // 0 or 1 = single sample; 2/4 = MSAA
     const char        *debug_name;
 } RenderTargetSpec;
 
@@ -346,6 +347,7 @@ typedef struct RenderTarget {
     uint32_t height;
     uint32_t layers;
     uint32_t mip_count;
+    uint32_t samples; // 1 = direct, else MSAA (matches the pipeline's rasterizationSamples)
 
     VkImageUsageFlags  usage;
     VkImageAspectFlags aspect;
@@ -386,7 +388,7 @@ typedef struct BufferPool {
     VmaAllocation allocation;
     VkDeviceSize  size_bytes;
 
-    void *mapped;
+    void               *mapped;
     struct BufferState *states;
     uint32_t            state_count;
 
@@ -406,7 +408,7 @@ typedef struct BufferPool {
 typedef struct BufferState {
     VkPipelineStageFlags2 stage;
     VkAccessFlags2        access;
-    bool                   valid;
+    bool                  valid;
 } BufferState;
 
 typedef enum PipelineType { PIPELINE_TYPE_GRAPHICS, PIPELINE_TYPE_COMPUTE } PipelineType;
@@ -462,6 +464,15 @@ typedef struct GraphicsPipelineConfig {
     uint32_t        color_attachment_count; // 0 = no color attachments
     const VkFormat *color_formats;          // NULL when color_attachment_count == 0
     VkFormat        depth_format;           // 0 (VK_FORMAT_UNDEFINED) = no depth attachment
+    VkSampleCountFlagBits rasterization_samples; // 0 = VK_SAMPLE_COUNT_1_BIT; must
+                                                 // match every attachment of the
+                                                 // passes that bind this pipeline
+
+    // Marks pipelines that ride the scene MSAA chain (sky + scene draws).
+    // These follow renderer_set_msaa: switching MSAA re-records their sample
+    // count and hot-rebuilds them, like the shader hot-reload path. Everything
+    // else in the frame (sparkles, SMAA, post, fullscreen) stays at 1x.
+    bool msaa_scaled;
 
     // Per-attachment blend state. Unset entries (zeroed write mask) default to
     // no blending; opt in with blend_alpha() in the initializer.
@@ -492,14 +503,14 @@ typedef struct VkBackendPipelines {
 } VkBackendPipelines;
 
 typedef struct BarrierBatch {
-    VkImageMemoryBarrier2 image_barriers[512];
-    uint32_t image_count;
+    VkImageMemoryBarrier2 image_barriers[MAX_IMAGE_BARRIERS];
+    uint32_t              image_count;
 
     // Buffer dependencies declared through PassDesc.buf_reads / buf_writes.
     // Both resolve to per-slice barriers: a read narrows to the pass's own
     // stage/access, a write widens to ALL_COMMANDS. Neither ever names a range
     // wider than the slice it was given.
-    VkBufferMemoryBarrier2 buffer_barriers[512];
+    VkBufferMemoryBarrier2 buffer_barriers[MAX_BUFFER_BARRIERS];
     uint32_t               buffer_count;
 
     // Number of barriers silently dropped when the batch was full. Flushed as
@@ -536,6 +547,14 @@ typedef struct PassAttachment {
     LoadOp        load;
     StoreOp       store;
     float         clear[4]; // color rgba; depth clear value in clear[0]
+
+    // MSAA resolve (optional). When set, the attachment is sampled-count > 1 and
+    // the resolve image receives the sample-averaged result at end of rendering.
+    // The resolve image must be single-sample and never also a color attachment
+    // of the same pass. For depth attachments resolve_mode must be
+    // SAMPLE_ZERO (or the mode the depth format supports); colors use AVERAGE.
+    RenderTarget           *resolve;
+    VkResolveModeFlagBits   resolve_mode; // 0 = no resolve / default AVERAGE for color
 } PassAttachment;
 
 typedef struct BufferSlice {
@@ -564,15 +583,21 @@ typedef struct PassDesc {
     const PassAttachment *colors;        // NULL when compute-only
     uint32_t              color_count;   // 0..MAX_COLOR_ATTACHMENTS
     const PassAttachment *depth;         // NULL = no depth attachment
+    uint32_t              samples;       // 0/1 = single-sample; else MSAA. Every
+                                         // attachment + the bound pipeline must
+                                         // match it exactly.
     RenderTarget *const  *shader_reads;  // sampled reads (sampled-read layout)
     uint32_t              shader_read_count;
     RenderTarget *const  *shader_writes; // storage image writes (GENERAL layout)
     uint32_t              shader_write_count;
-    const BufferAccess   *buf_reads;     // NULL when none
+    const BufferAccess   *buf_reads; // NULL when none
     uint32_t              buf_read_count;
-    const BufferAccess   *buf_writes;    // NULL when none
+    const BufferAccess   *buf_writes; // NULL when none
     uint32_t              buf_write_count;
-    PipelineID            pipeline;      // 1-based; 0 = caller binds later (e.g. Nuklear)
+    PipelineID            pipeline; // 1-based; 0 = caller binds later (e.g. Nuklear)
+    bool                  depth_only; // graphics pass with no color attachments
+                                       // (depth-only pre-Z); gets a rendering
+                                       // scope instead of the compute shortcut
 } PassDesc;
 
 typedef struct SamplerDesc {
@@ -610,7 +635,7 @@ typedef struct MemStats {
     uint32_t images[MEM_TAG_COUNT];
     uint64_t total_bytes;
     uint64_t peak_bytes;
-    uint64_t heap_used;   /* driver-reported across heaps: includes what VMA does not own */
+    uint64_t heap_used; /* driver-reported across heaps: includes what VMA does not own */
     uint64_t heap_budget;
 } MemStats;
 
@@ -785,6 +810,10 @@ PipelineID pipeline_create_compute(VkBackend *r, const char *path);
 PipelineID pipeline_create_graphics(VkBackend *r, GraphicsPipelineConfig *cfg);
 void       pipeline_rebuild(VkBackend *r);
 void       pipeline_mark_dirty(VkBackend *r, const char *changed);
+/* Hot-rebuild every graphics pipeline flagged msaa_scaled at a new MSAA sample
+   count. Old pipelines retire through the delete queue exactly like the shader
+   hot-reload path, so in-flight frames keep rendering with the old ones. */
+void       pipeline_rebuild_msaa_samples(VkBackend *r, uint32_t samples);
 // Commands
 void vk_cmd_set_viewport_scissor(VkCommandBuffer cmd, VkExtent2D extent);
 void image_transition_swapchain(VkBackend *r, VkCommandBuffer cmd, FlowSwapchain *sc, VkImageLayout new_layout,

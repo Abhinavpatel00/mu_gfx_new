@@ -203,6 +203,14 @@ float4 fs_main(SceneVOut i) : SV_Target0
         discard;
 #endif
 
+#ifdef SCENE_PREZ
+    /* Depth-only pre-Z route: geometry that survives the alpha test stops
+       here — the depth write is the entire output, no lighting runs. The
+       visible pass re-shades with the EQUAL-retest pipeline downstream, so
+       the color value is a don't-care. */
+    return float4(0.0f, 0.0f, 0.0f, 0.0f);
+#endif
+
     /* SDF slime face: one atlas tile per expression (R = eyes, A = mouth,
        B = eye whites, G = eye highlights, 0.5 = shape edge). Edge width comes
        from screen-space derivatives so faces stay crisp at any distance — the
@@ -222,6 +230,10 @@ float4 fs_main(SceneVOut i) : SV_Target0
         float  white   = smoothstep(0.5f - w, 0.5f + w, sdf.b);
         if (max(max(eye, mouth), white) < 0.02f)
             discard;
+#ifdef SCENE_PREZ
+        /* Faces in the pre-Z list write depth for the surviving texels only. */
+        return float4(0.0f, 0.0f, 0.0f, 0.0f);
+#endif
         float3 dark = float3(0.05f, 0.055f, 0.09f); /* the old geometry navy */
         /* G is a sheen ramp across the eye, not a glint dot: shade the pupil
            by it and add a hot core where it peaks. Mouths stay flat dark. */

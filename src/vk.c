@@ -1698,6 +1698,8 @@ static bool rt_create_internal(VkBackend *r, RenderTarget *rt, const RenderTarge
         mips = RT_MAX_MIPS;
     rt->mip_count = mips;
 
+    rt->samples = spec->samples ? spec->samples : 1;
+
     // // Bindless slots unused until registered
     rt->bindless_index = UINT32_MAX;
     //
@@ -1709,7 +1711,7 @@ static bool rt_create_internal(VkBackend *r, RenderTarget *rt, const RenderTarge
         .extent        = {rt->width, rt->height, 1},
         .mipLevels     = rt->mip_count,
         .arrayLayers   = spec->layers,
-        .samples       = VK_SAMPLE_COUNT_1_BIT,
+        .samples       = (VkSampleCountFlagBits)rt->samples,
         .tiling        = VK_IMAGE_TILING_OPTIMAL,
         .usage         = rt->usage,
         .sharingMode   = VK_SHARING_MODE_EXCLUSIVE,
@@ -1891,6 +1893,7 @@ bool rt_resize(VkBackend *r, RenderTarget *rt, uint32_t width, uint32_t height)
                                        .usage      = rt->usage,
                                        .aspect     = rt->aspect,
                                        .mip_count  = rt->mip_count,
+                                       .samples    = rt->samples,
                                        .debug_name = rt->debug_name};
 
     rt_destroy_internal(r, rt, false);
@@ -2085,7 +2088,7 @@ VkPipeline create_graphics_pipeline(VkBackend *renderer, const GraphicsPipelineC
 
     VkPipelineMultisampleStateCreateInfo msaa = {
         .sType                = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
-        .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT,
+        .rasterizationSamples = cfg->rasterization_samples ? cfg->rasterization_samples : VK_SAMPLE_COUNT_1_BIT,
     };
 
     VkPipelineDepthStencilStateCreateInfo depth = {
@@ -2360,6 +2363,25 @@ void pipeline_rebuild(VkBackend *r) {
             r->render_pipelines.pipelines[i] = create_compute_pipeline(r, e->compute.path);
 
         printf("Pipeline %d hot reloaded\n", i);
+    }
+}
+
+void pipeline_rebuild_msaa_samples(VkBackend *r, uint32_t samples) {
+    uint64_t retire = r->timeline_last_submitted;
+
+    for (int i = 0; i < r->render_pipelines.count; i++) {
+        PipelineEntry *e = &r->render_pipelines.entries[i];
+
+        if (e->type != PIPELINE_TYPE_GRAPHICS || !e->graphics.msaa_scaled)
+            continue;
+        if (e->graphics.rasterization_samples == (VkSampleCountFlagBits)samples)
+            continue;
+
+        e->graphics.rasterization_samples = (VkSampleCountFlagBits)samples;
+        delete_queue_defer(r, retire, deferred_destroy_pipeline,
+                           (void *)(uintptr_t)r->render_pipelines.pipelines[i]);
+        r->render_pipelines.pipelines[i] = create_graphics_pipeline(r, &e->graphics);
+        printf("Pipeline %d rebuilt at %ux MSAA\n", i, samples);
     }
 }
 
@@ -2749,9 +2771,26 @@ void begin_pass(VkBackend *r, VkCommandBuffer cmd, const PassDesc *desc) {
     assert(desc->color_count <= MAX_COLOR_ATTACHMENTS);
     assert((desc->colors && desc->color_count) || desc->color_count == 0);
 
+    uint32_t samples = desc->samples ? desc->samples : 1;
+
     forEach(i, desc->color_count) pass_transition_attachment(r, cmd, &desc->colors[i]);
     if (desc->depth)
         pass_transition_attachment(r, cmd, desc->depth);
+
+    /* Resolve images are written at end of rendering, so they arrive in the
+       same attachment-optimal layout the write accesses them in. */
+    forEach(i, desc->color_count) {
+        if (desc->colors[i].resolve) {
+            rt_transition_all(r, cmd, desc->colors[i].resolve, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                              VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                              VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT);
+        }
+    }
+    if (desc->depth && desc->depth->resolve) {
+        rt_transition_all(r, cmd, desc->depth->resolve, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+                          VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+                          VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
+    }
 
     forEach(i, desc->shader_read_count) {
         rt_transition_all(r, cmd, desc->shader_reads[i], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
@@ -2768,7 +2807,7 @@ void begin_pass(VkBackend *r, VkCommandBuffer cmd, const PassDesc *desc) {
 
     flush_barriers(r, cmd);
 
-    if (desc->color_count == 0) {
+    if (desc->color_count == 0 && !desc->depth_only) {
         // Compute pass: no rendering scope, so no viewport or area to derive.
         // This is reached before any area logic because a compute pass that
         // declares only buffer dependencies has no image to size a viewport
@@ -2779,10 +2818,10 @@ void begin_pass(VkBackend *r, VkCommandBuffer cmd, const PassDesc *desc) {
         return;
     }
 
-    const RenderTarget *area = desc->colors[0].target;
+    const RenderTarget *area = desc->colors ? desc->colors[0].target : NULL;
     if (!area)
         area = desc->depth ? desc->depth->target : NULL;
-    assert(area || desc->colors[0].swapchain_view);
+    assert(area || (desc->colors && desc->colors[0].swapchain_view));
     VkExtent2D area_extent = area ? (VkExtent2D){.width = area->width, .height = area->height} : r->swapchain.extent;
 
     VkRenderingAttachmentInfo color_attachments[MAX_COLOR_ATTACHMENTS];
@@ -2795,6 +2834,14 @@ void begin_pass(VkBackend *r, VkCommandBuffer cmd, const PassDesc *desc) {
             .loadOp      = (VkAttachmentLoadOp)a->load,
             .storeOp     = (VkAttachmentStoreOp)a->store,
             .clearValue  = {.color = {{a->clear[0], a->clear[1], a->clear[2], a->clear[3]}}},
+            .resolveImageView =
+                a->resolve ? a->resolve->view : VK_NULL_HANDLE,
+            .resolveImageLayout =
+                a->resolve ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED,
+            .resolveMode =
+                (samples > 1 && a->resolve)
+                    ? (a->resolve_mode ? a->resolve_mode : VK_RESOLVE_MODE_AVERAGE_BIT)
+                    : VK_RESOLVE_MODE_NONE,
         };
     }
 
@@ -2807,6 +2854,14 @@ void begin_pass(VkBackend *r, VkCommandBuffer cmd, const PassDesc *desc) {
             .loadOp      = (VkAttachmentLoadOp)desc->depth->load,
             .storeOp     = (VkAttachmentStoreOp)desc->depth->store,
             .clearValue  = {.depthStencil = {.depth = desc->depth->clear[0]}},
+            .resolveImageView =
+                desc->depth->resolve ? desc->depth->resolve->view : VK_NULL_HANDLE,
+            .resolveImageLayout =
+                desc->depth->resolve ? VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED,
+            .resolveMode = (samples > 1 && desc->depth->resolve)
+                               ? (desc->depth->resolve_mode ? desc->depth->resolve_mode
+                                                            : VK_RESOLVE_MODE_SAMPLE_ZERO_BIT)
+                               : VK_RESOLVE_MODE_NONE,
         };
     }
 
@@ -2815,7 +2870,7 @@ void begin_pass(VkBackend *r, VkCommandBuffer cmd, const PassDesc *desc) {
         .renderArea           = {.extent = area_extent},
         .layerCount           = 1,
         .colorAttachmentCount = desc->color_count,
-        .pColorAttachments    = color_attachments,
+        .pColorAttachments    = desc->color_count ? color_attachments : NULL,
         .pDepthAttachment     = desc->depth ? &depth_attachment : NULL,
     };
 
