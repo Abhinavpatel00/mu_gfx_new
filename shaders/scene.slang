@@ -33,8 +33,7 @@ static float3 unpack_oct(SceneU32 o)
     float3 n = float3(e.x, e.y, 1.0f - abs(e.x) - abs(e.y));
     float  t = max(-n.z, 0.0f);
     n.xy += float2(n.x >= 0.0f ? -t : t, n.y >= 0.0f ? -t : t);
-    return normalize(n);
-}
+    return normalize(n);}
 
 struct SceneVOut {
     float4               position : SV_Position;
@@ -50,33 +49,31 @@ struct SceneVOut {
 SceneVOut vs_main(uint vid : SV_VertexID, uint iid : SV_InstanceID, uint base_inst : SV_StartInstanceLocation)
 {
     /* Identity split, and which half each comes from is the whole point:
-         - the group is uniform across the draw, so it comes from one row
-           addressed by the draw's own instance base (group_base[base_instance])
-           and read once, then broadcast by the hardware;
-         - that one row carries the rung's vertex stream and its material, so
-           mesh, stream and material are a single dependent load rather than the
-           chain group_base -> group_mesh -> shade_meshes -> vertex_stream;
-         - the instance slot is the only genuinely per-lane datum, so it is the
-           only thing read per-lane, out of vis[] which holds a plain slot.
-       vis[] therefore needs no packed key and no decode. */
-    SceneGroupShade gs   = pc.group_shade[pc.group_base[base_inst]];
-    SceneU32        slot = pc.vis[base_inst + iid];
+          - the group is uniform across the draw, so it comes from one row
+            addressed by the draw's own instance base (group_base[base_instance])
+            and read once, then broadcast by the hardware;
+          - that one row carries the rung's vertex stream and its material, so
+            mesh, stream and material are a single dependent load rather than the
+            chain group_base -> group_mesh -> shade_meshes -> vertex_stream;
+          - the instance datum is one consolidated row per survivor, written by
+            cs_scatter once per frame: vs_rows[base_inst + iid] is the single
+            dependent per-lane load, replacing the old vis -> slot -> seven
+            random per-vertex table loads. */
+    SceneGroupShade gs  = pc.group_shade[pc.group_base[base_inst]];
+    SceneVsRow      row = pc.vs_rows[base_inst + iid];
 
-    /* iid is Slang SV_InstanceID == InstanceIndex - BaseInstance: draw-local.
-       vis base is base_inst == firstInstance. */
-    SceneInstance     inst = pc.instances[slot];
-    ScenePackedVertex v    = gs.vertex_stream[vid];
+    ScenePackedVertex v = gs.vertex_stream[vid];
 
     float3 local = float3(unpack_half2(v.position_xy), f16tof32(v.position_z & 0xFFFFu));
-    float  s     = f16tof32(inst.scale);
-    float3 ipos  = float3(inst.pos[0], inst.pos[1], inst.pos[2]);
+    float  s     = f16tof32(row.scale_sq & 0xFFFFu);
+    float3 ipos  = float3(row.pos[0], row.pos[1], row.pos[2]);
     /* Hop squash-and-stretch, volume-preserving and branch-free. sy scales the
        local height about the instance centre; widen = 1/sqrt(sy) keeps the
        volume constant for small changes. sy==1 and widen==1 is the identity,
        so every non-slime instance (the default) is bit-identical to the rigid
        path. */
-    float  sy      = pc.squash[slot];
-    float  sz      = pc.stretch[slot];
+    float  sy      = f16tof32(row.scale_sq >> 16u);
+    float  sz      = f16tof32(row.st_wg & 0xFFFFu);
     float  widen   = rsqrt(max(sy, 1e-3f));
     /* Forward stretch along local +Z (the facing the yaw already points at),
        traded against x so volume holds: widen/rsqrt(sz) * widen*sqrt(sz) leaves
@@ -86,7 +83,15 @@ SceneVOut vs_main(uint vid : SV_VertexID, uint iid : SV_InstanceID, uint base_in
     float3 su      = float3(ax, sy, az);
 
     SceneVOut o;
-    o.face = pc.face_id[slot];
+
+    /* Bloom strength and the face tile are packed into one word; the jiggle
+       amplitude rides the other word. amp==0 multiplies to a zero offset, so
+       every non-slime instance (the default) is bit-identical to the rigid
+       path with no branch. */
+    float amp = f16tof32(row.st_wg >> 16u);
+    o.bloom   = f16tof32(row.bloom_face & 0xFFFFu);
+
+    o.face = row.bloom_face >> 16u;
 
     /* SDF face quad: rigidly attached to the body's front (+Z in instance
        space) so ears, jiggle and face share one transform — a billboard would
@@ -96,45 +101,41 @@ SceneVOut vs_main(uint vid : SV_VertexID, uint iid : SV_InstanceID, uint base_in
        you see plain body, like SR's decal faces. Group-uniform branch. */
     if ((pc.materials[gs.material].flags & SCENE_MAT_FACE) != 0u) {
         float3 fq = float3(local.x * 1.05f * s * ax, (local.y * 0.85f + 0.12f) * s * sy, 1.02f * s * az);
-        float3 world = ipos + quat_rotate(inst.quat, fq);
-        float amp = pc.wiggle[slot];
+        float3 world = ipos + quat_rotate(row.quat, fq);
         if (amp != 0.0f) {
             float h  = local.y + 0.5f;
-            float ph = global_data.time * 6.0f + float(slot / 2u) * 2.399963f;
-            world += quat_rotate(inst.quat, unpack_oct(v.normal_oct)) * (sin(ph) * amp * h);
+            float ph = global_data.time * 6.0f + float(row.pair) * 2.399963f;
+            world += quat_rotate(row.quat, unpack_oct(v.normal_oct)) * (sin(ph) * amp * h);
         }
         o.position = float4(dot(pc.clip_rows[0], float4(world, 1.0f)), dot(pc.clip_rows[1], float4(world, 1.0f)),
                             dot(pc.clip_rows[2], float4(world, 1.0f)), dot(pc.clip_rows[3], float4(world, 1.0f)));
-        o.normal   = quat_rotate(inst.quat, unpack_oct(v.normal_oct)); /* unused: face path is unlit */
+        o.normal   = quat_rotate(row.quat, unpack_oct(v.normal_oct)); /* unused: face path is unlit */
         o.uv       = unpack_half2(v.uv);
         o.material = gs.material;
         o.world    = world;
-        o.bloom    = pc.bloom[slot];
         return o;
     }
 
     float3 squishy = local * su;
-    float3 world   = ipos + quat_rotate(inst.quat, squishy * s);
+    float3 world   = ipos + quat_rotate(row.quat, squishy * s);
 
     /* Gel jiggle: displace along the local normal by a per-instance amplitude,
        phase-shifted per slot so a crowd of slimes does not wobble in lockstep.
        The height factor keeps the base planted and wobbles the crown most, which
-       is what reads as gel rather than a rigid translate. amp==0 multiplies to a
-       zero offset, so every non-slime instance (the default) is bit-identical to
-       the rigid path with no branch. */
-    float amp = pc.wiggle[slot];
+       is what reads as gel rather than a rigid translate. */
     if (amp != 0.0f) {
         float h  = local.y * 0.5f + 0.5f;
         /* Phase from the instance *pair* index, not the raw slot: a slime is
            two slots (body, face quad) sharing one transform, and they must
            jiggle in lockstep or the face slides off the body. Different pairs
            still land on unrelated phases. */
-        float ph = global_data.time * 6.0f + float(slot / 2u) * 2.399963f;
-        world += quat_rotate(inst.quat, unpack_oct(v.normal_oct)) * (sin(ph) * amp * h);
+        float ph = global_data.time * 6.0f + float(row.pair) * 2.399963f;
+        world += quat_rotate(row.quat, unpack_oct(v.normal_oct)) * (sin(ph) * amp * h);
     }
 
     if (pc.counts[5] != 0u && iid == 0u) /* DEBUG: one line per draw, MU_SHADER_DEBUG */
-        printf("[VS] base=%u iid=%u slot=%u pos=(%.4f, %.4f, %.4f)\n", base_inst, iid, slot, world.x, world.y, world.z);
+        printf("[VS] base=%u iid=%u pair=%u pos=(%.4f, %.4f, %.4f)\n", base_inst, iid, row.pair, world.x, world.y,
+               world.z);
 
     o.position = float4(dot(pc.clip_rows[0], float4(world, 1.0f)), dot(pc.clip_rows[1], float4(world, 1.0f)),
                         dot(pc.clip_rows[2], float4(world, 1.0f)), dot(pc.clip_rows[3], float4(world, 1.0f)));
@@ -142,20 +143,25 @@ SceneVOut vs_main(uint vid : SV_VertexID, uint iid : SV_InstanceID, uint base_in
        widen), so the geometric normal divides by the same factors. Same
        identity argument as the position path. */
     float3 nrm = unpack_oct(v.normal_oct);
-    o.normal   = normalize(quat_rotate(inst.quat, nrm / max(su, 1e-3f)));
+    o.normal   = normalize(quat_rotate(row.quat, nrm / max(su, 1e-3f)));
     o.uv       = unpack_half2(v.uv);
     o.material = gs.material;
     o.world    = world;
-    o.bloom    = pc.bloom[slot];
     return o;
 }
 
 /* Cook-Torrance GGX against one directional light. Metalness and roughness come
    from the material row, not from a constant, so a model that varies them looks
    like itself rather than like every other model. */
+/* pow() maps to the log2/exp2 path on Intel Gen; the FS fresnels use small
+   integer exponents that cost 1-3 FMAs as repeated squares instead. */
+static float pow2(float x) { return x * x; }
+static float pow3(float x) { return x * x * x; }
+static float pow5(float x) { float x2 = x * x; return x2 * x2 * x; }
+
 static float3 fresnel_schlick(float3 f0, float vdh)
 {
-    return f0 + (1.0f - f0) * pow(1.0f - vdh, 5.0f);
+    return f0 + (1.0f - f0) * pow5(1.0f - vdh);
 }
 
 static float distribution_ggx(float ndh, float roughness)
@@ -297,7 +303,7 @@ float4 fs_main(SceneVOut i) : SV_Target0
        glows like wet gel. Gated on the material flag so ordinary props are
        untouched. */
     if ((m.flags & SCENE_MAT_GEL) != 0u) {
-        float rim = pow(1.0f - saturate(ndv), 3.0f);
+        float rim = pow3(1.0f - saturate(ndv));
         direct += albedo * rim * 0.8f;
     }
 

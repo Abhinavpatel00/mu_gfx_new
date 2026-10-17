@@ -79,8 +79,23 @@ struct ScenePackedVertex {
     SCENE_U32 uv;          /* half2 */
 };
 
+/* ---- 32-byte vertex-shader row: one drawn instance, everything the VS needs.
+   cs_scatter writes one row per survivor (a few thousand per frame) so the VS
+   no longer chases vis -> slot -> seven random tables once per VERTEX (roughly
+   a million per frame). Written by the GPU, for the GPU: the CPU never stages
+   it, and the cull keeps reading SceneInstance. Field order matches the VS's
+   first reads. ---- */
+struct SceneVsRow {
+    float     pos[3];     /* 12 world position (mirror of SceneInstance.pos) */
+    SCENE_U32 quat;       /*  4 10-10-10-2 quaternion                        */
+    SCENE_U32 scale_sq;   /*  4 half scale(lo) | half squash(hi)             */
+    SCENE_U32 st_wg;      /*  4 half stretch(lo) | half wiggle(hi)           */
+    SCENE_U32 bloom_face; /*  4 half bloom(lo) | u16 face tile(hi)           */
+    SCENE_U32 pair;       /*  4 slot/2: body+face share one jiggle phase     */
+};
+
 /* ---- 20-byte instance: world f32 position, quat, uniform half scale, bias.
-   Field order is cull-read order. No stored bounds, no flags. ---- */
+    Field order is cull-read order. No stored bounds, no flags. ---- */
 struct SceneInstance {
     float     pos[3];   /* 12 world position */
     SCENE_U32 quat;     /*  4 10-10-10-2 normalized quaternion */
@@ -197,26 +212,25 @@ struct SceneCullPush {
     SCENE_PTR(SCENE_U32) survivor_count;
     SCENE_PTR(SCENE_U32) counters;
     SCENE_PTR(SCENE_U32) cull_args; /* VkDispatchIndirectCommand triple */
+    SCENE_PTR(SceneVsRow) vs_rows;  /* scatter output: one row per survivor */
 
     SCENE_U32 counts[8]; /* 0 lod_count, 1 candidate_count, 2 max_survivors, 5 shader printf */
 };
 
+/* Draw: what per-vertex work needs. The per-lane datum is ONE row —
+   vs_rows[base_inst + iid] — so the VS does two loads (shade row is broadcast
+   per draw, vs row is one dependent load) and the streamed packed vertex, not
+   the old chain of seven table lookups keyed on vis[slot]. */
 struct SceneDrawPush {
 
     // i think these three field belongs to uniform buffer
     SceneVec4 clip_rows[4]; /* 64 */
     SceneVec4 camera;       /* 16 xyz eye position: specular needs a view vector */
 
-    SCENE_PTR(SceneInstance) instances;
-    SCENE_PTR(SCENE_U32) vis;
     SCENE_PTR(SCENE_U32) group_base; /* vis_base -> group id */
+    SCENE_PTR(SceneVsRow) vs_rows;   /* compacted per-instance rows, one per survivor */
     SCENE_PTR(SceneGroupShade) group_shade;
     SCENE_PTR(SceneGpuMaterial) materials;
-    SCENE_PTR(float) bloom;
-    SCENE_PTR(float) wiggle; /* per-instance jiggle amplitude; 0 = static */
-    SCENE_PTR(float) squash; /* per-instance vertical squash; 1 = rest */
-    SCENE_PTR(float) stretch; /* per-instance forward stretch; 1 = rest */
-    SCENE_PTR(SCENE_U32) face_id; /* per-instance face atlas tile; read only by FACE quads */
     SCENE_U32 counts[8]; /* 5 shader printf */
 };
 
@@ -246,13 +260,20 @@ struct SceneCompactPush {
     SCENE_PTR(SCENE_U32) vis_base;
     SCENE_PTR(SCENE_U32) cmd_index;
     SCENE_PTR(SCENE_U32) cursor;
-    SCENE_PTR(SCENE_U32) vis;
+    SCENE_PTR(SceneVsRow) vs_rows; /* scatter output, one per survivor */
     SCENE_PTR(SceneGpuDraw) draws;
     SCENE_PTR(SceneGpuDraw) group_static;
     SCENE_PTR(SCENE_U32) draw_count;
     SCENE_PTR(SCENE_U32X2) scan_aux;
     SCENE_PTR(SCENE_U32) counters;
     SCENE_PTR(SCENE_U32) group_base; /* vis_base -> group id, for the VS */
+    /* scatter's per-slot sources */
+    SCENE_PTR(SceneInstance) instances;
+    SCENE_PTR(float) bloom;
+    SCENE_PTR(float) wiggle;
+    SCENE_PTR(float) squash;
+    SCENE_PTR(float) stretch;
+    SCENE_PTR(SCENE_U32) face_id;
     SCENE_U32 counts[8];             /* 0 lod_count, 1 group_count G, 2 max_survivors,
                                         3 candidate_count, 4 blocks, 5 debug printf */
 };
@@ -334,6 +355,7 @@ struct SceneSlimePush {
 
 /* ---- layout contract: a lie here is a shader read of the wrong bytes ---- */
 _Static_assert(sizeof(struct ScenePackedVertex) == 16, "ScenePackedVertex is 16 bytes");
+_Static_assert(sizeof(struct SceneVsRow) == 32, "SceneVsRow is 32 bytes");
 _Static_assert(sizeof(struct SceneInstance) == 20, "SceneInstance is 20 bytes");
 _Static_assert(sizeof(struct SceneCullMesh) == 32, "SceneCullMesh is 32 bytes");
 _Static_assert(sizeof(struct SceneGroupShade) == 16, "SceneGroupShade is 16 bytes");
@@ -345,6 +367,16 @@ _Static_assert(sizeof(struct SceneCullPush) <= 256, "SceneCullPush exceeds the 2
 _Static_assert(sizeof(struct SceneDrawPush) <= 256, "SceneDrawPush exceeds the 256-byte push range");
 _Static_assert(sizeof(struct SceneSparklePush) <= 256, "SceneSparklePush exceeds the 256-byte push range");
 _Static_assert(sizeof(struct SceneCompactPush) <= 256, "SceneCompactPush exceeds the push range");
+
+struct SceneSortPush {
+    SCENE_PTR(SCENE_U32) survivors;
+    SCENE_PTR(SCENE_U32) survivor_count;
+    SCENE_PTR(SceneInstance) instances;
+    SCENE_PTR(SCENE_U32) sort_aux;      /* hist[64] | off[65] | cur[64] */
+    SCENE_PTR(SCENE_U32) survivors_sorted; /* scatter output, replaces survivors for compaction */
+    SCENE_U32 counts[4];             /* 0 max_survivors (also dispatch clamp), 3 debug printf */
+};
+_Static_assert(sizeof(struct SceneSortPush) == 56, "SceneSortPush is 56 bytes");
 _Static_assert(sizeof(struct SlimeState) == 96, "SlimeState is 96 bytes");
 _Static_assert(sizeof(struct SceneSlimePush) <= 256, "SceneSlimePush exceeds the push range");
 

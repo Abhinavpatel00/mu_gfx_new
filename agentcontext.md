@@ -35,6 +35,8 @@ bash build.sh          # compileslang.sh release -> embed_shaders.py -> make -j4
   `shaders/*.slang` -> `compiledshaders/*.spv`; (2) `scripts/embed_shaders.py`
   regenerates `build/generated/shaders.h` from `compiledshaders/*.spv`;
   (3) `make -j4` links `build/app`.
+  - **But the linked binary loads `.spv` from disk at runtime** — embedding
+    only matters for a `make release` build. See §7.8 for the implications.
 - `compileslang.sh` is a **per-stage entry-point finder**: a file is compiled as
   vertex/fragment/compute iff it *defines* `vs_main` / `fs_main` / `cs_main`
   (an anchored grep, not a substring match). A new shader stage = define the
@@ -240,6 +242,76 @@ in `update_global_data()`.
 6. Hardware here is an Intel UHD (TGL GT2); perf numbers are very noisy
    (identical runs 10-30 ms). Prefer structure over single-shot timings.
 7. Do **not** read screenshots back into context. Measure and print numbers.
+8. **SPIR-V is loaded from disk at runtime.** `make`'s default target is the
+   DEBUG config with `-DEMBED_SHADERS` commented out (Makefile ~line 128), so
+   every `./build/app` run reads whatever `compiledshaders/*.spv` currently
+   holds. Consequences:
+   - a) Rebuilding `.spv` while an app runs also triggers the dmon hot-reload
+     watcher (`src/renderer.c` watch_callback) → pipelines get rebuilt mid-run
+     from the new files and `printf("Pipeline %d hot reloaded")` appears.
+   - b) You cannot A/B two binaries against different shader states by copying
+     binaries: each run's SPVs = current disk state. For a deterministic
+     shader A/B, snapshot SPV sets (`cp compiledshaders/*.spv /tmp/...`) and
+     `cp` the wanted snapshot into `compiledshaders/` *before* launching.
+   - c) `compileslang.sh` rebuilds `.spv` only when `src -nt out`; editing an
+     included header (e.g. `scene_shared.h`) does not bump the .slang mtimes of
+     its includers, so half the kernels keep stale layouts. When changing ANY
+     shared shader header: `rm -f compiledshaders/*.spv` then `bash build.sh`.
+9. **run cwd = app dir? no: repo root.** `perf_report.txt` is written relative
+   to the process cwd; running the app from another directory looks for assets
+   there and misbehaves. Always run from the repo root:
+   `DISPLAY=:0 MU_RES=678x747 MU_PERF=N ./build/app x11`.
+10. **`MU_RES` is NOT reliable without setting it explicitly every run** — the
+    WM sometimes resizes to 1362x749 and scales all numbers ~4x. Pin
+    `MU_RES=678x747` on every measurement run and grep `resolution:` from the
+    report to confirm.
+11. **System-load noise dominates on this laptop** (`opencode`, `cline`,
+    `freebuff` agent processes eat CPU and add multi-ms jitter to GPU times;
+    run-to-run spread 2x for the same build). Mitigations: `renice -n 15` the
+    agent PIDs before measuring; take 3+ runs; compare matched rows (cur/avg
+    of `Scene Draw`) rather than whole-frame numbers; prefer instruction counts
+    (see §10) as a noise-free signal.
+
+---
+
+## 10. GPU profiling + shader instruction analysis tooling (new)
+
+### Per-pass GPU profiler
+- `GPU_SCOPE(prof, cmd, "Name", STAGE_*)` in `src/helpers.h` brackets one pass
+  with timestamp queries; the profiler lives at `vk->gpuprofiler[frame]`;
+  `perf_dump()` in `src/renderer.c` prints/pass times into `perf_report.txt`.
+- **Do not nest GPU_SCOPEs** — the report sums every scope into the frame
+  total, so a nested scope double-counts. One scope per pass ("Sky", "Cull",
+  "Scene Draw", ...), post passes keep their own ("SSAO", "Bloom", ...).
+- Baseline per-pass budget at 678x747 (iGPU, mid-noise): Scene Draw ~9.5 ms of
+  ~13.7 ms frame; then Tonemap ~1.3, SSAO ~0.8, SMAA ~0.9 total, Bloom ~0.4,
+  rest ~1 ms combined.
+
+### SPIR-V instruction audit (noise-free signal)
+- `spirv-dis` (v2026.4, `/usr/bin/`) disassembles `compiledshaders/*.spv`.
+- A counting script pattern lives at /tmp/opencode/spivcount.py (may not
+  persist; recreate): counts `OpLoad/OpStore`, image samples, `OpExtInst`
+  transcendentals (Pow/Exp2/Sqrt/FClamp/FMax), `OpFDiv` per stage-file.
+- On Intel Gen, `pow()` maps to a log2/exp2 path (~30 cycles) — **integer-
+  exponent pows were replaced with repeated-square helpers** (`pow2..pow48`,
+  see `shaders/toon.slang` / `shaders/scene.slang`), cutting toon.frag from
+  8 `OpPow` to 1 `Sqrt` and scene.frag from 3 `OpPow` to 1 (the GGX spec
+  exponent is variable — must stay). SSAO/gamma pows have variable exponents;
+  left alone. Frozen-time pixel diff of pow-expanded vs pow shaders:
+  mean 0.14/255 (bit-identical to the eye).
+- VS (toon/scene, ~560 instrs) is already 1 dependent row load + vertex
+  stream; per-vertex `materials[gs.material].flags` FACE test could fold into
+  `SceneGroupShade` (one more load removal candidate).
+
+### Scene row consolidation (done, in working tree)
+- The old per-vertex chain vis -> slot -> {instances, squash, stretch, wiggle,
+  bloom, face} (4-7 dependent/random loads per VERTEX at ~1 M verts) became
+  one 32-byte `SceneVsRow` written once per SURVIVOR by `cs_scatter`
+  (~3.8k rows/frame; ~1/250th the volume). `src/three_d/scene_shared.h`
+  documents the layout; the draw push struct and read lists shrank accordingly.
+- Measured effect at this resolution: Scene Draw 9.5 -> ~9.2 ms avg (~3%,
+  inside rig noise; structural win presumed real but under-measurable here).
+
 
 ---
 

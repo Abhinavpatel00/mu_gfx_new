@@ -47,64 +47,75 @@ struct SceneVOut {
 [shader("vertex")]
 SceneVOut vs_main(uint vid : SV_VertexID, uint iid : SV_InstanceID, uint base_inst : SV_StartInstanceLocation)
 {
-    SceneGroupShade gs   = pc.group_shade[pc.group_base[base_inst]];
-    SceneU32        slot = pc.vis[base_inst + iid];
+    SceneGroupShade gs  = pc.group_shade[pc.group_base[base_inst]];
+    SceneVsRow      row = pc.vs_rows[base_inst + iid];
 
-    SceneInstance     inst = pc.instances[slot];
-    ScenePackedVertex v    = gs.vertex_stream[vid];
+    ScenePackedVertex v = gs.vertex_stream[vid];
 
     float3 local = float3(unpack_half2(v.position_xy), f16tof32(v.position_z & 0xFFFFu));
-    float  s     = f16tof32(inst.scale);
-    float3 ipos  = float3(inst.pos[0], inst.pos[1], inst.pos[2]);
+    float  s     = f16tof32(row.scale_sq & 0xFFFFu);
+    float3 ipos  = float3(row.pos[0], row.pos[1], row.pos[2]);
     /* Same hop squash-and-stretch + gel jiggle as scene.slang:vs_main. sy==1
        and amp==0 (the defaults for every non-slime instance) is the identity. */
-    float  sy      = pc.squash[slot];
-    float  widen   = rsqrt(max(sy, 1e-3f));
-    float3 su      = float3(widen, sy, widen);
+    float  sy    = f16tof32(row.scale_sq >> 16u);
+    float  widen = rsqrt(max(sy, 1e-3f));
+    float3 su    = float3(widen, sy, widen);
 
     SceneVOut o;
-    o.face = pc.face_id[slot];
+    o.face  = row.bloom_face >> 16u;
+    float amp = f16tof32(row.st_wg >> 16u);
+    o.bloom   = f16tof32(row.bloom_face & 0xFFFFu);
 
     /* SDF face quad: body-locked decal, same math as scene.slang. */
     if ((pc.materials[gs.material].flags & SCENE_MAT_FACE) != 0u) {
         float3 fq = float3(local.x * 1.05f * s * widen, (local.y * 0.85f + 0.12f) * s * sy, 1.02f * s * widen);
-        float3 world = ipos + quat_rotate(inst.quat, fq);
-        float famp = pc.wiggle[slot];
-        if (famp != 0.0f) {
+        float3 world = ipos + quat_rotate(row.quat, fq);
+        if (amp != 0.0f) {
             float fh  = local.y + 0.5f;
-            float fph = global_data.time * 6.0f + float(slot / 2u) * 2.399963f;
-            world += quat_rotate(inst.quat, unpack_oct(v.normal_oct)) * (sin(fph) * famp * fh * s);
+            float fph = global_data.time * 6.0f + float(row.pair) * 2.399963f;
+            world += quat_rotate(row.quat, unpack_oct(v.normal_oct)) * (sin(fph) * amp * fh * s);
         }
         o.position = float4(dot(pc.clip_rows[0], float4(world, 1.0f)), dot(pc.clip_rows[1], float4(world, 1.0f)),
                             dot(pc.clip_rows[2], float4(world, 1.0f)), dot(pc.clip_rows[3], float4(world, 1.0f)));
-        o.normal   = quat_rotate(inst.quat, unpack_oct(v.normal_oct));
+        o.normal   = quat_rotate(row.quat, unpack_oct(v.normal_oct));
         o.uv       = unpack_half2(v.uv);
         o.material = gs.material;
         o.world    = world;
-        o.bloom    = pc.bloom[slot];
         return o;
     }
 
-    float3 world   = ipos + quat_rotate(inst.quat, local * su * s);
+    float3 world   = ipos + quat_rotate(row.quat, local * su * s);
 
-    float amp = pc.wiggle[slot];
     if (amp != 0.0f)
     {
         float h    = local.y * 0.5f + 0.5f;
-        float ph   = global_data.time * 6.0f + float(slot / 2u) * 2.399963f;
-        world += quat_rotate(inst.quat, unpack_oct(v.normal_oct)) * (sin(ph) * amp * h * s);
+        float ph   = global_data.time * 6.0f + float(row.pair) * 2.399963f;
+        world += quat_rotate(row.quat, unpack_oct(v.normal_oct)) * (sin(ph) * amp * h * s);
     }
 
     o.position = float4(dot(pc.clip_rows[0], float4(world, 1.0f)), dot(pc.clip_rows[1], float4(world, 1.0f)),
                         dot(pc.clip_rows[2], float4(world, 1.0f)), dot(pc.clip_rows[3], float4(world, 1.0f)));
     float3 nrm = unpack_oct(v.normal_oct);
-    o.normal   = normalize(quat_rotate(inst.quat, nrm / max(su, 1e-3f)));
+    o.normal   = normalize(quat_rotate(row.quat, nrm / max(su, 1e-3f)));
     o.uv       = unpack_half2(v.uv);
     o.material = gs.material;
     o.world    = world;
-    o.bloom    = pc.bloom[slot];
     return o;
 }
+
+/* Integer/2.5-exponent helpers. pow() maps to the Medium log2/exp2 path on
+   Intel Gen (LUT + two transcendentals, ~30 cycles); repeated squares are
+   1-6 cheaper FMAs and the FS runs once per pixel, so the style/gel fresnels
+   and spec dots take the multiplier chain. Bit-approx differences vs pow()
+   are within cosmetic noise for a stylized look. */
+static float pow2(float x) { return x * x; }
+static float pow3(float x) { return x * x * x; }
+static float pow4(float x) { float x2 = x * x; return x2 * x2; }
+static float pow5(float x) { float x2 = x * x; return x2 * x2 * x; }
+static float pow24(float x) { float x2 = x * x; float x4 = x2 * x2; float x8 = x4 * x4; return x8 * x8 * x8; }
+static float pow32(float x) { float x2 = x * x; float x4 = x2 * x2; float x8 = x4 * x4; float x16 = x8 * x8; return x16 * x16; }
+static float pow48(float x) { float x2 = x * x; float x4 = x2 * x2; float x8 = x4 * x4; float x16 = x8 * x8; return x16 * x16 * x16; }
+static float pow2_5(float x) { float x2 = x * x; return x2 * sqrt(x); }
 
 [shader("fragment")]
 float4 fs_main(SceneVOut i) : SV_Target0
@@ -200,10 +211,10 @@ float4 fs_main(SceneVOut i) : SV_Target0
         float  ramp = (floor(f) + smoothstep(0.47f, 0.53f, f - floor(f))) * 0.5f;
         float3 shadow = float3(0.58f, 0.66f, 0.86f);
         diffuse   = kd * albedo * ramp * lerp(float3(1.0f), shadow, 1.0f - ramp);
-        float  sp = pow(ndh, 48.0f);
+        float  sp = pow48(ndh);
         specular  = f0 * smoothstep(0.35f, 0.42f, sp) * (1.0f - roughness * 0.7f);
-        rim       = albedo * pow(1.0f - ndv, 4.0f) * 0.18f * (0.4f + 0.6f * ramp);
-        outline   = pow(1.0f - ndv, 5.0f) * 0.45f;
+        rim       = albedo * pow4(1.0f - ndv) * 0.18f * (0.4f + 0.6f * ramp);
+        outline   = pow5(1.0f - ndv) * 0.45f;
     } else if (style == 1u) {
         /* Soft stylized: four gently smoothed steps, a neutral-warm shadow, a
            modest soft specular and a breath of sky rim. */
@@ -211,9 +222,9 @@ float4 fs_main(SceneVOut i) : SV_Target0
         float  ramp = (floor(f) + smoothstep(0.25f, 0.75f, f - floor(f))) * 0.25f;
         float3 shadow = float3(1.0f, 0.97f, 0.93f);
         diffuse   = kd * albedo * ramp * lerp(float3(1.0f), shadow, 1.0f - ramp);
-        float  sp = pow(ndh, 32.0f);
+        float  sp = pow32(ndh);
         specular  = f0 * smoothstep(0.28f, 0.55f, sp) * 0.6f;
-        rim       = env_sky_color() * pow(1.0f - ndv, 2.5f) * (0.4f + 0.4f * ramp) * 0.12f;
+        rim       = env_sky_color() * pow2_5(1.0f - ndv) * (0.4f + 0.4f * ramp) * 0.12f;
     } else {
         /* Painterly: two wide soft steps, a warm shadow, a strong sky-to-ground
            ambient gradient and almost no specular — an illustrated look. */
@@ -221,14 +232,14 @@ float4 fs_main(SceneVOut i) : SV_Target0
         float  ramp = (floor(f) + smoothstep(0.12f, 0.88f, f - floor(f))) * 0.5f;
         float3 shadow = float3(0.86f, 0.76f, 0.60f);
         diffuse   = kd * albedo * ramp * lerp(float3(1.0f), shadow, 1.0f - ramp);
-        specular  = f0 * pow(ndh, 24.0f) * 0.25f;
+        specular  = f0 * pow24(ndh) * 0.25f;
         float3 warm = lerp(env_sky_color(), env_sun_radiance(), 0.5f);
-        rim       = warm * pow(1.0f - ndv, 2.0f) * (0.5f + 0.5f * ramp) * 0.16f;
+        rim       = warm * pow2(1.0f - ndv) * (0.5f + 0.5f * ramp) * 0.16f;
     }
 
     /* Gel slimes keep their wet albedo-tinted fresnel on top of any style. */
     if ((m.flags & SCENE_MAT_GEL) != 0u)
-        rim += albedo * pow(1.0f - ndv, 3.0f) * 0.25f;
+        rim += albedo * pow3(1.0f - ndv) * 0.25f;
 
      /* The band is an irradiance multiplier, so keep the direct term on the same
          Lambert 1/pi HDR scale as the PBR path instead of adding white light. */

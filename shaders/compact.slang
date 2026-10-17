@@ -230,14 +230,31 @@ void cs_emit(uint3 gid : SV_GroupID, uint3 lid : SV_GroupThreadID)
 
 [shader("compute")]
 [numthreads(64, 1, 1)]
+/* Scatter also builds the per-survivor SceneVsRow: the draw's vertex shader
+   then does ONE dependent table load per vertex instead of chasing seven
+   per-slot tables keyed on the slot. The random loads here run once per
+   survivor; in the VS they ran once per vertex — 100x more often. */
 void cs_scatter(uint3 tid : SV_DispatchThreadID)
 {
     uint n = min(pc.survivor_count[0], pc.counts[2]);
     if (tid.x >= n)
         return;
-    uint key   = pc.survivors[tid.x];
-    uint g     = group_of(key);
+    uint key = pc.survivors[tid.x];
+    uint g   = group_of(key);
     uint local;
     InterlockedAdd(pc.cursor[g], 1u, local);
-    pc.vis[pc.vis_base[g] + local] = key & 0xFFFFu;
+    uint dst  = pc.vis_base[g] + local;
+    uint slot = key & 0xFFFFu;
+
+    SceneInstance inst = pc.instances[slot];
+    SceneVsRow    row;
+    row.pos[0]      = inst.pos[0];
+    row.pos[1]      = inst.pos[1];
+    row.pos[2]      = inst.pos[2];
+    row.quat       = inst.quat;
+    row.scale_sq   = (uint)inst.scale | (f32tof16(pc.squash[slot]) << 16u);
+    row.st_wg      = f32tof16(pc.stretch[slot]) | (f32tof16(pc.wiggle[slot]) << 16u);
+    row.bloom_face = f32tof16(pc.bloom[slot]) | ((pc.face_id[slot] << 16u));
+    row.pair       = slot >> 1u; /* body+face share one jiggle phase */
+    pc.vs_rows[dst] = row;
 }

@@ -38,7 +38,7 @@
 
 
 #define MAX_COLOR_ATTACHMENTS 8
-#define VALIDATION false 
+#define VALIDATION false
 #define GPU_VALIDATION false 
 
 #define GPU_PRINTF false 

@@ -108,12 +108,14 @@ typedef struct SceneViewFrame {
     BufferSlice vis_base;
     BufferSlice cmd_index;
     BufferSlice cursor;
-    BufferSlice vis;
+    BufferSlice vsrows;     /* max_survivors x SceneVsRow: scatter output, read by the VS */
     BufferSlice draws;
     BufferSlice draw_count;
     BufferSlice scan_aux;   /* 3 * SCENE_SCAN_BLOCK u32x2: block totals + offsets */
     BufferSlice cull_args;  /* VkDispatchIndirectCommand triple, INDIRECT usage */
     BufferSlice group_base; /* max_survivors x u32: vis_base -> group id */
+    BufferSlice surv_sorted; /* max_survivors x u32: depth-sorted survivor list */
+    BufferSlice sort_aux;   /* 128 u32: depth-bucket hist[64] | cursor[64] */
 
 } SceneViewFrame;
 
@@ -251,6 +253,7 @@ struct Scene {
 
     /* pipelines */
     PipelineID cs_cull, cs_count, cs_scan_block, cs_scan_blocks, cs_emit, cs_scatter;
+    PipelineID cs_sort_clear, cs_sort_hist, cs_sort_scan, cs_sort_scatter;
     PipelineID cs_slime_sim, cs_slime_grid, cs_slime_resolve;
     PipelineID draw_pipeline;
     PipelineID toon_pipeline; /* cel-shaded variant of the scene draw */
@@ -471,6 +474,10 @@ Scene *scene_create(VkBackend *vk, const SceneDesc *desc) {
     s->cs_scan_blocks = pipeline_create_compute(vk, "compiledshaders/compact.cs_scan_blocks.comp.spv");
     s->cs_emit        = pipeline_create_compute(vk, "compiledshaders/compact.cs_emit.comp.spv");
     s->cs_scatter     = pipeline_create_compute(vk, "compiledshaders/compact.cs_scatter.comp.spv");
+    s->cs_sort_clear = pipeline_create_compute(vk, "compiledshaders/sort.cs_sort_clear.comp.spv");
+    s->cs_sort_hist   = pipeline_create_compute(vk, "compiledshaders/sort.cs_sort_hist.comp.spv");
+    s->cs_sort_scan   = pipeline_create_compute(vk, "compiledshaders/sort.cs_sort_scan.comp.spv");
+    s->cs_sort_scatter = pipeline_create_compute(vk, "compiledshaders/sort.cs_sort_scatter.comp.spv");
     s->cs_slime_sim     = pipeline_create_compute(vk, "compiledshaders/slime_sim.comp.spv");
     s->cs_slime_grid    = pipeline_create_compute(vk, "compiledshaders/slime_grid.comp.spv");
     s->cs_slime_resolve = pipeline_create_compute(vk, "compiledshaders/slime_resolve.comp.spv");
@@ -525,11 +532,13 @@ void scene_destroy(Scene *s) {
         buffer_pool_free(vf->vis_base);
         buffer_pool_free(vf->cmd_index);
         buffer_pool_free(vf->cursor);
-        buffer_pool_free(vf->vis);
+        buffer_pool_free(vf->vsrows);
         buffer_pool_free(vf->draws);
         buffer_pool_free(vf->draw_count);
         buffer_pool_free(vf->scan_aux);
         buffer_pool_free(vf->cull_args);
+        buffer_pool_free(vf->surv_sorted);
+        buffer_pool_free(vf->sort_aux);
         buffer_pool_free(vf->group_base);
     }
     free(s->staged_vertices);
@@ -1403,7 +1412,7 @@ static void ensure_view_frame(Scene *s, uint32_t view, uint32_t lane) {
     vf->vis_base       = alloc_slice(s, (VkDeviceSize)G * sizeof(uint32_t), 16);
     vf->cmd_index      = alloc_slice(s, (VkDeviceSize)G * sizeof(uint32_t), 16);
     vf->cursor         = alloc_slice(s, (VkDeviceSize)G * sizeof(uint32_t), 16);
-    vf->vis            = alloc_slice(s, (VkDeviceSize)s->max_survivors * sizeof(uint32_t), 16);
+    vf->vsrows         = alloc_slice(s, (VkDeviceSize)s->max_survivors * sizeof(struct SceneVsRow), 16);
     vf->draws          = alloc_slice(s, (VkDeviceSize)G * sizeof(struct SceneGpuDraw), 16);
     vf->draw_count     = alloc_slice(s, sizeof(uint32_t), 16);
     /* Three regions of uint2: block totals, visibility offsets, draw offsets.
@@ -1413,6 +1422,8 @@ static void ensure_view_frame(Scene *s, uint32_t view, uint32_t lane) {
     vf->scan_aux   = alloc_slice(s, (VkDeviceSize)SCENE_SCAN_BLOCK * 3u * sizeof(SceneU32x2), 16);
     vf->cull_args  = alloc_slice(s, 16, 16);
     vf->group_base = alloc_slice(s, (VkDeviceSize)s->max_survivors * sizeof(uint32_t), 16);
+    vf->surv_sorted = alloc_slice(s, (VkDeviceSize)s->max_survivors * sizeof(uint32_t), 16);
+    vf->sort_aux   = alloc_slice(s, (VkDeviceSize)128 * sizeof(uint32_t), 16);
     vf->ready      = true;
 }
 
@@ -1442,6 +1453,20 @@ static void build_cull_push(Scene *s, uint32_t view, uint32_t lane, struct Scene
     p->counts[5] = getenv("MU_SHADER_DEBUG") ? 1u : 0u;
 }
 
+static void build_sort_push(Scene *s, uint32_t view, uint32_t lane, struct SceneSortPush *p) {
+    memset(p, 0, sizeof(*p));
+    VkBackend      *vk = s->vk;
+    SceneViewFrame *vf = &s->view_frame[view][lane];
+
+    p->survivors        = slice_addr(vk, vf->survivors);
+    p->survivor_count   = slice_addr(vk, vf->survivor_count);
+    p->instances        = slice_addr(vk, s->instances);
+    p->sort_aux         = slice_addr(vk, vf->sort_aux);
+    p->survivors_sorted = slice_addr(vk, vf->surv_sorted);
+
+    p->counts[0] = s->max_survivors;
+}
+
 static void build_draw_push(Scene *s, uint32_t view, uint32_t lane, struct SceneDrawPush *p) {
     memset(p, 0, sizeof(*p));
     VkBackend      *vk = s->vk;
@@ -1461,16 +1486,10 @@ static void build_draw_push(Scene *s, uint32_t view, uint32_t lane, struct Scene
     p->camera.z = s->views[view].camera_pos[2];
     p->camera.w = 0.0f;
 
-    p->instances   = slice_addr(vk, s->instances);
-    p->vis         = slice_addr(vk, vf->vis);
     p->group_base  = slice_addr(vk, vf->group_base);
+    p->vs_rows     = slice_addr(vk, vf->vsrows);
     p->group_shade = slice_addr(vk, s->group_shade);
     p->materials   = slice_addr(vk, s->materials);
-    p->bloom       = slice_addr(vk, s->bloom_table);
-    p->wiggle      = slice_addr(vk, s->wiggle_table);
-    p->squash      = slice_addr(vk, s->squash_table);
-    p->stretch     = slice_addr(vk, s->stretch_table);
-    p->face_id     = slice_addr(vk, s->face_table);
 
     p->counts[5] = getenv("MU_SHADER_DEBUG") ? 1u : 0u;
 }
@@ -1485,6 +1504,7 @@ static void slime_record(Scene *s, VkCommandBuffer cmd, uint32_t view) {
         return;
 
     VkBackend   *vk     = s->vk;
+    GpuProfiler *prof   = &vk->gpuprofiler[vk->current_frame];
     uint32_t     count  = s->slime_count;
     uint32_t     groups = (count + 63u) / 64u;
     BufferSlice *st_in  = &s->slime_state[s->slime_parity];
@@ -1530,9 +1550,11 @@ static void slime_record(Scene *s, VkCommandBuffer cmd, uint32_t view) {
                                  .buf_writes      = sim_write,
                                  .buf_write_count = 1,
                                  .pipeline        = s->cs_slime_sim};
-    begin_pass(vk, cmd, &sim_pass);
-    dispatch_push(vk, cmd, (ByteSpan){&sp, (uint32_t)sizeof(sp)}, groups, 1, 1);
-    end_pass(vk, cmd, &sim_pass);
+    GPU_SCOPE(prof, cmd, "Slime Sim", STAGE_CS) {
+        begin_pass(vk, cmd, &sim_pass);
+        dispatch_push(vk, cmd, (ByteSpan){&sp, (uint32_t)sizeof(sp)}, groups, 1, 1);
+        end_pass(vk, cmd, &sim_pass);
+    }
 
     BufferAccess grid_reads[3] = {
         {.slice = *st_in, .stage = STAGE_CS, .access = ACCESS_SSBO_R},
@@ -1548,9 +1570,11 @@ static void slime_record(Scene *s, VkCommandBuffer cmd, uint32_t view) {
                           .buf_writes      = grid_writes,
                           .buf_write_count = 2,
                           .pipeline        = s->cs_slime_grid};
-    begin_pass(vk, cmd, &grid_pass);
-    dispatch_push(vk, cmd, (ByteSpan){&sp, (uint32_t)sizeof(sp)}, groups, 1, 1);
-    end_pass(vk, cmd, &grid_pass);
+    GPU_SCOPE(prof, cmd, "Slime Grid", STAGE_CS) {
+        begin_pass(vk, cmd, &grid_pass);
+        dispatch_push(vk, cmd, (ByteSpan){&sp, (uint32_t)sizeof(sp)}, groups, 1, 1);
+        end_pass(vk, cmd, &grid_pass);
+    }
 
     BufferAccess res_reads[6] = {
         {.slice = *st_in, .stage = STAGE_CS, .access = ACCESS_SSBO_R},
@@ -1575,9 +1599,11 @@ static void slime_record(Scene *s, VkCommandBuffer cmd, uint32_t view) {
                          .buf_writes      = res_writes,
                          .buf_write_count = 5,
                          .pipeline        = s->cs_slime_resolve};
-    begin_pass(vk, cmd, &res_pass);
-    dispatch_push(vk, cmd, (ByteSpan){&sp, (uint32_t)sizeof(sp)}, groups, 1, 1);
-    end_pass(vk, cmd, &res_pass);
+    GPU_SCOPE(prof, cmd, "Slime Resolve", STAGE_CS) {
+        begin_pass(vk, cmd, &res_pass);
+        dispatch_push(vk, cmd, (ByteSpan){&sp, (uint32_t)sizeof(sp)}, groups, 1, 1);
+        end_pass(vk, cmd, &res_pass);
+    }
 
     s->slime_parity ^= 1u;
 }
@@ -1587,6 +1613,7 @@ void scene_frame(Scene *s, VkCommandBuffer cmd, RenderTarget *color, RenderTarge
         return;
     VkBackend *vk   = s->vk;
     uint32_t   lane = vk->current_frame;
+    GpuProfiler *prof = &vk->gpuprofiler[vk->current_frame];
 
     ensure_pipelines(s, color, depth);
 
@@ -1618,6 +1645,7 @@ void scene_frame(Scene *s, VkCommandBuffer cmd, RenderTarget *color, RenderTarge
     /* Apply a pending roster change to the indirect dispatch args. This is the
        only place the CPU writes them, and only when the roster actually grew. */
     /* scene_frame */
+    GPU_SCOPE(prof, cmd, "Scene Upload", STAGE_XFER) {
     if (s->cull_args_dirty[lane]) {
         uint32_t args[4] = {(s->candidate_count + 63u) / 64u, 1u, 1u, 0u};
         if (args[0] == 0)
@@ -1722,13 +1750,16 @@ void scene_frame(Scene *s, VkCommandBuffer cmd, RenderTarget *color, RenderTarge
             vk, cmd, cand, (ByteSpan){s->candidate_upload_scratch, s->candidate_count * sizeof(struct SceneCullRow)});
         s->candidates_dirty = false;
     }
+    } /* Scene Upload */
 
     uint32_t G = s->group_count;
 
     /* The streamed world moved: re-bucket the obstacle discs around the camera
        and upload before the sim reads them this frame. */
-    if (s->slime_active && s->slime_obs_dirty)
-        slime_obstacles_rebuild(s, cmd, 0u);
+    if (s->slime_active && s->slime_obs_dirty) {
+        GPU_SCOPE(prof, cmd, "Obs Rebuild", STAGE_XFER)
+            slime_obstacles_rebuild(s, cmd, 0u);
+    }
 
     slime_record(s, cmd, 0u);
 
@@ -1762,7 +1793,13 @@ void scene_frame(Scene *s, VkCommandBuffer cmd, RenderTarget *color, RenderTarge
         cp.vis_base       = slice_addr(vk, vf->vis_base);
         cp.cmd_index      = slice_addr(vk, vf->cmd_index);
         cp.cursor         = slice_addr(vk, vf->cursor);
-        cp.vis            = slice_addr(vk, vf->vis);
+        cp.vs_rows        = slice_addr(vk, vf->vsrows);
+        cp.instances      = slice_addr(vk, s->instances);
+        cp.bloom          = slice_addr(vk, s->bloom_table);
+        cp.wiggle         = slice_addr(vk, s->wiggle_table);
+        cp.squash         = slice_addr(vk, s->squash_table);
+        cp.stretch        = slice_addr(vk, s->stretch_table);
+        cp.face_id        = slice_addr(vk, s->face_table);
         cp.draws          = slice_addr(vk, vf->draws);
         cp.group_static   = slice_addr(vk, s->group_static);
         cp.draw_count     = slice_addr(vk, vf->draw_count);
@@ -1825,9 +1862,12 @@ void scene_frame(Scene *s, VkCommandBuffer cmd, RenderTarget *color, RenderTarge
             .pipeline        = s->cs_cull,
         };
 
-        begin_pass(vk, cmd, &cull_pass);
-        dispatch_indirect(vk, cmd, (ByteSpan){&cp_push, (uint32_t)sizeof(cp_push)}, vf->cull_args);
-        end_pass(vk, cmd, &cull_pass);
+        /* T2: cull */
+        GPU_SCOPE(prof, cmd, "Cull", STAGE_CS) {
+            begin_pass(vk, cmd, &cull_pass);
+            dispatch_indirect(vk, cmd, (ByteSpan){&cp_push, (uint32_t)sizeof(cp_push)}, vf->cull_args);
+            end_pass(vk, cmd, &cull_pass);
+        }
 
         /* T3a: histogram survivors by (mesh,lod) group */
         BufferAccess count_reads[2] = {
@@ -1850,9 +1890,11 @@ void scene_frame(Scene *s, VkCommandBuffer cmd, RenderTarget *color, RenderTarge
             .buf_write_count = ARRAY_COUNT(count_writes),
             .pipeline        = s->cs_count,
         };
-        begin_pass(vk, cmd, &count_pass);
-        dispatch_push(vk, cmd, (ByteSpan){&cp, (uint32_t)sizeof(cp)}, (s->max_survivors + 63u) / 64u, 1, 1);
-        end_pass(vk, cmd, &count_pass);
+        GPU_SCOPE(prof, cmd, "Compact Count", STAGE_CS) {
+            begin_pass(vk, cmd, &count_pass);
+            dispatch_push(vk, cmd, (ByteSpan){&cp, (uint32_t)sizeof(cp)}, (s->max_survivors + 63u) / 64u, 1, 1);
+            end_pass(vk, cmd, &count_pass);
+        }
 
         /* T3b: scan group_count -> vis_base + draw commands + draw_count */
         /* T3b: two-level scan + emit. The old code ran this as one workgroup
@@ -1903,9 +1945,11 @@ void scene_frame(Scene *s, VkCommandBuffer cmd, RenderTarget *color, RenderTarge
             .buf_write_count = ARRAY_COUNT(scan_writes),
             .pipeline        = s->cs_scan_block,
         };
-        begin_pass(vk, cmd, &scan_pass);
-        dispatch_push(vk, cmd, (ByteSpan){&cp, (uint32_t)sizeof(cp)}, cp.counts[4], 1, 1);
-        end_pass(vk, cmd, &scan_pass);
+        GPU_SCOPE(prof, cmd, "Scan Block", STAGE_CS) {
+            begin_pass(vk, cmd, &scan_pass);
+            dispatch_push(vk, cmd, (ByteSpan){&cp, (uint32_t)sizeof(cp)}, cp.counts[4], 1, 1);
+            end_pass(vk, cmd, &scan_pass);
+        }
 
         /* cs_scan_blocks READS scan_aux region 0 (the per-block totals cs_scan_block
            just wrote) and writes regions 1 and 2. Declaring writes only left the
@@ -1924,9 +1968,11 @@ void scene_frame(Scene *s, VkCommandBuffer cmd, RenderTarget *color, RenderTarge
             .buf_write_count = ARRAY_COUNT(scan_writes),
             .pipeline        = s->cs_scan_blocks,
         };
-        begin_pass(vk, cmd, &block_pass);
-        dispatch_push(vk, cmd, (ByteSpan){&cp, (uint32_t)sizeof(cp)}, 1, 1, 1);
-        end_pass(vk, cmd, &block_pass);
+        GPU_SCOPE(prof, cmd, "Scan Blocks", STAGE_CS) {
+            begin_pass(vk, cmd, &block_pass);
+            dispatch_push(vk, cmd, (ByteSpan){&cp, (uint32_t)sizeof(cp)}, 1, 1, 1);
+            end_pass(vk, cmd, &block_pass);
+        }
 
         /* cs_emit reads group_count, group_static and the block offsets in
            scan_aux regions 1 and 2. */
@@ -1948,12 +1994,18 @@ void scene_frame(Scene *s, VkCommandBuffer cmd, RenderTarget *color, RenderTarge
             .buf_write_count = ARRAY_COUNT(scan_writes),
             .pipeline        = s->cs_emit,
         };
-        begin_pass(vk, cmd, &emit_pass);
-        dispatch_push(vk, cmd, (ByteSpan){&cp, (uint32_t)sizeof(cp)}, cp.counts[4], 1, 1);
-        end_pass(vk, cmd, &emit_pass);
+        GPU_SCOPE(prof, cmd, "Emit Draws", STAGE_CS) {
+            begin_pass(vk, cmd, &emit_pass);
+            dispatch_push(vk, cmd, (ByteSpan){&cp, (uint32_t)sizeof(cp)}, cp.counts[4], 1, 1);
+            end_pass(vk, cmd, &emit_pass);
+        }
 
-        /* T3c: scatter survivors into their group's contiguous vis range */
-        BufferAccess scatter_reads[4] = {
+        /* T3c: scatter survivors into their group's contiguous vsrow range.
+           The row is built HERE, once per survivor, from the per-slot tables;
+           the VS then does one dependent load per VERTEX instead of seven.
+           This is the same access pattern the draw would have, paid at 1/250th
+           the volume. */
+        BufferAccess scatter_reads[10] = {
             {.slice  = vf->survivors,
              .stage  = STAGE_CS,
              .access = ACCESS_SSBO_R},
@@ -1966,9 +2018,27 @@ void scene_frame(Scene *s, VkCommandBuffer cmd, RenderTarget *color, RenderTarge
             {.slice  = vf->cursor,
              .stage  = STAGE_CS,
              .access = ACCESS_SSBO_R | ACCESS_SSBO_W},
+            {.slice  = s->instances,
+             .stage  = STAGE_CS,
+             .access = ACCESS_SSBO_R},
+            {.slice  = s->bloom_table,
+             .stage  = STAGE_CS,
+             .access = ACCESS_SSBO_R},
+            {.slice  = s->wiggle_table,
+             .stage  = STAGE_CS,
+             .access = ACCESS_SSBO_R},
+            {.slice  = s->squash_table,
+             .stage  = STAGE_CS,
+             .access = ACCESS_SSBO_R},
+            {.slice  = s->stretch_table,
+             .stage  = STAGE_CS,
+             .access = ACCESS_SSBO_R},
+            {.slice  = s->face_table,
+             .stage  = STAGE_CS,
+             .access = ACCESS_SSBO_R},
         };
         BufferAccess scatter_writes[1] = {
-            {.slice  = vf->vis,
+            {.slice  = vf->vsrows,
              .stage  = STAGE_CS,
              .access = ACCESS_SSBO_W},
         };
@@ -1979,9 +2049,11 @@ void scene_frame(Scene *s, VkCommandBuffer cmd, RenderTarget *color, RenderTarge
             .buf_write_count = ARRAY_COUNT(scatter_writes),
             .pipeline        = s->cs_scatter,
         };
-        begin_pass(vk, cmd, &scatter_pass);
-        dispatch_push(vk, cmd, (ByteSpan){&cp, (uint32_t)sizeof(cp)}, (s->max_survivors + 63u) / 64u, 1, 1);
-        end_pass(vk, cmd, &scatter_pass);
+        GPU_SCOPE(prof, cmd, "Scatter", STAGE_CS) {
+            begin_pass(vk, cmd, &scatter_pass);
+            dispatch_push(vk, cmd, (ByteSpan){&cp, (uint32_t)sizeof(cp)}, (s->max_survivors + 63u) / 64u, 1, 1);
+            end_pass(vk, cmd, &scatter_pass);
+        }
 
         /* T5: draw */
         /* The renderer draws the sky into the HDR target first, so the draw
@@ -1991,10 +2063,7 @@ void scene_frame(Scene *s, VkCommandBuffer cmd, RenderTarget *color, RenderTarge
         PassAttachment dep = {.target = depth, .load = LOAD_CLEAR, .store = STORE_KEEP};
         dep.clear[0]       = 0.0f; /* reverse-Z: the far plane is 0.0 */
 
-        BufferAccess draw_reads[14] = {
-            {.slice  = s->instances,
-             .stage  = STAGE_VERT,
-             .access = ACCESS_SSBO_R},
+        BufferAccess draw_reads[8] = {
             {.slice  = s->vertex_arena,
              .stage  = STAGE_VERT,
              .access = ACCESS_SSBO_R},
@@ -2004,7 +2073,7 @@ void scene_frame(Scene *s, VkCommandBuffer cmd, RenderTarget *color, RenderTarge
             {.slice  = s->materials,
              .stage  = STAGE_FRAG,
              .access = ACCESS_SSBO_R},
-            {.slice  = vf->vis,
+            {.slice  = vf->vsrows,
              .stage  = STAGE_VERT,
              .access = ACCESS_SSBO_R},
             {.slice  = vf->draws,
@@ -2019,21 +2088,6 @@ void scene_frame(Scene *s, VkCommandBuffer cmd, RenderTarget *color, RenderTarge
             {.slice  = vf->group_base,
              .stage  = STAGE_VERT,
              .access = ACCESS_SSBO_R},
-            {.slice  = s->bloom_table,
-             .stage  = STAGE_VERT,
-             .access = ACCESS_SSBO_R},
-            {.slice  = s->wiggle_table,
-             .stage  = STAGE_VERT,
-             .access = ACCESS_SSBO_R},
-            {.slice  = s->squash_table,
-             .stage  = STAGE_VERT,
-             .access = ACCESS_SSBO_R},
-            {.slice  = s->stretch_table,
-             .stage  = STAGE_VERT,
-             .access = ACCESS_SSBO_R},
-            {.slice  = s->face_table,
-             .stage  = STAGE_VERT,
-             .access = ACCESS_SSBO_R},
         };
         PassDesc draw_pass = {
             .colors         = &col,
@@ -2043,12 +2097,14 @@ void scene_frame(Scene *s, VkCommandBuffer cmd, RenderTarget *color, RenderTarge
             .buf_read_count = ARRAY_COUNT(draw_reads),
             .pipeline       = s->toon ? s->toon_pipeline : s->draw_pipeline,
         };
-        begin_pass(vk, cmd, &draw_pass);
+        GPU_SCOPE(prof, cmd, "Scene Draw", STAGE_COLOR) {
+            begin_pass(vk, cmd, &draw_pass);
 
-        vkCmdBindIndexBuffer(cmd, vk->gpu_pool.buffer, s->index_arena.offset, VK_INDEX_TYPE_UINT16);
-        cmd_draw_indexed_indirect_count(vk, cmd, (ByteSpan){&dp, (uint32_t)sizeof(dp)}, vf->draws, vf->draw_count, G,
-                                        (uint32_t)sizeof(struct SceneGpuDraw));
-        end_pass(vk, cmd, &draw_pass);
+            vkCmdBindIndexBuffer(cmd, vk->gpu_pool.buffer, s->index_arena.offset, VK_INDEX_TYPE_UINT16);
+            cmd_draw_indexed_indirect_count(vk, cmd, (ByteSpan){&dp, (uint32_t)sizeof(dp)}, vf->draws, vf->draw_count, G,
+                                            (uint32_t)sizeof(struct SceneGpuDraw));
+            end_pass(vk, cmd, &draw_pass);
+        }
 
         /* T5b: transparent sparkle pass, after the opaque draw. Reads the slime
            body rows the resolve pass just wrote, blends additively over the
@@ -2083,10 +2139,12 @@ void scene_frame(Scene *s, VkCommandBuffer cmd, RenderTarget *color, RenderTarge
                               .buf_reads      = sreads,
                               .buf_read_count = ARRAY_COUNT(sreads),
                               .pipeline       = s->sparkle_pipeline};
-            begin_pass(vk, cmd, &spass);
-            push_constants(vk, cmd, (ByteSpan){&spk, (uint32_t)sizeof(spk)});
-            vkCmdDraw(cmd, 6u, spk.counts[0], 0u, 0u);
-            end_pass(vk, cmd, &spass);
+            GPU_SCOPE(prof, cmd, "Sparkle", STAGE_COLOR) {
+                begin_pass(vk, cmd, &spass);
+                push_constants(vk, cmd, (ByteSpan){&spk, (uint32_t)sizeof(spk)});
+                vkCmdDraw(cmd, 6u, spk.counts[0], 0u, 0u);
+                end_pass(vk, cmd, &spass);
+            }
         }
     }
 

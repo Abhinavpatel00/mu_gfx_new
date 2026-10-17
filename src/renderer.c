@@ -2439,14 +2439,16 @@ static const float kSceneClear[4] = {0.02f, 0.025f, 0.03f, 1.0f};
 static void pass_sky(Renderer *r, VkCommandBuffer cmd, RenderTarget *target) {
     PassAttachment color = {.target = target, .load = LOAD_CLEAR, .store = STORE_KEEP};
     PassDesc       pd    = {.colors = &color, .color_count = 1, .pipeline = r->EnginePipelines.sky};
-    begin_pass(&r->vk, cmd, &pd);
-    SkyPush sp = {.exponent        = r->env.sky_exponent,
-                  .glow_strength   = r->env.sun_glow,
-                  .glow_power      = r->env.sun_glow_power,
-                  .ground_fade     = 0.85f};
-    push_constants(&r->vk, cmd, (ByteSpan){&sp, sizeof(sp)});
-    vkCmdDraw(cmd, 3, 1, 0, 0);
-    end_pass(&r->vk, cmd, &pd);
+    GPU_SCOPE(&r->vk.gpuprofiler[r->vk.current_frame], cmd, "Sky", STAGE_COLOR) {
+        begin_pass(&r->vk, cmd, &pd);
+        SkyPush sp = {.exponent        = r->env.sky_exponent,
+                      .glow_strength   = r->env.sun_glow,
+                      .glow_power      = r->env.sun_glow_power,
+                      .ground_fade     = 0.85f};
+        push_constants(&r->vk, cmd, (ByteSpan){&sp, sizeof(sp)});
+        vkCmdDraw(cmd, 3, 1, 0, 0);
+        end_pass(&r->vk, cmd, &pd);
+    }
 }
 
 bool renderer_frame(Renderer *r) {
@@ -2513,15 +2515,33 @@ bool renderer_frame(Renderer *r) {
         }
     }
     RenderTarget *hdr = &r->hdr_color[r->vk.swapchain.current_image];
-    GPU_SCOPE(frame_prof, cmd, "Scene", STAGE_COLOR) {
-        if (r->two_d)
-            two_d_render(r->two_d, cmd, hdr, kSceneClear);
-        else
-            pass_sky(r, cmd, hdr);
-        if (r->game.render) {
-            uint32_t image = r->vk.swapchain.current_image;
-            r->game.render(r->game.user, cmd, &r->hdr_color[image], &r->depth[image]);
+    /* The sub-passes inside (slime compute, cull/compact, draw, sparkle, sky)
+       each carry their own GPU_SCOPE in scene.c / pass_sky, so there is no
+       outer "Scene" scope here: the profiler sums every recorded pass into the
+       frame total, and nesting would double-count. */
+    {
+        {
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, r->vk.bindless_system.pipeline_layout, 0, 1,
+                                    &r->vk.bindless_system.set, 0, NULL);
+
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, r->vk.bindless_system.pipeline_layout, 0, 1,
+                                    &r->vk.bindless_system.set, 0, NULL);
+
+            rt_transition_all(
+                &r->vk, cmd, &r->depth[r->vk.swapchain.current_image], LAYOUT_DEPTH,
+                STAGE_EARLY_Z | STAGE_LATE_Z,
+                ACCESS_DEPTH_W | ACCESS_DEPTH_R);
+
+            flush_barriers(&r->vk, cmd);
         }
+    }
+    if (r->two_d)
+        two_d_render(r->two_d, cmd, hdr, kSceneClear);
+    else
+        pass_sky(r, cmd, hdr);
+    if (r->game.render) {
+        uint32_t image = r->vk.swapchain.current_image;
+        r->game.render(r->game.user, cmd, &r->hdr_color[image], &r->depth[image]);
     }
 
     /* Edge-triggered so the windows persist while you drag a slider; a held
