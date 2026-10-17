@@ -198,13 +198,19 @@ float4 fs_main(SceneVOut i) : SV_Target0
         albedo *= texel.rgb;
         alpha *= texel.a;
     }
+#ifndef SCENE_NO_DISCARD
     if ((m.flags & SCENE_MAT_ALPHA_TEST) != 0u && alpha < 0.5f)
         discard;
+#endif
 
     /* SDF slime face: one atlas tile per expression (R = eyes, A = mouth,
        B = eye whites, G = eye highlights, 0.5 = shape edge). Edge width comes
        from screen-space derivatives so faces stay crisp at any distance — the
-       whole point of SDF faces. Unlit: expressions must read in shadow. */
+       whole point of SDF faces. Unlit: expressions must read in shadow.
+       SCENE_NO_DISCARD (early-Z route) skips this branch entirely: FACE
+       materials are routed to the late-Z (alpha) pipeline, because the
+       discard inside would force the whole early route into late-Z. */
+#ifndef SCENE_NO_DISCARD
     if ((m.flags & SCENE_MAT_FACE) != 0u) {
         uint   tile    = i.face % (SCENE_FACE_COLS * SCENE_FACE_ROWS);
         float2 tile_xy = float2(tile % SCENE_FACE_COLS, tile / SCENE_FACE_COLS);
@@ -230,6 +236,7 @@ float4 fs_main(SceneVOut i) : SV_Target0
         col = lerp(col, dark * 0.45f, clamp(ring, 0.0f, 1.0f));
         return float4(col, i.bloom);
     }
+#endif /* SCENE_NO_DISCARD */
 
     if ((m.flags & SCENE_MAT_UNLIT) != 0u)
         return float4(albedo, i.bloom);

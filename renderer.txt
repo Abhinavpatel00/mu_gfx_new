@@ -4,12 +4,16 @@ Render flow (per frame)
 Driver:  src/renderer.c  render_frame()
 Scene:   src/three_d/scene.c  scene_frame()
 Slimes:  src/three_d/scene.c  slime_record()
-Shaders: shaders/*.slang  ->  compiledshaders/*.spv
+Shaders: shaders/*.slang  ->  compiledshaders/*.spv  (loaded from disk at runtime;
+         EMBED_SHADERS is disabled in the default make target — see agentcontext §2)
 
 The frame is one command buffer: a chain of compute passes, then the graphics
 passes that consume what compute produced. Every pass declares the exact buffer
 slices it reads and writes (begin_pass / end_pass + BufferAccess), so barriers
 implicate only those byte ranges, never the whole 512 MB pool.
+
+Pass scopes live in perf_report.txt (per-pass ms + verts + frags rows), so the
+flow below is documented next to the numbers that justify it.
 
 
 Compute
@@ -31,16 +35,35 @@ Slimes  (once per frame, view 0; only when slime_active)
                                                   (slime-vs-slime 3x3 + obstacle CSR push-out)
     Ping-pong state              state_in <-> state_out
 
-Cull + compact  (per view)
-    Cull                         cs_cull        -> survivors[]
-    Histogram survivors          cs_count       -> group_count[]
-    Scan per block               cs_scan_block  -> vis_base, cmd_index, cursor, draws[],
-                                                    draw_count, scan_aux
-    Scan block offsets           cs_scan_blocks -> block base offsets in scan_aux
-    Emit indirect draws          cs_emit        -> draws[] + group_base[]
-    Scatter survivors            cs_scatter     -> vis[]
+Cull + compact + route split  (per view)
+    Cull                         cs_cull        -> survivors[] (+ survivor_count)
+    [MU_NO_SORT off] Depth sort  cs_sort_clear  zero sort_aux (hist + per-bucket cursors)
+                 (front-to-back) cs_sort_hist   64 buckets over 256 m, camera from GlobalData
+                                 cs_sort_scan   bucket offsets
+                                 cs_sort_scatter-> surv_sorted[] (compaction reads this)
+    Histogram survivors          cs_count       -> group_count[g]   (reads survivors or
+                                                                 surv_sorted)
+    Scan per block               cs_scan_block  -> vis_base, cmd_index, scan_aux region 0
+                                 (3 lanes: instance count | nonempty | nonempty+alpha)
+    Scan block offsets           cs_scan_blocks -> scan_aux regions 1..3
+                                 (vis | opaque-draw | alpha-draw block offsets)
+    Emit indirect draws          cs_emit        -> draws[] (non-alpha groups),
+                                                    draws_alpha[] (alpha-test + FACE groups),
+                                                    draw_count[] / draw_count_alpha[],
+                                                    group_base[vis_base] = group
+                                 Route bit: alpha_bits[g] (uploaded once from material
+                                 flags ALPHA_TEST|FACE, scene.c group-build loop).
+                                 cmd_index[g] holds the ROUTE-LOCAL slot, so one
+                                 per-group array serves two dense command lists.
+                                 MU_SPLIT? -> counts[6]: 1 = split (default), 0 = MU_NO_SPLIT
+    Scatter survivors            cs_scatter     -> vsrows[] (compacted per-instance rows:
+                                                    the VS then does one dependent table
+                                                    load per VERTEX, not seven per-slot
+                                                    gathers)
 
 Counters copy to the host-visible lane buffer (for the next frame / HUD)
+    cs_scan_blocks finalizes DRAWN/FRUSTUM/DRAWS from the scan totals — one write
+    per frame instead of one atomic per candidate; cs_emit adds the per-LOD totals.
 
 
 Graphics
@@ -49,18 +72,30 @@ Graphics
 Sky
     Draw sky                     pass_sky       -> HDR color (no depth)
 
-Opaque
-    Draw all opaque indirect     scene frame T5  vkCmdDrawIndexedIndirectCount
-                                                 draws[] / draw_count[]
-                                                 pipeline: draw_pipeline  (or toon_pipeline)
-                                                 depth: reverse-Z, LOAD_CLEAR 0.0, STORE_KEEP
+Opaque (route split, both passes share ONE indirect structure)
+    Draw non-alpha groups        record_scene_draw "Scene Draw"
+                                 vkCmdDrawIndexedIndirectCount draws[] / draw_count[]
+                                 pipeline: draw_pipeline_early (or toon_pipeline_early)
+                                   FS compiled with SCENE_NO_DISCARD: no alpha-test or
+                                   face discard in the program, so the driver keeps
+                                   EARLY-Z on — depth-failed fragments die before the
+                                   FS (this recovered ~25% of frame shading time)
+                                 depth: reverse-Z, LOAD_CLEAR 0.0, STORE_KEEP
+    Draw alpha-test groups       record_scene_draw "Scene Draw Alpha"  (split only)
+                                 vkCmdDrawIndexedIndirectCount draws_alpha[] /
+                                 draw_count_alpha[]
+                                 pipeline: draw_pipeline (or toon_pipeline) — the
+                                   original FS WITH the discards; late-Z by necessity
+                                 depth: LOAD_KEEP / STORE_KEEP (occluders final first)
+    MU_NO_SPLIT=1 falls back to one combined pass reading draws[] on the original
+    pipeline (the pre-split behaviour), for A/B timing.
 
 Transparent
     Draw sparkles additive       scene frame T5b vkCmdDraw(6, slime_count * sparkles_per_slime)
-                                                 one camera-facing quad per sparkle, procedural
-                                                 (instance id -> slime -> instance row)
-                                                 pipeline: sparkle_pipeline (blend ONE,ONE; depth test on, depth write off)
-                                                 depth: LOAD_KEEP / STORE_KEEP
+                                 one camera-facing quad per sparkle, procedural
+                                 (instance id -> slime -> instance row)
+                                 pipeline: sparkle_pipeline (blend ONE,ONE; depth test on, depth write off)
+                                 depth: LOAD_KEEP / STORE_KEEP
     Draw particles               (not yet present)
     Draw other transparent       (not yet present)
 
@@ -76,12 +111,21 @@ Post
 Notes
 =====
 * Compute pipelines: cs_slime_sim, cs_slime_grid, cs_slime_resolve, cs_cull,
-  cs_count, cs_scan_block, cs_scan_blocks, cs_emit, cs_scatter.
-* The slime sim runs once per frame for view 0; the cull/compact passes run
-  once per view.
+  cs_sort_clear, cs_sort_hist, cs_sort_scan, cs_sort_scatter, cs_count,
+  cs_scan_block, cs_scan_blocks, cs_emit, cs_scatter.
+* The slime sim runs once per frame for view 0; everything from cull onward runs
+  once per view (views[x] live in s->view_frame[view][lane], lane = frame in
+  flight). Transients are allocated at the view's first recorded frame, not for
+  all views at upload.
 * Under the slime sim the dynamic instance prefix [0, 2*slime_count) is owned by
   compute, so the CPU squash/stretch/face uploads are skipped.
-* Sparkles are a separate additive pass after the opaque draw. `MU_SPARKLES=N`
-  sets quads per slime (0 disables the pass). The billboard basis is recovered
-  from the clip rows (row 0 ~ right, row 1 ~ -up), so no camera vectors are
-  uploaded.
+* The depth sort and the route split are independent: the sort only reorders
+  survivors INSIDE each group's slot range (cs_count histograms groups either
+  way), so any combination is valid.
+* Env knobs: MU_NO_SORT (skip T2.5), MU_NO_SPLIT (one early-Z-naive draw pass),
+  MU_SPARKLES=N (0 disables), MU_TOON (pipeline swap), MU_TOON_STYLE,
+  MU_FREEZE_TIME (deterministic frames), MU_RES=WxH, MU_PERF=N (headless dump),
+  MU_SHOT=N (screenshot after N frames, keeps running).
+* SPVs are read from compiledshaders/ at pipeline creation; editing a shared
+  header (scene_shared.h) does NOT touch their mtimes — rm *.spv before
+  measuring anything (agentcontext §7.8).

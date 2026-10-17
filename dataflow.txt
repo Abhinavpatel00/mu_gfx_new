@@ -1,0 +1,126 @@
+Data flow (who owns what)
+=========================
+
+Companion of renderer.txt: renderer.txt says what runs in which order; this
+says what data exists, who writes it, who reads it, and how long it lives.
+When adding a feature or refactoring a pass, find the row in these tables
+first — the layout IS the design (AGENTS.md §3).
+
+Anchors: structs live in src/three_d/scene_shared.h; tables live in
+src/three_d/scene.c (struct Scene / SceneViewFrame); the push builders are the
+build_*_push() functions in scene.c.
+
+
+1. Persistent scene tables (CPU truth -> GPU once; rewritten only when dirty)
+   ---------------------------------------------------------------------------
+   Table / size        C owner            Writer              Readers
+   ------------------  ------------------ ------------------- -------------------
+   instances           cpu_instances      slime_resolve (CS)  cs_cull, cs_scatter,
+   (SceneInstance,                        CPU dirty re-upload draw VS via vsrows
+    48 B, slot-indexed)
+   cull_rows           cpu_rows           upload once         cs_cull (candidate list)
+   (SceneCullRow 8B)
+   cull_meshes         cpu_cull           upload once         cs_cull (spheres)
+   lod_rows            cpu_lod            upload once         cs_cull (ladder walk)
+   materials           cpu_mat            upload once         scene FS (albedo/flags)
+   group_static        cpu_group_static   upload once         cs_emit (draw templates)
+   group_shade         cpu_group_shade    upload once         draw VS (rung vbase,
+   (16 B)                                                     material id)
+   alpha_bits          cpu_alpha_bits     upload once         cs_scan_block, cs_emit
+   vertex_arena        staged_vertices    upload once         draw VS (device address
+                                                              rides in group_shade)
+   index_arena         staged_indices     upload once         bound at draw (UINT16)
+   slime vibr tables   bloom_strength     wiggle_dirty etc.   cs_scatter (per-slot);
+   (bloom/wiggle/squash/  /squash_v/...                       owned by slime_resolve
+    stretch/face ids)                                        when the sim is active,
+                                                             CPU uploads skipped then
+
+   Rule: an upload happens when its dirtiness flag is set (bloom_dirty,
+   wiggle_dirty, squash_dirty, stretch_dirty, face_dirty, uploaded_dirty,
+   candidates_dirty). A settled scene uploads nothing.
+
+2. Render-time per-push state (built by the builders in scene.c)
+   -----------------------------------------------------------------------
+    Push              Built by        Consumers (shaders reading push constants)
+    ----------------- --------------- ------------------------------------------
+    SceneCullPush     build_cull_push cs_cull, cs_sort_* (layout fixed: verify
+                                      SceneCullPush size before adding fields)
+    SceneSortPush     build_sort_push cs_sort_clear/hist/scan/scatter (56 B fixed)
+    SceneCompactPush  scene_frame     cs_count, cs_scan_block(s), cs_emit, cs_scatter
+    SceneDrawPush     build_draw_push draw VS (clip_rows + camera HF for FS + group/vrows ptrs)
+    SceneSparklePush  scene_frame     sparkle VS
+    SceneSlimePush    slime_record    cs_slime_sim/grid/resolve
+    SlimeState (96 B row, size asserted): ping-pong pair owned by compute
+
+
+   Note on the compact push: counts[6] = route-split flag (1 = two command
+   lists, default); counts[5] = shader printf; counts[0..4] = lod_count, G,
+   max_survivors, candidate_count, blocks.
+
+3. Per-view, per-lane transients (SceneViewFrame, cleared or fully rewritten
+   every frame every view; allocated lazily at the view's first recorded frame)
+   -----------------------------------------------------------------------
+   slice          cleared            producer        consumer
+   -------------- ------------------ --------------- ------------------
+   survivors      cnt-guarded        cs_cull         cs_count (or sort)
+   survivor_count fill_buffer cs_cull, sort_hist+scatter cs_count/scatter guard
+   group_count    fill_buffer        cs_count        scan block/blocks, emit (counts[g] != 0)
+   vis_base       fully rewritten    cs_scan_block, cs_emit   cs_emit, cs_scatter
+   cmd_index      fully rewritten    cs_scan_block, cs_emit   cs_emit only
+                 (holds the ROUTE-LOCAL slot: run.z prefix for alpha groups,
+                  run.y for opaque — see compact.slang scan_block)
+   cursor         zeroed by cs_emit  cs_scatter      (interlocked slot within group)
+   vsrows         fully rewritten    cs_scatter      draw VS
+   draws/draw_count        rewritten  cs_scan_blocks(cs_emit) draw pass 1 (early-Z)
+   draws_alpha/draw_count_alpha   rewritten  cs_scan_blocks + cs_emit  draw pass 2 (late-Z)
+   group_base     rewritten          cs_emit         draw VS (group = f(first_instance))
+   cull_args      rewritten          (dispatch sizes for draws)
+   scan_aux       rewritten          cs_scan_block (region 0 totals); cs_scan_blocks
+                 (regions 1..3); cs_emit reads regions 1..3
+                 (4 regions x SCENE_SCAN_BLOCK x u32x3)
+   surv_sorted    rewritten          cs_sort_scatter cs_count, cs_scatter (via push ptr)
+   sort_aux       zeroed by cs_sort_clear            cs_sort_hist/scan/scatter
+
+   Survivors vs surv_sorted: compaction always reads through the push pointer;
+   with sorting on (default) it points at surv_sorted, with MU_NO_SORT=1 it
+   points at survivors (raw order, A/B path). The pass descriptors similarly
+   declare surv_sorted as the read in both cases and stay correct.
+   Data semantics: slot = candidate index; key = mesh:16|slot:16 with lod in
+   the top 2 bits; group_of(key) = mesh * lod_count + lod.
+
+4. Counters (s->counters[lane], one u32 block, host-visible copy for HUD)
+   -----------------------------------------------------------------------
+   DRAWN   = total instance counts over drawn groups (scan total .x)
+   DRAWS   = total command slot count = opaque + alpha (scan .y + .z)
+   DROPPED cull (updated per reject); FRUSTUM = candidates - drawn - drop
+   Hi-Z    unused (constant 0)
+   LOD0..3 cs_emit InterlockedAdd per drawn group
+   Copy to counters_host[lane] at the end of scene_frame (cmd_copy_buffer)
+   for the following frame's readback — one frame of latency by design.
+
+5. Material flags (SceneGpuMaterial.flags, shared def in scene_shared.h)
+   -----------------------------------------------------------------------
+   ALPHA_TEST 0x10  from MUASSET_BATCH_BLEND (muasset route, scene_asset.c);
+                    routes the group to the late-Z list AND puts the discard in
+                    the FS for the alpha pass.
+   FACE       0x40  slime SDF body; ALSO late-Z (FS discard on the face block).
+   HAS_ALBEDO/HAS_NORMAL/HAS_ORM/UNLIT are FS behaviour, not routing.
+
+   Invariant: alpha_bits[g] must match what the two FS variants actually
+   gate on (SCENE_NO_DISCARD strips exactly alpha-test + face discards). If a
+   new discard branch appears in scene.slang/toon.slang, add its material flag
+   to this mask AND route it — otherwise early-Z dies again for the WHOLE
+   pipeline.
+
+6. Lifetimes worth remembering
+   -----------------------------------------------------------------------
+   - CPU staging tables live in one mu_arena freed at scene_destroy; the arena
+     capacity is computed by SUMMING all the tables in scene_create — adding a
+     table without bumping that sum segfaults at the next memset (hit this for
+     cpu_alpha_bits).
+   - Slime state: two SlimeState buffers ping-pong by s->slime_parity; CPU
+     writes once at spawn (slime_state_init), then compute owns both sides.
+   - Obstacle discs: camera-relative, re-bucketed on window resize/changes, so
+     they live outside the "upload once" rule.
+   - Transient view slabs (§3) are allocated on first use, not at upload:
+     scene uploads can happen before scene views finish registering.

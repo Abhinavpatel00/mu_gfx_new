@@ -59,18 +59,20 @@ void cs_sort_clear(uint3 tid : SV_DispatchThreadID)
 }
 
 groupshared uint s_hist[SORT_BUCKETS];
+groupshared uint s_scan[SORT_BUCKETS];
 
 [shader("compute")]
 [numthreads(64, 1, 1)]
 void cs_sort_hist(uint3 tid : SV_DispatchThreadID, uint lid : SV_GroupThreadID)
 {
-    uint n = min(pc.survivor_count[0], pc.counts[0]);
-    if (tid.x >= n)
-        return;
+    /* All lanes join: an early return in the partial workgroup would skip a
+       group barrier and hang the GPU. Empty lanes just contribute zero. */
     s_hist[lid] = 0u;
     GroupMemoryBarrierWithGroupSync();
 
-    InterlockedAdd(s_hist[bucket_of(pc.survivors[tid.x])], 1u);
+    uint n = min(pc.survivor_count[0], pc.counts[0]);
+    if (tid.x < n)
+        InterlockedAdd(s_hist[bucket_of(pc.survivors[tid.x])], 1u);
     GroupMemoryBarrierWithGroupSync();
 
     /* One global atomic per lane: a 407-workgroup histogram fans into 64
@@ -84,20 +86,19 @@ void cs_sort_scan(uint3 tid : SV_DispatchThreadID, uint lid : SV_GroupThreadID)
 {
     /* Exactly 64 lanes; exclusive scan stays in shared memory so no cross-
        lane global read (which a group barrier would not order). */
-    groupshared uint v[SORT_BUCKETS];
-    v[lid] = pc.sort_aux[lid];
+    s_scan[lid] = pc.sort_aux[lid];
     GroupMemoryBarrierWithGroupSync();
     for (uint off = 1u; off < SORT_BUCKETS; off <<= 1u) {
         uint a = 0u;
         if (lid >= off)
-            a = v[lid - off];
+            a = s_scan[lid - off];
         GroupMemoryBarrierWithGroupSync();
-        v[lid] += a;
+        s_scan[lid] += a;
         GroupMemoryBarrierWithGroupSync();
     }
     /* exclusive prefix = inclusive scan minus this bucket's own count. */
     uint mine = pc.sort_aux[lid];
-    pc.sort_aux[SORT_CUR_BASE + lid] = v[lid] - mine;
+    pc.sort_aux[SORT_CUR_BASE + lid] = s_scan[lid] - mine;
 }
 
 [shader("compute")]

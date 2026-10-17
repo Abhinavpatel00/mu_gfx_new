@@ -48,7 +48,11 @@ typedef struct SceneVec4 {
 typedef struct SceneU32x2 {
     uint32_t lo, hi;
 } SceneU32x2;
+typedef struct SceneU32x3 {
+    uint32_t x, y, z;
+} SceneU32x3;
 #define SCENE_U32X2 SceneU32x2
+#define SCENE_U32X3 SceneU32x3
 #else
 /* Slang side: vec4 is a real float4 so dot()/swizzles work; pointers are real
    device-space pointers in the push constant. */
@@ -59,6 +63,7 @@ typedef struct SceneU32x2 {
 #define SCENE_U32       uint
 #define SCENE_I32       int
 #define SCENE_U32X2     uint2
+#define SCENE_U32X3     uint3
 #define SceneU16        uint16_t
 #define SceneI16        int16_t
 #define SceneU32        uint
@@ -264,7 +269,10 @@ struct SceneCompactPush {
     SCENE_PTR(SceneGpuDraw) draws;
     SCENE_PTR(SceneGpuDraw) group_static;
     SCENE_PTR(SCENE_U32) draw_count;
-    SCENE_PTR(SCENE_U32X2) scan_aux;
+    SCENE_PTR(SCENE_U32) draw_count_alpha; /* split mode: nonempty alpha groups */
+    SCENE_PTR(SceneGpuDraw) draws_alpha;   /* split mode: alpha-test draw commands */
+    SCENE_PTR(SCENE_U32) alpha_bits;       /* per-group: 1 = alpha-test material */
+    SCENE_PTR(SCENE_U32X3) scan_aux;
     SCENE_PTR(SCENE_U32) counters;
     SCENE_PTR(SCENE_U32) group_base; /* vis_base -> group id, for the VS */
     /* scatter's per-slot sources */
@@ -275,7 +283,8 @@ struct SceneCompactPush {
     SCENE_PTR(float) stretch;
     SCENE_PTR(SCENE_U32) face_id;
     SCENE_U32 counts[8];             /* 0 lod_count, 1 group_count G, 2 max_survivors,
-                                        3 candidate_count, 4 blocks, 5 debug printf */
+                                        3 candidate_count, 4 blocks, 5 debug printf,
+                                        6 route split: 1 = opaque/alpha two-pass */
 };
 
 /* ---- GPU slime sim. One 96-byte row per slime. The CPU writes it once at
@@ -349,6 +358,14 @@ struct SceneSlimePush {
     SCENE_U32 pad;
 };
 
+struct SceneSortPush {
+    SCENE_PTR(SCENE_U32) survivors;
+    SCENE_PTR(SCENE_U32) survivor_count;
+    SCENE_PTR(SceneInstance) instances;
+    SCENE_PTR(SCENE_U32) sort_aux;      /* hist[64] | off[65] | cur[64] */
+    SCENE_PTR(SCENE_U32) survivors_sorted; /* scatter output, replaces survivors for compaction */
+    SCENE_U32 counts[4];             /* 0 max_survivors (also dispatch clamp), 3 debug printf */
+};
 #undef SCENE_PTR
 
 #ifdef __STDC__
@@ -368,14 +385,6 @@ _Static_assert(sizeof(struct SceneDrawPush) <= 256, "SceneDrawPush exceeds the 2
 _Static_assert(sizeof(struct SceneSparklePush) <= 256, "SceneSparklePush exceeds the 256-byte push range");
 _Static_assert(sizeof(struct SceneCompactPush) <= 256, "SceneCompactPush exceeds the push range");
 
-struct SceneSortPush {
-    SCENE_PTR(SCENE_U32) survivors;
-    SCENE_PTR(SCENE_U32) survivor_count;
-    SCENE_PTR(SceneInstance) instances;
-    SCENE_PTR(SCENE_U32) sort_aux;      /* hist[64] | off[65] | cur[64] */
-    SCENE_PTR(SCENE_U32) survivors_sorted; /* scatter output, replaces survivors for compaction */
-    SCENE_U32 counts[4];             /* 0 max_survivors (also dispatch clamp), 3 debug printf */
-};
 _Static_assert(sizeof(struct SceneSortPush) == 56, "SceneSortPush is 56 bytes");
 _Static_assert(sizeof(struct SlimeState) == 96, "SlimeState is 96 bytes");
 _Static_assert(sizeof(struct SceneSlimePush) <= 256, "SceneSlimePush exceeds the push range");

@@ -111,7 +111,9 @@ typedef struct SceneViewFrame {
     BufferSlice vsrows;     /* max_survivors x SceneVsRow: scatter output, read by the VS */
     BufferSlice draws;
     BufferSlice draw_count;
-    BufferSlice scan_aux;   /* 3 * SCENE_SCAN_BLOCK u32x2: block totals + offsets */
+    BufferSlice draws_alpha;      /* route split: alpha-test commands, G slots */
+    BufferSlice draw_count_alpha; /* route split: alpha command count */
+    BufferSlice scan_aux;   /* 4 * SCENE_SCAN_BLOCK u32x3: totals + vis/opaque/alpha offsets */
     BufferSlice cull_args;  /* VkDispatchIndirectCommand triple, INDIRECT usage */
     BufferSlice group_base; /* max_survivors x u32: vis_base -> group id */
     BufferSlice surv_sorted; /* max_survivors x u32: depth-sorted survivor list */
@@ -142,6 +144,7 @@ struct Scene {
     BufferSlice cull_rows;
     BufferSlice group_static; /* G x SceneGpuDraw templates */
     BufferSlice group_shade;  /* G x SceneGroupShade: rung vertex stream + material */
+    BufferSlice alpha_bits;   /* G x u32: 1 = group lands in the alpha (late-Z) pass */
     BufferSlice vertex_arena; /* mesh-local packed vertices, every rung of every mesh */
     BufferSlice index_arena;  /* u16 indices, bound once per class */
 
@@ -160,6 +163,7 @@ struct Scene {
     struct SceneGpuMaterial *cpu_mat;
     struct SceneCullRow     *cpu_rows;
     struct SceneGpuDraw     *cpu_group_static;
+    uint32_t                *cpu_alpha_bits;  /* per (mesh,lod) source rows: alpha-test flag */
 
     uint32_t mesh_count;
     uint32_t lod_row_count;
@@ -256,7 +260,9 @@ struct Scene {
     PipelineID cs_sort_clear, cs_sort_hist, cs_sort_scan, cs_sort_scatter;
     PipelineID cs_slime_sim, cs_slime_grid, cs_slime_resolve;
     PipelineID draw_pipeline;
+    PipelineID draw_pipeline_early; /* route split: same FS without discards, early-Z */
     PipelineID toon_pipeline; /* cel-shaded variant of the scene draw */
+    PipelineID toon_pipeline_early; /* toon early-Z variant */
     PipelineID sparkle_pipeline; /* additive transparent sparkle pass */
     bool       toon;
     bool       pipelines_ready;
@@ -388,6 +394,7 @@ Scene *scene_create(VkBackend *vk, const SceneDesc *desc) {
         b += (uint64_t)s->max_meshes * SCENE_MAX_LODS * sizeof(struct SceneGroupShade);
         b += (uint64_t)s->max_meshes * SCENE_MAX_LODS * sizeof(uint32_t);
         b += (uint64_t)s->max_meshes * SCENE_MAX_LODS * sizeof(struct SceneGpuDraw);
+        b += (uint64_t)s->max_meshes * SCENE_MAX_LODS * sizeof(uint32_t);   /* cpu_alpha_bits */
         b += (uint64_t)s->max_lod_rows * sizeof(struct SceneLodRow);
         b += (uint64_t)s->max_materials * sizeof(struct SceneGpuMaterial);
         b += 512 + 16; /* alignment slack for the allocations above */
@@ -457,6 +464,7 @@ Scene *scene_create(VkBackend *vk, const SceneDesc *desc) {
     s->cpu_rung_vbase = mu_arena_alloc(&s->arena, (uint32_t)(s->max_meshes * SCENE_MAX_LODS * sizeof(uint32_t)), 16);
     s->cpu_group_static =
         mu_arena_alloc(&s->arena, (uint32_t)(s->max_meshes * SCENE_MAX_LODS * sizeof(struct SceneGpuDraw)), 16);
+    s->cpu_alpha_bits = mu_arena_alloc(&s->arena, (uint32_t)(s->max_meshes * SCENE_MAX_LODS * sizeof(uint32_t)), 16);
     s->cpu_lod  = mu_arena_alloc(&s->arena, s->max_lod_rows * sizeof(struct SceneLodRow), 16);
     s->cpu_mat  = mu_arena_alloc(&s->arena, s->max_materials * sizeof(struct SceneGpuMaterial), 16);
     s->cpu_rows = mu_arena_alloc(&s->arena, s->max_instances * sizeof(struct SceneCullRow), 16);
@@ -464,6 +472,7 @@ Scene *scene_create(VkBackend *vk, const SceneDesc *desc) {
     memset(s->cpu_group_shade, 0, (size_t)s->max_meshes * SCENE_MAX_LODS * sizeof(struct SceneGroupShade));
     memset(s->cpu_rung_vbase, 0, (size_t)s->max_meshes * SCENE_MAX_LODS * sizeof(uint32_t));
     memset(s->cpu_group_static, 0, (size_t)s->max_meshes * SCENE_MAX_LODS * sizeof(struct SceneGpuDraw));
+    memset(s->cpu_alpha_bits, 0, (size_t)s->max_meshes * SCENE_MAX_LODS * sizeof(uint32_t));
     memset(s->cpu_lod, 0, (size_t)s->max_lod_rows * sizeof(struct SceneLodRow));
     memset(s->cpu_mat, 0, (size_t)s->max_materials * sizeof(struct SceneGpuMaterial));
     memset(s->cpu_rows, 0, (size_t)s->max_instances * sizeof(struct SceneCullRow));
@@ -507,6 +516,7 @@ void scene_destroy(Scene *s) {
     buffer_pool_free(s->face_table);
     buffer_pool_free(s->group_static);
     buffer_pool_free(s->group_shade);
+    buffer_pool_free(s->alpha_bits);
     buffer_pool_free(s->vertex_arena);
     buffer_pool_free(s->index_arena);
     buffer_pool_free(s->slime_state[0]);
@@ -535,6 +545,8 @@ void scene_destroy(Scene *s) {
         buffer_pool_free(vf->vsrows);
         buffer_pool_free(vf->draws);
         buffer_pool_free(vf->draw_count);
+        buffer_pool_free(vf->draws_alpha);
+        buffer_pool_free(vf->draw_count_alpha);
         buffer_pool_free(vf->scan_aux);
         buffer_pool_free(vf->cull_args);
         buffer_pool_free(vf->surv_sorted);
@@ -1219,6 +1231,16 @@ bool scene_upload_scene(Scene *s, VkCommandBuffer cmd) {
                 s->cpu_group_shade[g]  = s->cpu_group_shade[src];
                 s->cpu_group_shade[g].vertex_stream =
                     vbase_addr + (uint64_t)s->cpu_rung_vbase[src] * sizeof(struct ScenePackedVertex);
+                /* Route split input: one flag per group, from its material.
+                   Alpha-test and SDF-face materials both carry a discard in
+                   the real FS, so both take the late-Z pass; the early-Z FS
+                   variant compiles without either. Alpha-test is a mesh trait
+                   (whole asset batches), FACE is the slime body material. */
+                s->cpu_alpha_bits[g] =
+                    (s->cpu_mat[s->cpu_group_shade[g].material].flags &
+                     (SCENE_MAT_ALPHA_TEST | SCENE_MAT_FACE))
+                        ? 1u
+                        : 0u;
             }
         }
     }
@@ -1292,10 +1314,13 @@ bool scene_upload_scene(Scene *s, VkCommandBuffer cmd) {
         uint32_t G      = s->group_count ? s->group_count : 1;
         s->group_static = alloc_slice(s, (VkDeviceSize)G * sizeof(struct SceneGpuDraw), 16);
         s->group_shade  = alloc_slice(s, (VkDeviceSize)G * sizeof(struct SceneGroupShade), 16);
+        s->alpha_bits   = alloc_slice(s, (VkDeviceSize)G * sizeof(uint32_t), 16);
         renderer_upload_buffer_to_slice(vk, cmd, s->group_static,
                                         (ByteSpan){s->cpu_group_static, G * sizeof(struct SceneGpuDraw)});
         renderer_upload_buffer_to_slice(vk, cmd, s->group_shade,
                                         (ByteSpan){s->cpu_group_shade, G * sizeof(struct SceneGroupShade)});
+        renderer_upload_buffer_to_slice(vk, cmd, s->alpha_bits,
+                                        (ByteSpan){s->cpu_alpha_bits, G * sizeof(uint32_t)});
     }
 
     s->dirty_count = s->instance_count; /* upload everything once */
@@ -1338,12 +1363,22 @@ static void ensure_pipelines(Scene *s, RenderTarget *color, RenderTarget *depth)
     cfg.blends[0]        = blend_disabled();
     s->draw_pipeline     = pipeline_create_graphics(s->vk, &cfg);
 
+    /* The early-Z route variant: same VS and state, but the FS is compiled
+       with SCENE_NO_DISCARD so the alpha-test and SDF-face discards vanish and
+       the driver keeps early-Z on for the groups the compaction routes here.
+       Alpha-test and FACE materials stay on s->draw_pipeline (late-Z). */
+    cfg.frag_path        = "compiledshaders/scene_opaque.frag.spv";
+    s->draw_pipeline_early = pipeline_create_graphics(s->vk, &cfg);
+
     /* The toon variant shares the vertex layout and push constant, so it is the
        same config with the other fragment shader. Both exist every frame; the
        switch is a pointer choice at draw time, not a rebuild. */
     cfg.vert_path      = "compiledshaders/toon.vert.spv";
     cfg.frag_path      = "compiledshaders/toon.frag.spv";
     s->toon_pipeline   = pipeline_create_graphics(s->vk, &cfg);
+
+    cfg.frag_path        = "compiledshaders/toon_opaque.frag.spv";
+    s->toon_pipeline_early = pipeline_create_graphics(s->vk, &cfg);
 
     /* Sparkles share the draw's clip rows and color/depth formats but blend
        additively and never write depth: a transparent pass that runs after the
@@ -1415,11 +1450,13 @@ static void ensure_view_frame(Scene *s, uint32_t view, uint32_t lane) {
     vf->vsrows         = alloc_slice(s, (VkDeviceSize)s->max_survivors * sizeof(struct SceneVsRow), 16);
     vf->draws          = alloc_slice(s, (VkDeviceSize)G * sizeof(struct SceneGpuDraw), 16);
     vf->draw_count     = alloc_slice(s, sizeof(uint32_t), 16);
-    /* Three regions of uint2: block totals, visibility offsets, draw offsets.
-       The stride must be uint2, not uint: cs_scan_block writes whole uint2
-       block totals into region 0, so a uint32 stride made every block total
-       overlap the next and corrupted the scan input. */
-    vf->scan_aux   = alloc_slice(s, (VkDeviceSize)SCENE_SCAN_BLOCK * 3u * sizeof(SceneU32x2), 16);
+    vf->draws_alpha    = alloc_slice(s, (VkDeviceSize)G * sizeof(struct SceneGpuDraw), 16);
+    vf->draw_count_alpha = alloc_slice(s, sizeof(uint32_t), 16);
+    /* Four regions of uint3 (12-byte stride): the three scan lanes' block
+       totals, then vis / opaque-draw / alpha-draw block offsets. The counts
+       lane lives in .x of each, which is all the stride regularity the scan
+       needs; the emit lanes ride .y/.z of region 0 only. */
+    vf->scan_aux   = alloc_slice(s, (VkDeviceSize)SCENE_SCAN_BLOCK * 4u * sizeof(SceneU32x3), 16);
     vf->cull_args  = alloc_slice(s, 16, 16);
     vf->group_base = alloc_slice(s, (VkDeviceSize)s->max_survivors * sizeof(uint32_t), 16);
     vf->surv_sorted = alloc_slice(s, (VkDeviceSize)s->max_survivors * sizeof(uint32_t), 16);
@@ -1608,6 +1645,85 @@ static void slime_record(Scene *s, VkCommandBuffer cmd, uint32_t view) {
     s->slime_parity ^= 1u;
 }
 
+/* MU_NO_SORT runs the old unordered path for A/B timing of the sort. */
+static bool sort_disabled(void) {
+    static bool v = -1;
+    if (v == (bool)-1)
+        v = getenv("MU_NO_SORT") != NULL;
+    return v;
+}
+
+/* MU_NO_SPLIT routes every group into one early-Z command list for A/B timing
+   of the opaque/alpha pipeline split. Default is split: the discard in the
+   shared scene FS was forcing the whole draw pipeline into late-Z and costing
+   ~25% of frame shading time against it. */
+static bool split_disabled(void) {
+    static bool v = -1;
+    if (v == (bool)-1)
+        v = getenv("MU_NO_SPLIT") != NULL;
+    return v;
+}
+
+/* One record of the instance draw. The route split reuses this verbatim for
+   the alpha-test command list: own pipeline, own buffers, and the depth load
+   keeps whatever the opaque pass wrote (a fragment that survives the
+   late-Z test blends nothing — depth write only — so ordering the alpha pass
+   after the opaque pass makes the occluders final before the overdraw-heavy
+   foliage shades against them). */
+static void record_scene_draw(Scene *s, const SceneViewFrame *vf, GpuProfiler *prof, VkCommandBuffer cmd,
+                              RenderTarget *color, RenderTarget *depth, ByteSpan dp_span, BufferSlice draws,
+                              BufferSlice draw_count, PipelineID pipeline, const char *tag, bool dep_clear) {
+    VkBackend     *vk = s->vk;
+    uint32_t       G  = s->group_count ? s->group_count : 1;
+    PassAttachment col = {.target = color, .load = LOAD_KEEP, .store = STORE_KEEP};
+    PassAttachment dep = {.target = depth, .load = dep_clear ? LOAD_CLEAR : LOAD_KEEP, .store = STORE_KEEP};
+    if (dep_clear)
+        dep.clear[0] = 0.0f; /* reverse-Z: the far plane is 0.0 */
+
+    BufferAccess draw_reads[8] = {
+        {.slice  = s->vertex_arena,
+         .stage  = STAGE_VERT,
+         .access = ACCESS_SSBO_R},
+        {.slice  = s->group_shade,
+         .stage  = STAGE_VERT,
+         .access = ACCESS_SSBO_R},
+        {.slice  = s->materials,
+         .stage  = STAGE_FRAG,
+         .access = ACCESS_SSBO_R},
+        {.slice  = vf->vsrows,
+         .stage  = STAGE_VERT,
+         .access = ACCESS_SSBO_R},
+        {.slice  = draws,
+         .stage  = STAGE_DRAW,
+         .access = ACCESS_INDIRECT},
+        {.slice  = draw_count,
+         .stage  = STAGE_DRAW,
+         .access = ACCESS_INDIRECT},
+        {.slice  = s->index_arena,
+         .stage  = STAGE_INDEX,
+         .access = ACCESS_INDEX},
+        {.slice  = vf->group_base,
+         .stage  = STAGE_VERT,
+         .access = ACCESS_SSBO_R},
+    };
+    PassDesc draw_pass = {
+        .colors         = &col,
+        .color_count    = 1,
+        .depth          = &dep,
+        .buf_reads      = draw_reads,
+        .buf_read_count = ARRAY_COUNT(draw_reads),
+        .pipeline       = pipeline,
+    };
+    GPU_SCOPE(prof, cmd, tag, STAGE_COLOR) {
+        begin_pass(vk, cmd, &draw_pass);
+
+        vkCmdBindIndexBuffer(cmd, vk->gpu_pool.buffer, s->index_arena.offset, VK_INDEX_TYPE_UINT16);
+        cmd_draw_indexed_indirect_count(vk, cmd, dp_span, draws, draw_count, G,
+                                        (uint32_t)sizeof(struct SceneGpuDraw));
+        end_pass(vk, cmd, &draw_pass);
+    }
+}
+
 void scene_frame(Scene *s, VkCommandBuffer cmd, RenderTarget *color, RenderTarget *depth) {
     if (!s || !s->uploaded || s->view_count == 0 || s->group_count == 0)
         return;
@@ -1787,7 +1903,10 @@ void scene_frame(Scene *s, VkCommandBuffer cmd, RenderTarget *color, RenderTarge
 
         struct SceneCompactPush cp;
         memset(&cp, 0, sizeof(cp));
-        cp.survivors      = slice_addr(vk, vf->survivors);
+        /* The sort export: compaction consumes the depth-ordered list so the
+           draw's early-Z sees near-first runs inside every group range.
+           MU_NO_SORT falls back to the raw survivor order for A/B timing. */
+        cp.survivors      = slice_addr(vk, sort_disabled() ? vf->survivors : vf->surv_sorted);
         cp.survivor_count = slice_addr(vk, vf->survivor_count);
         cp.group_count    = slice_addr(vk, vf->group_count);
         cp.vis_base       = slice_addr(vk, vf->vis_base);
@@ -1802,7 +1921,10 @@ void scene_frame(Scene *s, VkCommandBuffer cmd, RenderTarget *color, RenderTarge
         cp.face_id        = slice_addr(vk, s->face_table);
         cp.draws          = slice_addr(vk, vf->draws);
         cp.group_static   = slice_addr(vk, s->group_static);
+        cp.draws_alpha    = slice_addr(vk, vf->draws_alpha);
         cp.draw_count     = slice_addr(vk, vf->draw_count);
+        cp.draw_count_alpha = slice_addr(vk, vf->draw_count_alpha);
+        cp.alpha_bits     = slice_addr(vk, s->alpha_bits);
         cp.scan_aux       = slice_addr(vk, vf->scan_aux);
         cp.counters       = slice_addr(vk, s->counters[lane]);
         cp.group_base     = slice_addr(vk, vf->group_base);
@@ -1816,6 +1938,13 @@ void scene_frame(Scene *s, VkCommandBuffer cmd, RenderTarget *color, RenderTarge
         cp.counts[5] = cp_push.counts[5];
         if (cp.counts[5] && view == 0 && lane == 0)
             log_info("[dbg] shader printf enable = %u, G = %u", cp.counts[5], G);
+        /* Route split (default on, MU_NO_SPLIT to disable): alpha-test groups
+           take the late-Z draw pass, everything else the early-Z one. The
+           discard in the shared FS forced the whole draw pipeline into late-Z;
+           the split restores early-Z for the opaque majority (measured ~25% of
+           frame shading time in the frozen-time A/B). Independent of the depth
+           sort, which only orders instances inside each group's slot range. */
+        cp.counts[6] = split_disabled() ? 0u : 1u;
         /* Every table is a slice of one buffer, so naming a slice names a byte
            range. That is the whole point of declaring these instead of
            barriering the pool: the previous code emitted four whole-pool
@@ -1869,9 +1998,123 @@ void scene_frame(Scene *s, VkCommandBuffer cmd, RenderTarget *color, RenderTarge
             end_pass(vk, cmd, &cull_pass);
         }
 
+        if (!sort_disabled()) {
+        /* T2.5: depth-bucket sort of the survivors (front-to-back). The
+           compaction preserves survivor-list order inside each group's
+           contiguous range, so reordering only the survivor list turns every
+           group's instances into a near-first run for the draw's early-Z to
+           reject against. The camera comes from GlobalData; the sort exports
+           the sorted list that every following compact pass consumes. */
+        struct SceneSortPush sp;
+        build_sort_push(s, view, lane, &sp);
+
+        BufferAccess sort_clear_writes[1] = {
+            {.slice  = vf->sort_aux,
+             .stage  = STAGE_CS,
+             .access = ACCESS_SSBO_W},
+        };
+        PassDesc sort_clear_pass = {
+            .buf_writes      = sort_clear_writes,
+            .buf_write_count = ARRAY_COUNT(sort_clear_writes),
+            .pipeline        = s->cs_sort_clear,
+        };
+        GPU_SCOPE(prof, cmd, "Sort Clear", STAGE_CS) {
+            begin_pass(vk, cmd, &sort_clear_pass);
+            dispatch_push(vk, cmd, (ByteSpan){&sp, (uint32_t)sizeof(sp)}, 1, 1, 1);
+            end_pass(vk, cmd, &sort_clear_pass);
+        }
+
+        BufferAccess sort_hist_reads[3] = {
+            {.slice  = vf->survivors,
+             .stage  = STAGE_CS,
+             .access = ACCESS_SSBO_R},
+            {.slice  = vf->survivor_count,
+             .stage  = STAGE_CS,
+             .access = ACCESS_SSBO_R},
+            {.slice  = s->instances,
+             .stage  = STAGE_CS,
+             .access = ACCESS_SSBO_R},
+        };
+        BufferAccess sort_hist_writes[1] = {
+            {.slice  = vf->sort_aux,
+             .stage  = STAGE_CS,
+             .access = ACCESS_SSBO_R | ACCESS_SSBO_W},
+        };
+        PassDesc sort_hist_pass = {
+            .buf_reads       = sort_hist_reads,
+            .buf_read_count  = ARRAY_COUNT(sort_hist_reads),
+            .buf_writes      = sort_hist_writes,
+            .buf_write_count = ARRAY_COUNT(sort_hist_writes),
+            .pipeline        = s->cs_sort_hist,
+        };
+        GPU_SCOPE(prof, cmd, "Sort Hist", STAGE_CS) {
+            begin_pass(vk, cmd, &sort_hist_pass);
+            dispatch_push(vk, cmd, (ByteSpan){&sp, (uint32_t)sizeof(sp)},
+                          (s->max_survivors + 63u) / 64u, 1, 1);
+            end_pass(vk, cmd, &sort_hist_pass);
+        }
+
+        BufferAccess sort_scan_reads[1] = {
+            {.slice  = vf->sort_aux,
+             .stage  = STAGE_CS,
+             .access = ACCESS_SSBO_R},
+        };
+        BufferAccess sort_scan_writes[1] = {
+            {.slice  = vf->sort_aux,
+             .stage  = STAGE_CS,
+             .access = ACCESS_SSBO_R | ACCESS_SSBO_W},
+        };
+        PassDesc sort_scan_pass = {
+            .buf_reads       = sort_scan_reads,
+            .buf_read_count  = ARRAY_COUNT(sort_scan_reads),
+            .buf_writes      = sort_scan_writes,
+            .buf_write_count = ARRAY_COUNT(sort_scan_writes),
+            .pipeline        = s->cs_sort_scan,
+        };
+        GPU_SCOPE(prof, cmd, "Sort Scan", STAGE_CS) {
+            begin_pass(vk, cmd, &sort_scan_pass);
+            dispatch_push(vk, cmd, (ByteSpan){&sp, (uint32_t)sizeof(sp)}, 1, 1, 1);
+            end_pass(vk, cmd, &sort_scan_pass);
+        }
+
+        BufferAccess sort_scatter_reads[4] = {
+            {.slice  = vf->survivors,
+             .stage  = STAGE_CS,
+             .access = ACCESS_SSBO_R},
+            {.slice  = vf->survivor_count,
+             .stage  = STAGE_CS,
+             .access = ACCESS_SSBO_R},
+            {.slice  = s->instances,
+             .stage  = STAGE_CS,
+             .access = ACCESS_SSBO_R},
+            {.slice  = vf->sort_aux,
+             .stage  = STAGE_CS,
+             .access = ACCESS_SSBO_R | ACCESS_SSBO_W},
+        };
+        BufferAccess sort_scatter_writes[1] = {
+            {.slice  = vf->surv_sorted,
+             .stage  = STAGE_CS,
+             .access = ACCESS_SSBO_W},
+        };
+        PassDesc sort_scatter_pass = {
+            .buf_reads       = sort_scatter_reads,
+            .buf_read_count  = ARRAY_COUNT(sort_scatter_reads),
+            .buf_writes      = sort_scatter_writes,
+            .buf_write_count = ARRAY_COUNT(sort_scatter_writes),
+            .pipeline        = s->cs_sort_scatter,
+        };
+        GPU_SCOPE(prof, cmd, "Sort Scatter", STAGE_CS) {
+            begin_pass(vk, cmd, &sort_scatter_pass);
+            dispatch_push(vk, cmd, (ByteSpan){&sp, (uint32_t)sizeof(sp)},
+                          (s->max_survivors + 63u) / 64u, 1, 1);
+            end_pass(vk, cmd, &sort_scatter_pass);
+        }
+
+        }
+
         /* T3a: histogram survivors by (mesh,lod) group */
         BufferAccess count_reads[2] = {
-            {.slice  = vf->survivors,
+            {.slice  = vf->surv_sorted,
              .stage  = STAGE_CS,
              .access = ACCESS_SSBO_R},
             {.slice  = vf->survivor_count,
@@ -1900,15 +2143,18 @@ void scene_frame(Scene *s, VkCommandBuffer cmd, RenderTarget *color, RenderTarge
         /* T3b: two-level scan + emit. The old code ran this as one workgroup
            of one thread looping over all G groups; it is now O(G/1024) wide.
            scan_aux carries the per-block totals between the two levels. */
-        BufferAccess scan_reads[2] = {
+        BufferAccess scan_reads[3] = {
             {.slice  = vf->group_count,
              .stage  = STAGE_CS,
              .access = ACCESS_SSBO_R},
             {.slice  = s->group_static,
              .stage  = STAGE_CS,
              .access = ACCESS_SSBO_R},
+            {.slice  = s->alpha_bits,
+             .stage  = STAGE_CS,
+             .access = ACCESS_SSBO_R},
         };
-        BufferAccess scan_writes[8] = {
+        BufferAccess scan_writes[10] = {
             {.slice  = vf->vis_base,
              .stage  = STAGE_CS,
              .access = ACCESS_SSBO_W | ACCESS_SSBO_W},
@@ -1922,6 +2168,12 @@ void scene_frame(Scene *s, VkCommandBuffer cmd, RenderTarget *color, RenderTarge
              .stage  = STAGE_CS,
              .access = ACCESS_SSBO_W},
             {.slice  = vf->draw_count,
+             .stage  = STAGE_CS,
+             .access = ACCESS_SSBO_W},
+            {.slice  = vf->draws_alpha,
+             .stage  = STAGE_CS,
+             .access = ACCESS_SSBO_W},
+            {.slice  = vf->draw_count_alpha,
              .stage  = STAGE_CS,
              .access = ACCESS_SSBO_W},
             {.slice  = vf->scan_aux,
@@ -1974,9 +2226,9 @@ void scene_frame(Scene *s, VkCommandBuffer cmd, RenderTarget *color, RenderTarge
             end_pass(vk, cmd, &block_pass);
         }
 
-        /* cs_emit reads group_count, group_static and the block offsets in
-           scan_aux regions 1 and 2. */
-        BufferAccess emit_reads[3] = {
+        /* cs_emit reads group_count, group_static, the per-group alpha flag and
+           the block offsets in scan_aux regions 1..3. */
+        BufferAccess emit_reads[4] = {
             {.slice  = vf->group_count,
              .stage  = STAGE_CS,
              .access = ACCESS_SSBO_R},
@@ -1984,6 +2236,9 @@ void scene_frame(Scene *s, VkCommandBuffer cmd, RenderTarget *color, RenderTarge
              .stage  = STAGE_CS,
              .access = ACCESS_SSBO_R},
             {.slice  = vf->scan_aux,
+             .stage  = STAGE_CS,
+             .access = ACCESS_SSBO_R},
+            {.slice  = s->alpha_bits,
              .stage  = STAGE_CS,
              .access = ACCESS_SSBO_R},
         };
@@ -2006,7 +2261,7 @@ void scene_frame(Scene *s, VkCommandBuffer cmd, RenderTarget *color, RenderTarge
            This is the same access pattern the draw would have, paid at 1/250th
            the volume. */
         BufferAccess scatter_reads[10] = {
-            {.slice  = vf->survivors,
+            {.slice  = vf->surv_sorted,
              .stage  = STAGE_CS,
              .access = ACCESS_SSBO_R},
             {.slice  = vf->survivor_count,
@@ -2055,55 +2310,23 @@ void scene_frame(Scene *s, VkCommandBuffer cmd, RenderTarget *color, RenderTarge
             end_pass(vk, cmd, &scatter_pass);
         }
 
-        /* T5: draw */
-        /* The renderer draws the sky into the HDR target first, so the draw
-           loads it rather than clearing. Depth still clears, because the sky
-           leaves no depth behind. */
-        PassAttachment col = {.target = color, .load = LOAD_KEEP, .store = STORE_KEEP};
-        PassAttachment dep = {.target = depth, .load = LOAD_CLEAR, .store = STORE_KEEP};
-        dep.clear[0]       = 0.0f; /* reverse-Z: the far plane is 0.0 */
-
-        BufferAccess draw_reads[8] = {
-            {.slice  = s->vertex_arena,
-             .stage  = STAGE_VERT,
-             .access = ACCESS_SSBO_R},
-            {.slice  = s->group_shade,
-             .stage  = STAGE_VERT,
-             .access = ACCESS_SSBO_R},
-            {.slice  = s->materials,
-             .stage  = STAGE_FRAG,
-             .access = ACCESS_SSBO_R},
-            {.slice  = vf->vsrows,
-             .stage  = STAGE_VERT,
-             .access = ACCESS_SSBO_R},
-            {.slice  = vf->draws,
-             .stage  = STAGE_DRAW,
-             .access = ACCESS_INDIRECT},
-            {.slice  = vf->draw_count,
-             .stage  = STAGE_DRAW,
-             .access = ACCESS_INDIRECT},
-            {.slice  = s->index_arena,
-             .stage  = STAGE_INDEX,
-             .access = ACCESS_INDEX},
-            {.slice  = vf->group_base,
-             .stage  = STAGE_VERT,
-             .access = ACCESS_SSBO_R},
-        };
-        PassDesc draw_pass = {
-            .colors         = &col,
-            .color_count    = 1,
-            .depth          = &dep,
-            .buf_reads      = draw_reads,
-            .buf_read_count = ARRAY_COUNT(draw_reads),
-            .pipeline       = s->toon ? s->toon_pipeline : s->draw_pipeline,
-        };
-        GPU_SCOPE(prof, cmd, "Scene Draw", STAGE_COLOR) {
-            begin_pass(vk, cmd, &draw_pass);
-
-            vkCmdBindIndexBuffer(cmd, vk->gpu_pool.buffer, s->index_arena.offset, VK_INDEX_TYPE_UINT16);
-            cmd_draw_indexed_indirect_count(vk, cmd, (ByteSpan){&dp, (uint32_t)sizeof(dp)}, vf->draws, vf->draw_count, G,
-                                            (uint32_t)sizeof(struct SceneGpuDraw));
-            end_pass(vk, cmd, &draw_pass);
+        /* T5: draw. The renderer draws the sky into the HDR target first, so
+           the draw loads it rather than clearing. Depth still clears, because
+           the sky leaves no depth behind.
+           Route split (default): the opaque pass uses the discard-free FS so
+           early-Z stays on, then the alpha pass draws the discard-FS command
+           list over the result. Without the split (MU_NO_SPLIT), one pass runs
+           the original shared pipeline exactly as before. */
+        bool split = split_disabled() ? false : true;
+        PipelineID opaque_pipeline =
+            (s->toon ? (split ? s->toon_pipeline_early : s->toon_pipeline)
+                     : (split ? s->draw_pipeline_early : s->draw_pipeline));
+        record_scene_draw(s, vf, prof, cmd, color, depth, (ByteSpan){&dp, (uint32_t)sizeof(dp)}, vf->draws,
+                          vf->draw_count, opaque_pipeline, "Scene Draw", true);
+        if (split) {
+            PipelineID alpha_pipeline = s->toon ? s->toon_pipeline : s->draw_pipeline;
+            record_scene_draw(s, vf, prof, cmd, color, depth, (ByteSpan){&dp, (uint32_t)sizeof(dp)}, vf->draws_alpha,
+                              vf->draw_count_alpha, alpha_pipeline, "Scene Draw Alpha", false);
         }
 
         /* T5b: transparent sparkle pass, after the opaque draw. Reads the slime

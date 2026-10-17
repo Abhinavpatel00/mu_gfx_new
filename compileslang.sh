@@ -67,11 +67,20 @@ for file in "$SRC_DIR"/*.slang; do
     # Extra compute entry points. create_compute_pipeline() only ever binds
     # "main", so a file with several kernels needs one .spv per entry.
     for entry in cs_count cs_prefix cs_cull cs_hiz \
-                 cs_scan_block cs_scan_blocks cs_emit cs_scatter; do
+                 cs_scan_block cs_scan_blocks cs_emit cs_scatter \
+                 cs_sort_clear cs_sort_hist cs_sort_scan cs_sort_scatter; do
         if has_entry "$entry" "$file"; then
             compile_stage compute  "$entry" "$file" "$OUT_DIR/$name.$entry.comp.spv"
         fi
     done
+
+    # Early-Z route fragments: the whole main shader included with SCENE_NO_DISCARD
+    # set, so the alpha-test/face discards vanish and the driver keeps early-Z on.
+    # Explicit entries: the include hides fs_main from has_entry's scan.
+    if [ "$file" = "$SRC_DIR/scene_opaque.frag.slang" ] || [ "$file" = "$SRC_DIR/toon_opaque.frag.slang" ]; then
+        # $name already ends in .frag (basename without .slang)
+        compile_stage fragment fs_main "$file" "$OUT_DIR/$name.spv"
+    fi
 
 done
 

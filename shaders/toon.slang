@@ -132,10 +132,15 @@ float4 fs_main(SceneVOut i) : SV_Target0
         albedo *= texel.rgb;
         alpha *= texel.a;
     }
+#ifndef SCENE_NO_DISCARD
     if ((m.flags & SCENE_MAT_ALPHA_TEST) != 0u && alpha < 0.5f)
         discard;
+#endif
 
-    /* SDF slime face: same atlas resolve as scene.slang, unlit. */
+    /* SDF slime face: same atlas resolve as scene.slang, unlit. FACE materials
+       are routed to the late-Z pipeline when SCENE_NO_DISCARD is set, so the
+       whole branch (and its discard) vanishes from the early-Z variant. */
+#ifndef SCENE_NO_DISCARD
     if ((m.flags & SCENE_MAT_FACE) != 0u) {
         uint   tile    = i.face % (SCENE_FACE_COLS * SCENE_FACE_ROWS);
         float2 tile_xy = float2(tile % SCENE_FACE_COLS, tile / SCENE_FACE_COLS);
@@ -157,6 +162,7 @@ float4 fs_main(SceneVOut i) : SV_Target0
         col = lerp(col, dark * 0.45f, clamp(ring, 0.0f, 1.0f));
         return float4(col, i.bloom);
     }
+#endif /* SCENE_NO_DISCARD */
 
     float3 n = normalize(i.normal);
     float  ao = 1.0f;

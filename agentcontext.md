@@ -20,6 +20,9 @@ Sibling docs:
 - `AGENTS.md` — the DOD doctrine and C style. **Read it for any coding task.**
 - `renderer.txt` — the authoritative per-frame render-flow reference (pass order,
   buffers). Update it when you add a pass.
+- `dataflow.txt` — the companion data reference (who owns each table, who reads
+  it, lifecycles, push-struct consumers, material-flag routing invariants).
+  Update it when you add a table, a buffer slice, or a push field.
 - `data/dodnotes.txt`, `.agents/skills/*` — deeper DOD material.
 
 ---
@@ -92,6 +95,7 @@ shaders/*.slang            Slang shaders (one file may define several entry poin
 compiledshaders/*.spv      build output (do not edit)
 build/generated/shaders.h  generated embedded SPIR-V (do not edit)
 renderer.txt               per-frame pass reference (update when passes change)
+dataflow.txt               per-table data reference (update when tables/slices/pushes change)
 vk_toon_shader/            vendored NVIDIA Vulkan-Samples "toon shading" reference (see §8)
 post_settings.json         live post/color-grade + toon settings (saved by the app)
 perf_report.txt            last MU_PERF dump
@@ -396,8 +400,9 @@ mesh and naturally produces interior crease lines.
 
 - Follow `AGENTS.md` (DOD: data layout first, IDs over pointers, existence over
   flags, measure before/after, prefer `mylib`).
-- When you add/modify a pass, update `renderer.txt`. When you change shared
-  structs, update both C and Slang sides and the `_Static_assert`s.
+- When you add/modify a pass, update `renderer.txt`. When you add/remove a
+  table, buffer slice, or push field, update `dataflow.txt`. When you change
+  shared structs, update both C and Slang sides and the `_Static_assert`s.
 - When you finish a task, **update this file** with anything a future agent would
   otherwise have to re-discover (new env knobs, gotchas, feature state).
 - Don't commit unless asked. Don't read screenshots back into context.

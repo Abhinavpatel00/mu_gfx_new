@@ -9,10 +9,17 @@
 
 
 
-   The scan carries two lanes because two exclusive scans fall out of one pass:
-   vis_base wants the running sum of instance counts, cmd_index wants the
-   running sum of "this group is non-empty". Scanning them together halves the
+   The scan carries three lanes because three exclusive scans fall out of one
+   pass: vis_base wants the running sum of instance counts, cmd_index wants the
+   running sum of "this group is non-empty", and the opaque/alpha route split
+   wants that second scan twice — once restricted to alpha-test materials
+   (late-Z pass) and once to the rest (early-Z pass). The two emit lanes are
+   mutually exclusive, so each non-empty group takes its slot number from the
+   lane matching its material class and cmd_index ends up holding the
+   route-local index directly. Scanning the lanes together halves the
    shared-memory traffic and the barrier count versus running the pass twice.
+   In combined mode (sort path, counts[6] == 0) the alpha lane stays empty and
+   every non-empty group lands in the one draw list, exactly as before.
 
    The previous version ran this as [numthreads(1,1,1)]: one thread looping over
    every group, serialized between the cull and the scatter. For a scene with
@@ -66,20 +73,20 @@ void cs_count(uint3 tid : SV_DispatchThreadID)
  * the SCAN_THREADS per-thread aggregates. Returns this thread's exclusive
  * offset and leaves s_thread holding the inclusive totals.
  * ------------------------------------------------------------------ */
-groupshared uint2 s_thread[SCAN_THREADS];
+groupshared uint3 s_thread[SCAN_THREADS];
 
-static uint2 thread_exclusive(uint2 v, uint lid)
+static uint3 thread_exclusive(uint3 v, uint lid)
 {
     s_thread[lid] = v;
     GroupMemoryBarrierWithGroupSync();
     for (uint off = 1u; off < SCAN_THREADS; off <<= 1u)
     {
-        uint2 t = (lid >= off) ? s_thread[lid - off] : uint2(0u, 0u);
+        uint3 t = (lid >= off) ? s_thread[lid - off] : uint3(0u, 0u, 0u);
         GroupMemoryBarrierWithGroupSync();
         s_thread[lid] += t;
         GroupMemoryBarrierWithGroupSync();
     }
-    uint2 incl = s_thread[lid];
+    uint3 incl = s_thread[lid];
     GroupMemoryBarrierWithGroupSync();
     return incl - v;
 }
@@ -91,18 +98,26 @@ void cs_scan_block(uint3 gid : SV_GroupID, uint3 lid : SV_GroupThreadID)
     uint G    = pc.counts[1];
     uint base = gid.x * SCAN_BLOCK;
 
-    uint2 vals[SCAN_ELEMS];
-    uint2 v   = uint2(0u, 0u);
+    uint3 vals[SCAN_ELEMS];
+    uint3 v   = uint3(0u, 0u, 0u);
+    uint  sp  = pc.counts[6];
     for (uint e = 0u; e < SCAN_ELEMS; ++e)
     {
         uint g = GROUP_IDX(base, lid.x, e);
 
         uint c = (g < G) ? pc.group_count[g] : 0u;
-        vals[e] = uint2(c, (c != 0u) ? 1u : 0u);
+        /* Route split: alpha-test materials take the late-Z pass, the rest the
+         * early-Z one. The two emit lanes are mutually exclusive, so
+         * cmd_index[g] stores whichever index the group's own route produced.
+         * Grouped into one bool here so out-of-range tail groups cannot fetch
+         * alpha_bits past G. */
+        bool am = (g < G) && (sp != 0u) && (pc.alpha_bits[g] != 0u);
+        bool nz = (c != 0u);
+        vals[e] = uint3(c, (nz && !am) ? 1u : 0u, (nz && am) ? 1u : 0u);
         v += vals[e];
     }
 
-    uint2 run = thread_exclusive(v, lid.x);
+    uint3 run = thread_exclusive(v, lid.x);
     for (uint e = 0u; e < SCAN_ELEMS; ++e)
     {
        uint g = GROUP_IDX(base, lid.x, e);
@@ -115,7 +130,7 @@ void cs_scan_block(uint3 gid : SV_GroupID, uint3 lid : SV_GroupThreadID)
                cursor[] is reserved for the scatter position and must stay
                available to cs_scatter at zero. */
             pc.vis_base[g] = run.x;
-            pc.cmd_index[g] = run.y;
+            pc.cmd_index[g] = ((sp != 0u) && (pc.alpha_bits[g] != 0u)) ? run.z : run.y;
         }
         run += vals[e];
     }
@@ -134,26 +149,29 @@ void cs_scan_blocks(uint3 gid : SV_GroupID, uint3 lid : SV_GroupThreadID)
         return;
 
     /* Level 2 reads the block totals cs_scan_block wrote into region 0. The
-       block offsets it produces go to regions 1 and 2, which are disjoint from
+       block offsets it produces go to regions 1..3, which are disjoint from
        region 0, so read-then-write in one dispatch is safe. */
     uint nb = pc.counts[4];
-    uint2 vals[SCAN_ELEMS];
-    uint2 v   = uint2(0u, 0u);
+    uint3 vals[SCAN_ELEMS];
+    uint3 v   = uint3(0u, 0u, 0u);
     for (uint e = 0u; e < SCAN_ELEMS; ++e)
     {
         uint b = lid.x + e * SCAN_THREADS;
-        vals[e] = (b < nb) ? pc.scan_aux[b] : uint2(0u, 0u);
+        vals[e] = (b < nb) ? pc.scan_aux[b] : uint3(0u, 0u, 0u);
         v += vals[e];
     }
 
-    uint2 run = thread_exclusive(v, lid.x);
+    uint3 run = thread_exclusive(v, lid.x);
     for (uint e = 0u; e < SCAN_ELEMS; ++e)
     {
         uint b = lid.x + e * SCAN_THREADS;
         if (b < nb)
         {
-            pc.scan_aux[1u * SCAN_BLOCK + b] = run.x;
-            pc.scan_aux[2u * SCAN_BLOCK + b] = run.y;
+            /* Region 1: vis (instance count) offsets, broadcast. Region 2:
+               opaque draw offsets. Region 3: alpha draw offsets. */
+            pc.scan_aux[1u * SCAN_BLOCK + b] = uint3(run.x, run.x, run.x);
+            pc.scan_aux[2u * SCAN_BLOCK + b] = uint3(run.y, run.y, run.y);
+            pc.scan_aux[3u * SCAN_BLOCK + b] = uint3(run.z, run.z, run.z);
         }
         run += vals[e];
     }
@@ -170,14 +188,15 @@ void cs_scan_blocks(uint3 gid : SV_GroupID, uint3 lid : SV_GroupThreadID)
            Doing it this way is the difference between one atomic per candidate
            and one write per frame, on a counter block small enough that every
            thread in the dispatch shares a cache line. */
-        uint2 total = s_thread[SCAN_THREADS - 1u];
+        uint3 total = s_thread[SCAN_THREADS - 1u];
         uint  drawn = total.x;
         uint  drop  = pc.counters[SCENE_COUNTER_DROPPED];
         pc.counters[SCENE_COUNTER_DRAWN]   = drawn;
         pc.counters[SCENE_COUNTER_FRUSTUM] = pc.counts[3] - drawn - drop;
         pc.counters[SCENE_COUNTER_HIZ]     = 0u;
-        pc.counters[SCENE_COUNTER_DRAWS]   = total.y;
+        pc.counters[SCENE_COUNTER_DRAWS]   = total.y + total.z;
         pc.draw_count[0]                   = total.y;
+        pc.draw_count_alpha[0]             = total.z;
 
         /* The per-LOD totals are accumulated by cs_emit, which runs after this
            dispatch, so this is where they start from. Storing DRAWN and friends
@@ -198,23 +217,34 @@ void cs_emit(uint3 gid : SV_GroupID, uint3 lid : SV_GroupThreadID)
 {
     uint G    = pc.counts[1];
     uint base = gid.x * SCAN_BLOCK;
-    uint2 off = uint2(pc.scan_aux[1u * SCAN_BLOCK + gid.x].x, pc.scan_aux[2u * SCAN_BLOCK + gid.x].y);
+    uint off  = pc.scan_aux[1u * SCAN_BLOCK + gid.x].x;
+    uint offO = pc.scan_aux[2u * SCAN_BLOCK + gid.x].x;
+    uint offA = pc.scan_aux[3u * SCAN_BLOCK + gid.x].x;
+    uint sp   = pc.counts[6];
 
     for (uint e = 0u; e < SCAN_ELEMS; ++e)
     {
         uint g = GROUP_IDX(base, lid.x, e);
         if (g >= G)
             continue; /* strided: later e can still be in range */
-        pc.vis_base[g] += off.x;
-        uint cmd = pc.cmd_index[g] + off.y;
-        pc.cmd_index[g] = cmd;
+        pc.vis_base[g] += off;
         pc.cursor[g]    = 0u; /* scatter starts at the group's vis base */
         if (pc.group_count[g] != 0u)
         {
+            /* One prefix per route: the group's cmd_index already holds the
+               route-local block-local index, so it adds the matching block
+               offset and lands in that route's command array. */
+            bool am         = (sp != 0u) && (pc.alpha_bits[g] != 0u);
+            uint cmd        = pc.cmd_index[g] + (am ? offA : offO);
+            pc.cmd_index[g] = cmd;
+
             SceneGpuDraw d = pc.group_static[g];
             d.instance_count = pc.group_count[g];
             d.first_instance = pc.vis_base[g];
-            pc.draws[cmd]    = d;
+            if (am)
+                pc.draws_alpha[cmd] = d;
+            else
+                pc.draws[cmd] = d;
             /* The VS has no DrawIndex in this Slang build, so it recovers the
                group from the draw's own instance base. Both sides derive it from
                vis_base[g], which is uniform across the draw — a broadcast, not
